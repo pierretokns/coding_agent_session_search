@@ -31256,9 +31256,8 @@ fn doctor_safe_auto_action_for_check(check: &DoctorCheckReport) -> &'static str 
 
 fn doctor_safe_auto_manual_next_command(check: &DoctorCheckReport) -> &'static str {
     match check.name.as_str() {
-        "safe_auto_archive_rebuild" | "database" | "database_backup" => {
-            "cass doctor repair --dry-run --json"
-        }
+        "safe_auto_archive_rebuild" | "database_backup" => "cass doctor repair --dry-run --json",
+        "database" if check.status == "fail" => "cass doctor reconstruct --dry-run --json",
         "repair_failure_marker" => "cass doctor --json",
         "operation_state" | "lock_file" => "cass doctor --json",
         "source_coverage" | "source_inventory" | "raw_mirror" | "raw_mirror_backfill" => {
@@ -43161,13 +43160,28 @@ fn build_doctor_source_authority_report(
     let coverage_delta = doctor_source_authority_coverage_delta(source_inventory, raw_mirror);
     let freshness_delta = doctor_source_authority_freshness_delta(db_path, raw_mirror);
     let checksum_evidence = doctor_source_authority_checksum_evidence(raw_mirror);
-    let raw_mirror_trusted = raw_mirror.status == "verified"
-        && checksum_evidence.summary_status == DoctorArtifactChecksumStatus::Matched;
-    let archive_available = source_inventory.db_available;
+    // `db_available` means that the archive path exists and the inventory
+    // probe was attempted.  It must not be promoted to authority when the
+    // probe failed: a failed open cannot truthfully supply a zero-row corpus
+    // or authorize derived rebuild decisions (cass#374).
+    let archive_readable =
+        source_inventory.db_available && source_inventory.db_query_error.is_none();
+
+    // Mirror-level warnings are not all integrity failures.  In particular,
+    // old interrupted-capture tmp directories and size advisories can make
+    // the aggregate status `warn` while every manifest/blob checksum still
+    // matches.  Authority must be based on the evidence that bears on byte
+    // integrity, not unrelated cleanup debris (cass#374).
+    let raw_mirror_trusted = checksum_evidence.summary_status
+        == DoctorArtifactChecksumStatus::Matched
+        && raw_mirror.summary.invalid_manifest_count == 0
+        && raw_mirror.summary.missing_blob_count == 0
+        && raw_mirror.summary.checksum_mismatch_count == 0
+        && raw_mirror.summary.manifest_checksum_mismatch_count == 0;
     let mut selected_authorities = Vec::new();
     let mut rejected_authorities = Vec::new();
 
-    if archive_available {
+    if archive_readable {
         selected_authorities.push(doctor_source_authority_candidate(
             DoctorSourceAuthorityKind::CanonicalArchiveDb,
             DoctorSourceAuthorityDecision::ReadOnly,
@@ -43185,6 +43199,20 @@ fn build_doctor_source_authority_report(
                     source_inventory.total_indexed_conversations
                 ),
             ],
+        ));
+    } else if source_inventory.db_available {
+        let query_error = source_inventory
+            .db_query_error
+            .as_deref()
+            .unwrap_or("archive database could not be opened");
+        rejected_authorities.push(doctor_source_authority_candidate(
+            DoctorSourceAuthorityKind::CanonicalArchiveDb,
+            DoctorSourceAuthorityDecision::Refused,
+            format!("archive database is unreadable and cannot be used as repair authority: {query_error}"),
+            0,
+            None,
+            DoctorArtifactChecksumStatus::NotRecorded,
+            vec!["archive-db-open-failed".to_string(), query_error.to_string()],
         ));
     }
 
@@ -68704,6 +68732,62 @@ paths = ["~/.claude/projects"]
     }
 
     #[test]
+    fn doctor_source_authority_rejects_unreadable_archive_and_keeps_verified_mirror() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        std::fs::create_dir_all(&data_dir).expect("create data dir");
+        let db_path = data_dir.join("agent_search.db");
+        std::fs::write(&db_path, b"malformed archive placeholder").expect("write db placeholder");
+        let source_path = data_dir.join("sessions/pruned.jsonl");
+        let source_inventory = build_doctor_source_inventory_report(
+            &data_dir,
+            true,
+            Some("OpenRead failed: database disk image is malformed".to_string()),
+            Vec::new(),
+            Vec::new(),
+        );
+        let bytes = b"{\"type\":\"message\",\"content\":\"preserved\"}\n";
+        let manifest = raw_mirror_test_manifest(
+            &data_dir,
+            "codex",
+            "local",
+            &source_path,
+            bytes,
+            vec![DoctorRawMirrorDbLink {
+                conversation_id: Some(1),
+                message_count: Some(1),
+                source_path: Some(source_path.display().to_string()),
+                started_at_ms: Some(1_733_000_000_000),
+            }],
+        );
+        write_raw_mirror_test_manifest(&data_dir, &manifest, bytes);
+        let mut raw_mirror = collect_doctor_raw_mirror_report(&data_dir);
+        // Interrupted capture debris is operational residue, not evidence
+        // that the verified manifest/blob bytes are corrupt.
+        raw_mirror.status = "warn".to_string();
+        raw_mirror.summary.interrupted_capture_count = 24;
+
+        let report = build_doctor_source_authority_report(&db_path, &source_inventory, &raw_mirror);
+
+        assert_eq!(
+            report.selected_authority,
+            Some(DoctorSourceAuthorityKind::VerifiedRawMirror),
+            "verified mirror evidence must outrank an unreadable archive"
+        );
+        assert!(report.rejected_authorities.iter().any(|candidate| {
+            candidate.authority == DoctorSourceAuthorityKind::CanonicalArchiveDb
+                && candidate.reason.contains("unreadable")
+                && candidate
+                    .evidence
+                    .contains(&"archive-db-open-failed".to_string())
+        }));
+        assert_eq!(
+            report.checksum_evidence.summary_status,
+            DoctorArtifactChecksumStatus::Matched
+        );
+    }
+
+    #[test]
     fn doctor_source_authority_report_refuses_unverified_mirror_when_archive_missing() {
         let temp = tempfile::TempDir::new().expect("tempdir");
         let data_dir = temp.path().join("cass-data");
@@ -72687,9 +72771,40 @@ fn gather_projection_signals_from_state(
     signals
 }
 
+/// Extend the fast status projection with doctor checks when the doctor has
+/// already performed a bounded archive probe.  Doctor's detailed database
+/// check is authoritative for that run; leaving it out made the adjacent
+/// `root_cause` field fall back to `unknown` even when the database check had
+/// just reported a non-retryable malformed/open failure (cass#374).
+fn gather_projection_signals_from_doctor_checks(
+    state: &serde_json::Value,
+    host_disk_free_pct: Option<f64>,
+    checks: &[DoctorCheckReport],
+) -> crate::root_cause_projection::ProjectionSignals {
+    let mut signals = gather_projection_signals_from_state(state, host_disk_free_pct);
+    if !signals.open_read_failure
+        && checks.iter().any(|check| {
+            check.name == "database" && check.status == "fail" && {
+                let lower = check.message.to_ascii_lowercase();
+                lower.contains("openread")
+                    || lower.contains("malformed")
+                    || lower.contains("corrupt")
+                    || lower.contains("disk image")
+                    || lower.contains("sqlite_")
+            }
+        })
+    {
+        signals.open_read_failure = true;
+    }
+    signals
+}
+
 #[cfg(test)]
 mod root_cause_signal_gather_tests {
-    use super::gather_projection_signals_from_state;
+    use super::{
+        doctor_check_report, gather_projection_signals_from_doctor_checks,
+        gather_projection_signals_from_state,
+    };
     use crate::root_cause_projection::project_root_cause;
     use crate::root_cause_taxonomy::{AttributionConfidence, RootCauseFamily};
 
@@ -72705,6 +72820,24 @@ mod root_cause_signal_gather_tests {
         assert!(s.open_read_failure);
         assert_eq!(
             project_root_cause(&s).family,
+            RootCauseFamily::FrankensqliteStorage
+        );
+    }
+
+    #[test]
+    fn doctor_database_check_failure_attributes_storage_when_fast_state_is_sparse() {
+        let checks = vec![doctor_check_report(
+            "database",
+            "fail",
+            "OpenRead failed: database disk image is malformed",
+            false,
+            false,
+        )];
+        let signals =
+            gather_projection_signals_from_doctor_checks(&serde_json::json!({}), None, &checks);
+        assert!(signals.open_read_failure);
+        assert_eq!(
+            project_root_cause(&signals).family,
             RootCauseFamily::FrankensqliteStorage
         );
     }
@@ -79387,7 +79520,11 @@ pub(crate) fn run_doctor_impl(
         // projection still supports host-disk-pressure for a future surface that
         // can supply a deterministic/scrubbed signal.
         let root_cause_attribution = crate::root_cause_projection::project_root_cause(
-            &gather_projection_signals_from_state(&readiness_snapshot, None),
+            &gather_projection_signals_from_doctor_checks(
+                &readiness_snapshot,
+                None,
+                &check_reports,
+            ),
         );
         let mut payload = serde_json::json!({
             // Top-level envelope versioning. Bumped to 2 in world-class-doctor
