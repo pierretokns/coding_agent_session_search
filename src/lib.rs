@@ -22546,6 +22546,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  CASS_STREAMING_CONSUMER_COMBINE=0        DISABLE flat-combining drain in run_streaming_consumer (Card 3; DEFAULT: on). Any non-off value (unset, 1, true, yes, on) leaves combining enabled.".to_string(),
             "  CASS_STREAMING_COMBINE_MAX=<N>           max messages per combined drain (clamped 1..1024, default 64)".to_string(),
             "  CASS_STREAMING_COMBINE_MAX_BYTES=<N>     byte cap per combined drain (clamped 1MiB..STREAMING_MAX, default half)".to_string(),
+            "  CASS_SEMANTIC_FIRST_BUILD_BATCH_CONVERSATIONS=<N>  conversation window between durable first-build checkpoints (default 64)".to_string(),
             "  CASS_INDEXER_PARALLEL_WAL=off            DISABLE Card 1 parallel-WAL shadow observer (DEFAULT: shadow). Observer records per-chunk wall-clock; does NOT change commit semantics. `on`/`commit` are reserved for a future revision.".to_string(),
         ],
         RobotTopic::Paths => {

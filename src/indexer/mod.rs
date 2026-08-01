@@ -86,8 +86,8 @@ use crate::storage::sqlite::{
     seed_canonical_from_best_historical_bundle,
 };
 use semantic::{
-    EmbeddingInput, SemanticIndexer, packet_embedding_inputs_from_storage_since,
-    packet_embedding_inputs_from_storage_with_progress, semantic_doc_id_for_input,
+    EmbeddingInput, SemanticBackfillStoragePlan, SemanticIndexer,
+    packet_embedding_inputs_from_storage_since, semantic_doc_id_for_input,
     visit_packet_embedding_inputs_from_storage,
 };
 
@@ -105,6 +105,7 @@ type BatchClassificationMap =
 
 const LEXICAL_REBUILD_PACKET_VERSION: u32 = CONVERSATION_PACKET_VERSION;
 const CODEX_INDEXER_EXTRA_COMPACT_THRESHOLD_BYTES: u64 = 16 * 1024 * 1024;
+const DEFAULT_SEMANTIC_FIRST_BUILD_BATCH_CONVERSATIONS: usize = 64;
 const PREPARSE_PRIMARY_SOURCE_CAPTURE_LIMIT: usize = 256;
 const WATCH_INGEST_DEFAULT_CHUNK_SIZE: usize = 32;
 const WATCH_INGEST_CHUNK_SIZE_MAX: usize = 512;
@@ -8887,88 +8888,19 @@ fn semantic_model_revision_for_embedder_id(embedder_id: &str) -> String {
     }
 }
 
-/// Republish the semantic manifest after a direct `cass index --semantic`
-/// pass so `cass status` reflects the freshly-built vector index.
+/// Return the bounded conversation window used by the initial semantic build.
 ///
-/// The manifest-backed `cass models backfill` path already does this via
-/// `manifest.publish_artifact(...)` inside `run_backfill_batch`. The
-/// direct path at the call-site below previously skipped the manifest
-/// update entirely, leaving status pointed at stale artifact metadata
-/// even after a successful republish — see issue #203.
-#[allow(clippy::too_many_arguments)]
-fn publish_direct_semantic_artifact(
-    storage: &FrankenStorage,
-    data_dir: &Path,
-    index_path: &Path,
-    embedder_id: &str,
-    embedder_dimension: usize,
-    embedded_doc_count: u64,
-    build_started_at_ms: i64,
-) -> Result<()> {
-    let Some(tier) = semantic_tier_for_embedder_id(embedder_id) else {
-        tracing::debug!(
-            embedder = embedder_id,
-            "skipping direct semantic manifest publish: unknown embedder tier"
-        );
-        return Ok(());
-    };
-
-    // Compute conversation count and fingerprint from the SAME storage
-    // handle so the manifest's `conversation_count` and the count
-    // embedded in `db_fingerprint` (the `content-v1:N:M:K` string) can
-    // never disagree by one. Also avoids re-opening the DB in
-    // `lexical_storage_fingerprint_for_db`, which is a no-op cost on
-    // SQLite but still pointless work.
-    let total_conversations_raw = count_total_conversations_exact(storage)?;
-    let db_fingerprint = lexical_rebuild_content_fingerprint(storage, total_conversations_raw)?;
-    let total_conversations = u64::try_from(total_conversations_raw).unwrap_or(u64::MAX);
-    let size_bytes = fs::metadata(index_path)
-        .with_context(|| {
-            format!(
-                "stat published semantic index {} for direct manifest publish",
-                index_path.display()
-            )
-        })?
-        .len();
-    let relative_index_path = index_path
-        .strip_prefix(data_dir)
-        .unwrap_or(index_path)
-        .to_string_lossy()
-        .into_owned();
-    let model_revision = semantic_model_revision_for_embedder_id(embedder_id);
-
-    let mut manifest = SemanticManifest::load_or_default(data_dir).map_err(|err| {
-        anyhow::anyhow!("loading semantic manifest for direct artifact publish: {err}")
-    })?;
-    let now = semantic_indexing_now_ms();
-    manifest.publish_artifact(ArtifactRecord {
-        tier,
-        embedder_id: embedder_id.to_string(),
-        model_revision,
-        schema_version: SEMANTIC_SCHEMA_VERSION,
-        chunking_version: CHUNKING_STRATEGY_VERSION,
-        dimension: embedder_dimension,
-        doc_count: embedded_doc_count,
-        conversation_count: total_conversations,
-        db_fingerprint: db_fingerprint.clone(),
-        index_path: relative_index_path,
-        size_bytes,
-        started_at_ms: build_started_at_ms,
-        completed_at_ms: now,
-        ready: true,
-    });
-    manifest.refresh_backlog(total_conversations, &db_fingerprint);
-    manifest
-        .save(data_dir)
-        .map_err(|err| anyhow::anyhow!("saving semantic manifest after direct publish: {err}"))?;
-    tracing::info!(
-        embedder = embedder_id,
-        tier = tier.as_str(),
-        doc_count = embedded_doc_count,
-        conversation_count = total_conversations,
-        "published direct semantic artifact to manifest"
-    );
-    Ok(())
+/// The old direct `cass index --semantic` path replayed the entire canonical
+/// archive into one in-memory vector before writing anything. That made the
+/// first build neither restartable nor safe for large CPU-only machines. Keep
+/// the default conservative, while allowing operators to tune the amount of
+/// work between durable checkpoints without changing the storage format.
+fn semantic_first_build_batch_conversations() -> usize {
+    dotenvy::var("CASS_SEMANTIC_FIRST_BUILD_BATCH_CONVERSATIONS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_SEMANTIC_FIRST_BUILD_BATCH_CONVERSATIONS)
 }
 
 fn count_total_messages_exact(storage: &FrankenStorage) -> Result<usize> {
@@ -14705,6 +14637,23 @@ pub fn run_index(
             tracing::info!(embedder = %opts.embedder, "starting semantic indexing");
 
             let semantic_indexer = SemanticIndexer::new(&opts.embedder, Some(&opts.data_dir))?;
+            let semantic_tier = semantic_tier_for_embedder_id(semantic_indexer.embedder_id())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "embedder {} has no resumable semantic tier",
+                        semantic_indexer.embedder_id()
+                    )
+                })?;
+            let db_fingerprint = lexical_storage_fingerprint_for_db(&opts.db_path)?;
+            let mut semantic_manifest = SemanticManifest::load_or_default(&opts.data_dir)
+                .map_err(|err| anyhow::anyhow!("loading semantic manifest: {err}"))?;
+            let semantic_progress_sink =
+                crate::indexer::semantic_progress::SemanticProgressSink::open(
+                    semantic_tier.as_str(),
+                    semantic_indexer.embedder_id(),
+                );
+            let batch_conversations = semantic_first_build_batch_conversations();
+
             set_semantic_phase("semantic:replay");
             set_semantic_progress_phase(
                 opts.progress.as_ref(),
@@ -14721,148 +14670,93 @@ pub fn run_index(
                     )
                 })?;
 
-            let mut embedding_inputs = packet_embedding_inputs_from_storage_with_progress(
-                &semantic_read_storage,
-                |current, total| {
-                    update_semantic_progress(
-                        opts.progress.as_ref(),
-                        &progress_bump,
-                        current,
-                        total,
+            // Keep the first build bounded and durable. Each call appends to
+            // the staged FSVI, then atomically saves a manifest checkpoint.
+            // A restart resumes from the conversation/message cursor instead
+            // of replaying the entire archive or retaining the corpus in RAM.
+            let published_index_path = loop {
+                set_semantic_phase("semantic:embedding");
+                let outcome = semantic_indexer.run_capped_backfill_from_storage_with_sink(
+                    &semantic_read_storage,
+                    &opts.data_dir,
+                    &mut semantic_manifest,
+                    SemanticBackfillStoragePlan {
+                        tier: semantic_tier,
+                        db_fingerprint: db_fingerprint.clone(),
+                        model_revision: semantic_model_revision_for_embedder_id(
+                            semantic_indexer.embedder_id(),
+                        ),
+                        max_conversations: batch_conversations,
+                    },
+                    &semantic_progress_sink,
+                )?;
+                let processed =
+                    usize::try_from(outcome.conversations_processed).unwrap_or(usize::MAX);
+                let total = usize::try_from(outcome.total_conversations).unwrap_or(usize::MAX);
+                update_semantic_progress(opts.progress.as_ref(), &progress_bump, processed, total);
+                tracing::info!(
+                    tier = semantic_tier.as_str(),
+                    embedder = semantic_indexer.embedder_id(),
+                    embedded_docs = outcome.embedded_docs,
+                    conversations_processed = outcome.conversations_processed,
+                    total_conversations = outcome.total_conversations,
+                    checkpoint_saved = outcome.checkpoint_saved,
+                    published = outcome.published,
+                    "completed bounded semantic build batch"
+                );
+                if outcome.published {
+                    break outcome.index_path;
+                }
+                if !outcome.checkpoint_saved {
+                    anyhow::bail!(
+                        "semantic backfill made no progress; inspect {}",
+                        outcome.manifest_path.display()
                     );
-                },
-            )?;
+                }
+            };
+            semantic_read_storage.close_best_effort_in_place();
+
+            let index_path = published_index_path;
+            let vector_index = FsVectorIndex::open(&index_path).with_context(|| {
+                format!("opening published semantic index {}", index_path.display())
+            })?;
+            let embedded_doc_count = vector_index.record_count();
             tracing::info!(
-                message_count = embedding_inputs.len(),
-                packet_driven = true,
-                "built semantic inputs from canonical ConversationPacket replay"
+                path = %index_path.display(),
+                embedder = semantic_indexer.embedder_id(),
+                embedded_doc_count,
+                "saved resumable semantic vector index"
             );
 
-            embedding_inputs.retain(|message| {
-                !is_hard_message_noise(semantic_role_name(message.role), &message.content)
-            });
-
-            // Generate embeddings
-            set_semantic_phase("semantic:embedding");
-            set_semantic_progress_phase(
-                opts.progress.as_ref(),
-                &progress_bump,
-                INDEX_PHASE_SEMANTIC_EMBEDDING,
-                0,
-                embedding_inputs.len(),
-            );
-            let embedded_messages = semantic_indexer.embed_messages_with_progress(
-                &embedding_inputs,
-                |current, total| {
-                    update_semantic_progress(
-                        opts.progress.as_ref(),
-                        &progress_bump,
-                        current,
-                        total,
-                    );
-                },
-            )?;
-            tracing::info!(
-                embedded_count = embedded_messages.len(),
-                "generated embeddings"
-            );
-
-            if !embedded_messages.is_empty() {
-                let embedded_doc_count = embedded_messages.len();
-                let build_started_at_ms = semantic_indexing_now_ms();
-                set_semantic_phase("semantic:vector_publish");
+            // HNSW is derived and intentionally last. If it is interrupted,
+            // the durable exact vector index and semantic manifest are still
+            // usable, and the next run can rebuild only this accelerator.
+            if opts.build_hnsw && embedded_doc_count > 0 {
+                set_semantic_phase("semantic:hnsw");
                 set_semantic_progress_phase(
                     opts.progress.as_ref(),
                     &progress_bump,
-                    INDEX_PHASE_SEMANTIC_VECTOR_PUBLISH,
+                    INDEX_PHASE_SEMANTIC_HNSW,
                     0,
                     embedded_doc_count,
                 );
-                let vector_index = semantic_indexer.build_and_save_index_with_progress(
-                    embedded_messages,
+                let hnsw_path = semantic_indexer.build_hnsw_index(
+                    &vector_index,
                     &opts.data_dir,
-                    |current| {
-                        update_semantic_progress(
-                            opts.progress.as_ref(),
-                            &progress_bump,
-                            current,
-                            embedded_doc_count,
-                        );
-                    },
+                    None, // Use default M
+                    None, // Use default ef_construction
                 )?;
-                let index_path = crate::search::vector_index::vector_index_path(
-                    &opts.data_dir,
-                    semantic_indexer.embedder_id(),
-                );
-                tracing::info!(
-                    path = %index_path.display(),
-                    embedder = semantic_indexer.embedder_id(),
-                    "saved semantic vector index"
-                );
-
-                // Build HNSW index for approximate nearest neighbor search (if enabled)
-                if opts.build_hnsw {
-                    set_semantic_phase("semantic:hnsw");
-                    let vector_count = vector_index.record_count();
-                    set_semantic_progress_phase(
-                        opts.progress.as_ref(),
-                        &progress_bump,
-                        INDEX_PHASE_SEMANTIC_HNSW,
-                        0,
-                        vector_count,
-                    );
-                    let hnsw_path = semantic_indexer.build_hnsw_index(
-                        &vector_index,
-                        &opts.data_dir,
-                        None, // Use default M
-                        None, // Use default ef_construction
-                    )?;
-                    update_semantic_progress(
-                        opts.progress.as_ref(),
-                        &progress_bump,
-                        vector_count,
-                        vector_count,
-                    );
-                    tracing::info!(
-                        path = %hnsw_path.display(),
-                        embedder = semantic_indexer.embedder_id(),
-                        "saved HNSW index for approximate search"
-                    );
-                }
-
-                // Publish the artifact to the semantic manifest so `cass
-                // status` reflects the freshly-built index. Without this,
-                // `index --semantic` republishes the .fsvi file but leaves
-                // semantic_manifest.json pointed at stale metadata, so
-                // status reports `semantic: stale / available: false`
-                // even though semantic search works (issue #203).
-                set_semantic_phase("semantic:manifest");
-                set_semantic_progress_phase(
+                update_semantic_progress(
                     opts.progress.as_ref(),
                     &progress_bump,
-                    INDEX_PHASE_SEMANTIC_MANIFEST,
-                    0,
-                    1,
+                    embedded_doc_count,
+                    embedded_doc_count,
                 );
-                if let Err(err) = publish_direct_semantic_artifact(
-                    &semantic_read_storage,
-                    &opts.data_dir,
-                    &index_path,
-                    semantic_indexer.embedder_id(),
-                    semantic_indexer.embedder_dimension(),
-                    u64::try_from(embedded_doc_count).unwrap_or(u64::MAX),
-                    build_started_at_ms,
-                ) {
-                    tracing::warn!(
-                        embedder = semantic_indexer.embedder_id(),
-                        error = %err,
-                        "direct semantic artifact published to disk but \
-                         manifest update failed; cass status may report \
-                        stale/unavailable until next backfill cycle"
-                    );
-                } else {
-                    update_semantic_progress(opts.progress.as_ref(), &progress_bump, 1, 1);
-                }
+                tracing::info!(
+                    path = %hnsw_path.display(),
+                    embedder = semantic_indexer.embedder_id(),
+                    "saved HNSW index for approximate nearest neighbor search"
+                );
             }
 
             // Set watermark so incremental watch-mode embedding only sees new messages
@@ -14874,18 +14768,20 @@ pub fn run_index(
                 0,
                 1,
             );
-            semantic_read_storage.close_best_effort_in_place();
-            if let Some(max_id) = embedding_inputs.iter().map(|e| e.message_id).max() {
-                persist::with_ephemeral_writer(
-                    &storage,
-                    false,
-                    "updating semantic indexing watermark",
-                    |writer| {
-                        writer
-                            .set_last_embedded_message_id(i64::try_from(max_id).unwrap_or(i64::MAX))
-                    },
-                )?;
-            }
+            let max_message_id: i64 = storage
+                .raw()
+                .query_row_map(
+                    "SELECT COALESCE(MAX(id), 0) FROM messages",
+                    &[] as &[ParamValue],
+                    |row| row.get_typed(0),
+                )
+                .context("reading semantic indexing watermark")?;
+            persist::with_ephemeral_writer(
+                &storage,
+                false,
+                "updating semantic indexing watermark",
+                |writer| writer.set_last_embedded_message_id(max_message_id),
+            )?;
             update_semantic_progress(opts.progress.as_ref(), &progress_bump, 1, 1);
         }
     }
@@ -31233,6 +31129,18 @@ mod tests {
         assert!(
             !super::semantic_model_revision_for_embedder_id("minilm-384").is_empty(),
             "minilm revision should resolve to ModelManifest::minilm_v2().revision"
+        );
+    }
+
+    #[test]
+    fn semantic_first_build_batch_conversations_is_positive_and_configurable() {
+        let _guard = set_env("CASS_SEMANTIC_FIRST_BUILD_BATCH_CONVERSATIONS", "7");
+        assert_eq!(super::semantic_first_build_batch_conversations(), 7);
+
+        let _guard = set_env("CASS_SEMANTIC_FIRST_BUILD_BATCH_CONVERSATIONS", "0");
+        assert_eq!(
+            super::semantic_first_build_batch_conversations(),
+            super::DEFAULT_SEMANTIC_FIRST_BUILD_BATCH_CONVERSATIONS
         );
     }
 
