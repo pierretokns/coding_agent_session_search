@@ -52979,7 +52979,10 @@ fn doctor_probe_mutation_lock(data_dir: &Path) -> DoctorMutationLockObservation 
         return DoctorMutationLockObservation::Absent { path };
     }
 
-    let file = match OpenOptions::new().read(true).write(true).open(&path) {
+    // Inspection only needs a readable descriptor. Requiring write access
+    // made health/status report the archive as unavailable when the data
+    // directory or lock file was intentionally read-only.
+    let file = match OpenOptions::new().read(true).open(&path) {
         Ok(file) => file,
         Err(err) => {
             return DoctorMutationLockObservation::Unavailable {

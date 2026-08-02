@@ -482,19 +482,44 @@ fn acquire_doctor_mutation_db_open_guard(
     let deadline = Instant::now() + timeout;
     let mut backoff = Duration::from_millis(4);
     loop {
-        let file = fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&lock_path)
-            .with_context(|| {
-                format!(
-                    "opening doctor mutation lock {} before opening {}",
-                    lock_path.display(),
-                    db_path.display()
-                )
-            })?;
+        // A readonly database probe only needs to read metadata and acquire a
+        // shared lock. Opening an existing lock file read/write made status and
+        // semantic inspection fail under read-only data directories even when
+        // no repair was active. Only the first creation needs write access.
+        let file = match fs::OpenOptions::new().read(true).open(&lock_path) {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                match fs::OpenOptions::new()
+                    .create_new(true)
+                    .read(true)
+                    .write(true)
+                    .open(&lock_path)
+                {
+                    Ok(file) => file,
+                    Err(create_err) if create_err.kind() == std::io::ErrorKind::AlreadyExists => {
+                        continue;
+                    }
+                    Err(create_err) => {
+                        return Err(create_err).with_context(|| {
+                            format!(
+                                "creating doctor mutation lock {} before opening {}",
+                                lock_path.display(),
+                                db_path.display()
+                            )
+                        });
+                    }
+                }
+            }
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "opening doctor mutation lock {} before opening {}",
+                        lock_path.display(),
+                        db_path.display()
+                    )
+                });
+            }
+        };
 
         if doctor_lock_file_pid_is_current_process(&file) {
             return Ok(DoctorMutationDbOpenGuard(None));
@@ -18577,6 +18602,35 @@ mod tests {
         );
 
         fs2::FileExt::unlock(&lock_file).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn doctor_storage_readonly_probe_does_not_require_lock_write_access() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("agent_search.db");
+        {
+            let storage = FrankenStorage::open(&db_path).unwrap();
+            storage.close().unwrap();
+        }
+
+        let lock_path = doctor_mutation_lock_path_for_db_open(&db_path).unwrap();
+        let lock_file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        drop(lock_file);
+        fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o444)).unwrap();
+
+        let conn =
+            open_franken_raw_readonly_connection_with_timeout(&db_path, Duration::from_millis(25))
+                .expect("readonly DB probe should open a readable lock file");
+        drop(conn);
     }
 
     #[test]
