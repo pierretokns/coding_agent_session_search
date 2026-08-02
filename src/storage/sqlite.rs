@@ -1255,6 +1255,8 @@ pub fn fts_messages_integrity_error_from_message(
         || lower.contains("sqlite_corrupt")
         || lower.contains("databasecorrupt")
         || lower.contains("database corrupt")
+        || lower.contains("fts5: corrupt")
+        || lower.contains("corrupt %_data")
         || lower.contains("missing required")
         || (mentions_required_shadow_table
             && (lower.contains("table not found") || lower.contains("no such table")));
@@ -11175,9 +11177,24 @@ impl FrankenStorage {
                 })
             }
             FtsShadowParityStatus::Partial => {
-                let inserted_rows = self
-                    .stream_fts_rows_via_frankensqlite(true)
-                    .with_context(|| "resuming missing FTS rows via frankensqlite")?;
+                let inserted_rows = match self.stream_fts_rows_via_frankensqlite(true) {
+                    Ok(inserted_rows) => inserted_rows,
+                    Err(err)
+                        if fts_messages_integrity_error_from_message(format!("{err:#}"))
+                            .is_some() =>
+                    {
+                        tracing::warn!(
+                            error = %err,
+                            "partial FTS shadow is corrupt; falling back to failure-atomic recreation"
+                        );
+                        let inserted_rows = self.rebuild_corrupt_fts_shadow()?;
+                        return Ok(FtsConsistencyRepair::Rebuilt { inserted_rows });
+                    }
+                    Err(err) => {
+                        return Err(err)
+                            .with_context(|| "resuming missing FTS rows via frankensqlite");
+                    }
+                };
                 let after = self.require_healthy_fts_parity("resumable FTS catch-up")?;
                 self.record_fts_franken_rebuild_generation()?;
                 self.set_fts_messages_present_cache(true);
@@ -11204,6 +11221,44 @@ impl FrankenStorage {
                 before.indexable_messages
             ),
         }
+    }
+
+    /// Recreate a queryable-but-corrupt FTS shadow through a derived-only
+    /// two-phase recovery.
+    ///
+    /// Incremental insertion is preferable for a healthy partial shadow, but
+    /// FTS5 can retain malformed segment pages that reject the next insert.
+    /// FrankenSQLite cannot drop and recreate the same live virtual table in
+    /// one transaction. Commit the derived-only drop first, then let the
+    /// normal absent-shadow path create and populate it in a fresh transaction.
+    /// The canonical archive is authoritative; an interruption between phases
+    /// leaves only an absent, recoverable derived shadow.
+    fn rebuild_corrupt_fts_shadow(&self) -> Result<usize> {
+        self.invalidate_fts_messages_present_cache();
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE TRANSACTION;")
+            .with_context(|| "starting derived-only corrupt FTS removal")?;
+        if let Err(err) = self
+            .conn
+            .execute_batch("DROP TABLE IF EXISTS fts_messages;")
+            .with_context(|| "dropping corrupt derived FTS shadow")
+        {
+            self.invalidate_fts_messages_present_cache();
+            let _ = self.conn.execute_batch("ROLLBACK;");
+            return Err(err.context("corrupt FTS removal rolled back"));
+        }
+        if let Err(err) = self
+            .conn
+            .execute_batch("COMMIT;")
+            .with_context(|| "publishing derived-only corrupt FTS removal")
+        {
+            self.invalidate_fts_messages_present_cache();
+            let _ = self.conn.execute_batch("ROLLBACK;");
+            return Err(err.context("corrupt FTS removal commit failed"));
+        }
+
+        self.invalidate_fts_messages_present_cache();
+        self.rebuild_fts_via_frankensqlite()
     }
 
     pub(crate) fn rebuild_fts_via_frankensqlite(&self) -> Result<usize> {
@@ -11348,7 +11403,7 @@ impl FrankenStorage {
                     .unwrap_or_default();
                 pending_chars = pending_chars.saturating_add(row.content.len());
                 entries.push(FtsEntry {
-                    content: row.content,
+                    content: fts_content_projection(&row.content),
                     title: conversation.title.clone(),
                     agent,
                     workspace,
@@ -14228,48 +14283,72 @@ fn franken_batch_insert_fts_on_connection(
     let mut inserted = 0;
 
     for chunk in entries.chunks(FTS5_BATCH_SIZE) {
-        let placeholders: String = chunk
-            .iter()
-            .enumerate()
-            .map(|(i, _)| {
-                let base = i * 7 + 1;
-                format!(
-                    "(?{},?{},?{},?{},?{},?{},?{})",
-                    base,
-                    base + 1,
-                    base + 2,
-                    base + 3,
-                    base + 4,
-                    base + 5,
-                    base + 6
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(",");
+        let mut pending_chunks: Vec<&[FtsEntry]> = vec![chunk];
+        while let Some(chunk) = pending_chunks.pop() {
+            let placeholders: String = chunk
+                .iter()
+                .enumerate()
+                .map(|(i, _)| {
+                    let base = i * 7 + 1;
+                    format!(
+                        "(?{},?{},?{},?{},?{},?{},?{})",
+                        base,
+                        base + 1,
+                        base + 2,
+                        base + 3,
+                        base + 4,
+                        base + 5,
+                        base + 6
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
 
-        let sql = format!(
-            "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at) VALUES {placeholders}"
-        );
+            let sql = format!(
+                "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at) VALUES {placeholders}"
+            );
 
-        let mut param_values: Vec<SqliteValue> = Vec::with_capacity(chunk.len() * 7);
-        for entry in chunk {
-            param_values.push(SqliteValue::from(entry.message_id));
-            param_values.push(SqliteValue::from(entry.content.as_str()));
-            param_values.push(SqliteValue::from(entry.title.as_str()));
-            param_values.push(SqliteValue::from(entry.agent.as_str()));
-            param_values.push(SqliteValue::from(entry.workspace.as_str()));
-            param_values.push(SqliteValue::from(entry.source_path.as_str()));
-            param_values.push(SqliteValue::from(entry.created_at));
+            let mut param_values: Vec<SqliteValue> = Vec::with_capacity(chunk.len() * 7);
+            for entry in chunk {
+                param_values.push(SqliteValue::from(entry.message_id));
+                param_values.push(SqliteValue::from(entry.content.as_str()));
+                param_values.push(SqliteValue::from(entry.title.as_str()));
+                param_values.push(SqliteValue::from(entry.agent.as_str()));
+                param_values.push(SqliteValue::from(entry.workspace.as_str()));
+                param_values.push(SqliteValue::from(entry.source_path.as_str()));
+                param_values.push(SqliteValue::from(entry.created_at));
+            }
+
+            match conn.execute_with_params(&sql, &param_values) {
+                Ok(_) => {
+                    inserted += chunk.len();
+                }
+                Err(err)
+                    if chunk.len() > 1
+                        && fts_messages_integrity_error_from_message(format!(
+                            "inserting into fts_messages: {err:#}"
+                        ))
+                        .is_some() =>
+                {
+                    // A malformed FTS5 segment can be caused by the combined
+                    // term-position payload of an otherwise valid batch. SQL
+                    // statement failure is atomic, so retry the same entries
+                    // at smaller boundaries before declaring the shadow bad.
+                    let midpoint = chunk.len() / 2;
+                    let (left, right) = chunk.split_at(midpoint);
+                    pending_chunks.push(right);
+                    pending_chunks.push(left);
+                }
+                Err(err) => {
+                    return Err(err).with_context(|| {
+                        format!(
+                            "inserting {} rows into fts_messages during streaming FTS maintenance",
+                            chunk.len()
+                        )
+                    });
+                }
+            }
         }
-
-        conn.execute_with_params(&sql, &param_values)
-            .with_context(|| {
-                format!(
-                    "inserting {} rows into fts_messages during streaming FTS maintenance",
-                    chunk.len()
-                )
-            })?;
-        inserted += chunk.len();
     }
 
     Ok(inserted)
@@ -16881,7 +16960,8 @@ pub struct DailyStatsHealth {
 /// Rows per FTS5 INSERT statement during db-resident `fts_messages`
 /// maintenance/rebuild. Each row binds 7 columns (rowid + 6 cols), and
 /// frankensqlite's `MAX_VARIABLE_NUMBER` is 32766, so the hard ceiling is
-/// 32766 / 7 = 4680 rows per statement; 4096 leaves margin (28672 params).
+/// 32766 / 7 = 4680 rows per statement. Keep the operational batch below the
+/// observed FTS5 segment limit as well.
 ///
 /// This value is performance-critical, NOT just a memory knob
 /// (`coding_agent_session_search-nhqw0` / gh #301): `fts_messages` is a
@@ -16895,8 +16975,10 @@ pub struct DailyStatsHealth {
 /// wedged `cass index --full` above ~15-30 MB of content. Issuing one large
 /// param-safe statement per flush collapses that to a handful of re-encodes.
 /// The asymptotic fix (incremental contentless persistence) is tracked in
-/// frankensqlite bd-sf8dx.
-const FTS5_BATCH_SIZE: usize = 4096;
+/// frankensqlite bd-sf8dx. 4096-row statements can fail with `corrupt %_data`
+/// after roughly 3k documents even when the canonical messages are valid, so
+/// the fork uses a conservative 512-row statement.
+const FTS5_BATCH_SIZE: usize = 512;
 
 #[derive(Debug, Clone)]
 struct FtsRebuildMessageRow {
@@ -16946,7 +17028,7 @@ impl FtsEntry {
     /// Create an FTS entry from a message and conversation.
     pub fn from_message(message_id: i64, msg: &Message, conv: &Conversation) -> Self {
         FtsEntry {
-            content: msg.content.clone(),
+            content: fts_content_projection(&msg.content),
             title: conv.title.clone().unwrap_or_default(),
             agent: conv.agent_slug.clone(),
             workspace: conv
@@ -16974,6 +17056,47 @@ impl FtsEntry {
 // Unicode scalar count, and bounds message-body buffer memory.
 const FTS_ENTRY_BATCH_MAX_DOCS: usize = 4000;
 const FTS_ENTRY_BATCH_MAX_CHARS: usize = 32 * 1024 * 1024;
+
+// The canonical message and raw mirror retain the complete body. The
+// database-resident FTS shadow gets a bounded projection because SQLite FTS5
+// cannot encode pathological multi-megabyte tokens (for example a DOM blob
+// with no whitespace) and may fail with a corrupt %_data segment error.
+const FTS_MAX_MESSAGE_CONTENT_BYTES: usize = 1024 * 1024;
+const FTS_MAX_UNBROKEN_TOKEN_BYTES: usize = 16 * 1024;
+const FTS_TRUNCATION_MARKER: &str = "\n[fts projection truncated]";
+
+fn fts_content_projection(content: &str) -> String {
+    let mut projected = String::with_capacity(content.len().min(FTS_MAX_MESSAGE_CONTENT_BYTES));
+    let mut unbroken_bytes = 0usize;
+    let mut truncated = false;
+
+    for ch in content.chars() {
+        let ch_bytes = ch.len_utf8();
+        if projected.len().saturating_add(ch_bytes) > FTS_MAX_MESSAGE_CONTENT_BYTES {
+            truncated = true;
+            break;
+        }
+        if ch.is_whitespace() {
+            unbroken_bytes = 0;
+        } else if unbroken_bytes.saturating_add(ch_bytes) > FTS_MAX_UNBROKEN_TOKEN_BYTES {
+            if projected.len().saturating_add(1).saturating_add(ch_bytes)
+                > FTS_MAX_MESSAGE_CONTENT_BYTES
+            {
+                truncated = true;
+                break;
+            }
+            projected.push(' ');
+            unbroken_bytes = 0;
+        }
+        projected.push(ch);
+        unbroken_bytes = unbroken_bytes.saturating_add(ch_bytes);
+    }
+
+    if truncated || projected.len() < content.len() {
+        projected.push_str(FTS_TRUNCATION_MARKER);
+    }
+    projected
+}
 
 /// Default batch size for the FTS rebuild INSERT (Bug #168).  When
 /// `fts_messages` is empty but `messages` has 100K+ rows, a single unbounded
@@ -29108,6 +29231,25 @@ mod tests {
     }
 
     #[test]
+    fn fts_content_projection_bounds_pathological_message_bodies() {
+        let content = format!(
+            "searchable-prefix {}",
+            "x".repeat(2 * FTS_MAX_MESSAGE_CONTENT_BYTES)
+        );
+        let projected = fts_content_projection(&content);
+
+        assert!(projected.len() <= FTS_MAX_MESSAGE_CONTENT_BYTES + FTS_TRUNCATION_MARKER.len());
+        assert!(projected.contains("searchable-prefix"));
+        assert!(projected.ends_with(FTS_TRUNCATION_MARKER));
+        assert!(
+            projected
+                .split_whitespace()
+                .all(|token| token.len() <= FTS_MAX_UNBROKEN_TOKEN_BYTES),
+            "the FTS projection must split long unbroken tokens"
+        );
+    }
+
+    #[test]
     fn fts_messages_integrity_reports_missing_shadow_tables() {
         let direct_missing_shadow = fts_messages_integrity_error_from_message(
             "inserting 10000 rows into fallback FTS: table not found: fts_messages_data",
@@ -29116,6 +29258,13 @@ mod tests {
         assert_eq!(
             direct_missing_shadow.missing_shadow_tables(),
             &["fts_messages_data"]
+        );
+        assert!(
+            fts_messages_integrity_error_from_message(
+                "inserting rows into fts_messages: fts5: corrupt %_data record: segment leaf term offset exceeds u16"
+            )
+            .is_some(),
+            "malformed FTS5 segment pages must trigger derived-shadow recovery"
         );
 
         let dir = TempDir::new().unwrap();
