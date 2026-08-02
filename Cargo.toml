@@ -68,6 +68,9 @@ ftui-extras = { version = "0.3.1", git = "https://github.com/Dicklesworthstone/f
 dirs = "6.0.0"
 walkdir = "2.5.0"
 glob = "0.3.3"
+# Read-only doctor metadata probes use the mature SQLite reader; canonical
+# archive writes and salvage still use FrankenSQLite.
+rusqlite = { version = "0.39.0", features = ["bundled", "modern_sqlite"] }
 base64 = ">=0.21"
 blake3 = "1.8.5"
 mime_guess = "2.0.5"
@@ -182,9 +185,6 @@ arbitrary = { version = "1", features = ["derive"] }
 serde_yaml = "0.9.34"
 rand = "0.10"
 rand_chacha = "0.10"
-# rusqlite is retained only for C-SQLite interop fixtures in tests; production
-# storage and historical salvage paths use frankensqlite.
-rusqlite = { version = "0.39.0", features = ["bundled", "modern_sqlite"] }
 # The manifest-policy build gate requires this explicit dev entry for compat
 # fixture assertions, even though production also uses the same pinned crate.
 fsqlite-types = { version = "0.1.19", package = "fsqlite-types", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "62a58ee388775ffdf133c069372a6d01e3a589b4" }
