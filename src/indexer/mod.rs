@@ -11722,6 +11722,7 @@ struct StreamingProducerConfig {
     since_ts: Option<i64>,
     local_since_ts_by_connector: Arc<HashMap<&'static str, Option<i64>>>,
     progress: Option<Arc<IndexingProgress>>,
+    progress_bump: Option<Arc<AtomicI64>>,
     active_source_filter: Arc<ActiveSessionSourceFilter>,
 }
 
@@ -11807,6 +11808,7 @@ fn spawn_connector_producer(
                 if let Some(p) = &config.progress {
                     p.tick_activity();
                 }
+                bump_index_run_lock_progress_if_present(config.progress_bump.as_ref());
                 batch_sender.push(conversation)
             }) {
                 Ok(()) => {
@@ -11917,6 +11919,7 @@ fn spawn_connector_producer(
                 if let Some(p) = &config.progress {
                     p.tick_activity();
                 }
+                bump_index_run_lock_progress_if_present(config.progress_bump.as_ref());
                 batch_sender.push(conversation)
             }) {
                 Ok(()) => {
@@ -12617,6 +12620,7 @@ fn run_streaming_index_with_connector_factories(
             &connector_factories,
         )?),
         progress: opts.progress.clone(),
+        progress_bump: progress_bump.cloned(),
         active_source_filter: Arc::new(ActiveSessionSourceFilter::new(
             opts.watch && opts.watch_once_paths.as_ref().is_none_or(Vec::is_empty),
         )),
@@ -40795,6 +40799,7 @@ mod tests {
                 since_ts: None,
                 local_since_ts_by_connector: Arc::new(HashMap::new()),
                 progress: Some(progress.clone()),
+                progress_bump: None,
                 active_source_filter: Arc::new(ActiveSessionSourceFilter::default()),
             },
         );
@@ -41329,6 +41334,7 @@ mod tests {
                 since_ts: None,
                 local_since_ts_by_connector: Arc::new(HashMap::new()),
                 progress: None,
+                progress_bump: None,
                 active_source_filter: Arc::new(ActiveSessionSourceFilter::default()),
             },
         );
