@@ -15,6 +15,19 @@ const MAX_INDEXED_TOOL_OUTPUT_CHARS: usize = 128 * 1024;
 // Keep ordinary Codex payloads verbatim. A single unusually large event is
 // compacted before it can be duplicated into the normalized conversation.
 const MAX_FULL_CODEX_MESSAGE_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
+// A large rollout is already retained in the raw mirror. Keeping the full
+// serde_json payload for every message in that rollout multiplies memory
+// during the enrichment pass (the 203 MB production rollout expanded past
+// 4 GB). Match the upstream connector's large-session policy here as well.
+const LARGE_CODEX_SESSION_COMPACTION_THRESHOLD_BYTES: u64 = 32 * 1024 * 1024;
+
+fn should_compact_modern_codex_message_extra(
+    file_size_bytes: Option<u64>,
+    line_bytes: usize,
+) -> bool {
+    file_size_bytes.is_some_and(|size| size >= LARGE_CODEX_SESSION_COMPACTION_THRESHOLD_BYTES)
+        || line_bytes > MAX_FULL_CODEX_MESSAGE_PAYLOAD_BYTES
+}
 
 pub struct CodexConnector {
     inner: franken_agent_detection::CodexConnector,
@@ -81,6 +94,9 @@ fn augment_modern_codex_messages(conversation: &mut NormalizedConversation) {
     let Ok(file) = File::open(&conversation.source_path) else {
         return;
     };
+    let file_size_bytes = std::fs::metadata(&conversation.source_path)
+        .ok()
+        .map(|metadata| metadata.len());
     let mut message_indices_by_signature: HashMap<ModernCodexMessageSignature, usize> =
         conversation
             .messages
@@ -130,7 +146,13 @@ fn augment_modern_codex_messages(conversation: &mut NormalizedConversation) {
             }
         };
         let raw_signature = modern_codex_raw_signature(&raw);
-        let compact_message_extra = line.len() > MAX_FULL_CODEX_MESSAGE_PAYLOAD_BYTES;
+        // Use the source-file size as the session-level signal. The previous
+        // line-only check retained full payloads for thousands of ordinary
+        // sub-8 MiB events inside a 203 MB rollout, defeating the upstream
+        // large-session compaction and wedging the watcher under memory
+        // pressure.
+        let compact_message_extra =
+            should_compact_modern_codex_message_extra(file_size_bytes, line.len());
         let Some(message) = modern_codex_message(&raw, compact_message_extra) else {
             continue;
         };
@@ -785,5 +807,18 @@ mod tests {
         assert_eq!(compact.content, "keep this searchable");
         assert_eq!(compact.extra["cass"]["model"], "gpt-5-codex");
         assert!(compact.extra.get("payload").is_none());
+    }
+
+    #[test]
+    fn large_codex_session_compacts_normal_sized_events_before_enrichment() {
+        assert!(should_compact_modern_codex_message_extra(
+            Some(LARGE_CODEX_SESSION_COMPACTION_THRESHOLD_BYTES),
+            1024,
+        ));
+        assert!(!should_compact_modern_codex_message_extra(Some(1024), 1024));
+        assert!(should_compact_modern_codex_message_extra(
+            Some(1024),
+            MAX_FULL_CODEX_MESSAGE_PAYLOAD_BYTES + 1,
+        ));
     }
 }

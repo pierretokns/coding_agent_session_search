@@ -28,6 +28,8 @@
     <dict>
         <key>CASS_SKIP_PREFLIGHT_COUNT_TOTAL_MESSAGES</key>
         <string>1</string>
+        <key>FSQLITE_PAGE_BUFFER_MAX</key>
+        <string>32768</string>
     </dict>
     <key>StandardOutPath</key>
     <string>/tmp/cass-watch.launchd.log</string>

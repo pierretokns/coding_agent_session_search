@@ -6561,14 +6561,22 @@ fn collect_new_messages_for_existing_conversation<'a>(
     let mut messages = Vec::new();
 
     for msg in &conv.messages {
-        let incoming_fingerprint = message_merge_fingerprint(msg);
+        // The merge contract treats an existing idx as canonical. Check cheap
+        // metadata before hashing content; on a repeated corpus scan this
+        // avoids re-hashing millions of already-ingested messages (including
+        // very large payloads) just to discard them.
         if let Some(existing_fingerprint) = existing_messages.get(&msg.idx) {
-            if existing_fingerprint != &incoming_fingerprint {
+            if existing_fingerprint.created_at != msg.created_at
+                || existing_fingerprint.role != msg.role
+                || existing_fingerprint.author != msg.author
+            {
                 idx_collision_count = idx_collision_count.saturating_add(1);
                 first_collision_idx.get_or_insert(msg.idx);
             }
             continue;
         }
+
+        let incoming_fingerprint = message_merge_fingerprint(msg);
 
         let incoming_replay = replay_fingerprint_from_merge(&incoming_fingerprint);
         if existing_replay_fingerprints.contains(&incoming_replay) {
@@ -13948,7 +13956,7 @@ fn franken_existing_message_lookup(
         .max()
         .unwrap_or(min_idx);
     let idx_rows = tx.query_params(
-        "SELECT idx
+        "SELECT idx, role, author, created_at
          FROM messages INDEXED BY sqlite_autoindex_messages_1
          WHERE conversation_id = ?1
            AND idx >= ?2
@@ -13957,20 +13965,30 @@ fn franken_existing_message_lookup(
     )?;
     record_message_lookup_bounded_queries(1, idx_rows.len());
 
-    let mut existing_indices = HashSet::with_capacity(idx_rows.len());
+    let mut existing_indices = HashMap::with_capacity(idx_rows.len());
     for row in idx_rows {
         let idx: i64 = row.get_typed(0)?;
-        existing_indices.insert(idx);
+        let role: String = row.get_typed(1)?;
+        existing_indices.insert(
+            idx,
+            MessageMergeFingerprint {
+                idx,
+                created_at: row.get_typed(3)?,
+                role: role_from_str(&role),
+                author: row.get_typed(2)?,
+                content_hash: [0; 32],
+            },
+        );
     }
 
     let mut by_idx = HashMap::with_capacity(incoming_messages.len().min(existing_indices.len()));
     let mut missing_messages = Vec::new();
     for msg in incoming_messages {
-        if existing_indices.contains(&msg.idx) {
-            // Same-idx messages are skipped by merge policy even when content has
-            // diverged. Use the incoming fingerprint as a lightweight presence
-            // marker so normal reprocessing does not need to read stored content.
-            by_idx.insert(msg.idx, message_merge_fingerprint(msg));
+        if let Some(existing_fingerprint) = existing_indices.get(&msg.idx) {
+            // Same-idx messages are skipped by merge policy even when content
+            // has diverged. Use a payload-free presence marker so normal
+            // reprocessing does not need to hash stored or incoming content.
+            by_idx.insert(msg.idx, existing_fingerprint.clone());
         } else {
             missing_messages.push(msg);
         }

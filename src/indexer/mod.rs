@@ -11647,6 +11647,20 @@ pub fn streaming_index_enabled() -> bool {
         .unwrap_or(true)
 }
 
+/// Connector fan-out is opt-in because each parser may retain one large
+/// session while it hands batches to the consumer. Serial mode keeps peak
+/// heap bounded without changing the connector set or canonical data.
+fn streaming_connector_parallel_enabled() -> bool {
+    dotenvy::var("CASS_STREAMING_CONNECTOR_PARALLEL")
+        .ok()
+        .is_some_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+}
+
 fn scan_path_exclusions_value_active(value: Option<&str>) -> bool {
     value.is_some_and(|raw| {
         raw.split([',', '\n'])
@@ -12529,6 +12543,36 @@ fn run_streaming_index_with_connector_factories(
             }
         }
         return Ok(NonWatchIngestOutcome::default());
+    }
+
+    // Large local archives are memory-bound by connector parsing, not by the
+    // bounded channel. Running six connector parsers concurrently lets each
+    // retain its current NormalizedConversation (and parser scratch space),
+    // multiplying a single large-session footprint until macOS starts
+    // swapping or the process is killed. Keep the channel/backpressure path,
+    // but serialize connector scans by default. Operators with ample memory
+    // can opt back into the old fan-out with CASS_STREAMING_CONNECTOR_PARALLEL=1.
+    if connector_factories.len() > 1 && !streaming_connector_parallel_enabled() {
+        let mut combined = NonWatchIngestOutcome::default();
+        let mut t_index = t_index;
+
+        for (name, factory) in connector_factories {
+            tracing::info!(connector = name, "serial_connector_scan_start");
+            let outcome = run_streaming_index_with_connector_factories(
+                storage,
+                t_index.as_deref_mut(),
+                opts,
+                since_ts,
+                lexical_strategy,
+                additional_scan_roots.clone(),
+                vec![(name, factory)],
+                scan_start_ts,
+                progress_bump,
+            )?;
+            combined = combined.accumulate(outcome);
+            tracing::info!(connector = name, "serial_connector_scan_complete");
+        }
+        return Ok(combined);
     }
 
     let buffered_connectors: Vec<&'static str> = connector_factories
@@ -26140,7 +26184,19 @@ pub mod persist {
         // with the short-lived writer so watch-mode observability and follow-up
         // policy transitions still reflect the active ingestion mode.
         apply_index_writer_checkpoint_policy(storage, defer_checkpoints);
-        let (writer, reusable) = storage.acquire_cached_ephemeral_writer().with_context(|| {
+        // Reusing a writer across ingest batches also reuses its frankensqlite
+        // page/MVCC state. On a long corpus that state grows even though each
+        // batch commits, eventually turning an overnight scan into a multi-GB
+        // process. Keep the safe, genuinely short-lived behavior as the default;
+        // the old reuse behavior remains available for workloads that explicitly
+        // accept its memory trade-off (and for the temp-table reuse test).
+        let reuse_writer = ephemeral_writer_reuse_enabled();
+        let (writer, reusable) = if reuse_writer {
+            storage.acquire_cached_ephemeral_writer()
+        } else {
+            FrankenStorage::open_writer(&db_path).map(|writer| (writer, false))
+        }
+        .with_context(|| {
             format!(
                 "opening short-lived frankensqlite writer for {context}: {}",
                 db_path.display()
@@ -26228,6 +26284,20 @@ pub mod persist {
                 Err(err)
             }
         }
+    }
+
+    fn ephemeral_writer_reuse_enabled() -> bool {
+        if cfg!(test) {
+            return true;
+        }
+        dotenvy::var("CASS_REUSE_EPHEMERAL_WRITER")
+            .ok()
+            .is_some_and(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
     }
 
     fn transient_franken_error(err: &anyhow::Error) -> Option<&FrankenError> {
