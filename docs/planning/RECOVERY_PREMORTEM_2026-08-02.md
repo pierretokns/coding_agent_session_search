@@ -13,6 +13,19 @@ The recovery gate is therefore: make reconstruction resumable and durably
 supervised, then prove candidate coverage, promotion safety, lexical readiness,
 semantic readiness, real hybrid execution, and watcher stability.
 
+## Observed run signal
+
+The durable run
+`doctor-recovery-20260802-171320-7436` demonstrated an important monitoring
+rule. While parsing a large Codex payload, the progress-record count held at
+17,197 for roughly two minutes, but the process stayed CPU-bound, the candidate
+SQLite WAL and receipt stream continued to grow, and the next checkpoint later
+advanced to 17,342 and then 17,430. A flat record count is therefore not, by
+itself, a stall. The low-noise watch must sample process ownership/CPU together
+with progress bytes, receipt/WAL growth, and free space; intervene only when
+all activity signals are flat for the configured timeout or the supervisor
+exits.
+
 ## Failure modes and controls
 
 | Failure mode | Evidence / likelihood | Impact | Detection gate | Control |
@@ -53,4 +66,3 @@ semantic readiness, real hybrid execution, and watcher stability.
 - Watcher is restarted only after recovery and remains alive across a detached
   operator session.
 - CM is rerun against the verified live corpus and its output is retained.
-
