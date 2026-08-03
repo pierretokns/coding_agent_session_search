@@ -6272,6 +6272,67 @@ pub struct InsertOutcome {
 /// before promotion.
 pub struct DoctorSqliteWriter {
     conn: rusqlite::Connection,
+    db_path: PathBuf,
+    raw_mirror_tail_marker_written: bool,
+}
+
+/// Marks a candidate whose raw-mirror reconstruction writes authoritative
+/// conversation tails in the same transaction as its message rows.  The
+/// lexical planner may use those tails as sizing metadata without repeating a
+/// full `messages GROUP BY conversation_id` scan through FrankenSQLite.
+pub(crate) const DOCTOR_RAW_MIRROR_TAIL_METADATA_META_KEY: &str =
+    "cass.doctor.raw_mirror_tail_metadata";
+const DOCTOR_RAW_MIRROR_TAIL_METADATA_META_VALUE: &str = "authoritative-v1";
+
+fn doctor_raw_mirror_tail_metadata_sidecar_path(db_path: &Path) -> PathBuf {
+    database_sidecar_path(db_path, ".cass-doctor-tail-authoritative")
+}
+
+fn doctor_raw_mirror_tail_metadata_sidecar_is_valid(db_path: &Path) -> bool {
+    fs::read_to_string(doctor_raw_mirror_tail_metadata_sidecar_path(db_path))
+        .map(|value| value.trim() == DOCTOR_RAW_MIRROR_TAIL_METADATA_META_VALUE)
+        .unwrap_or(false)
+}
+
+fn persist_doctor_raw_mirror_tail_metadata_sidecar(db_path: &Path) -> Result<()> {
+    let marker_path = doctor_raw_mirror_tail_metadata_sidecar_path(db_path);
+    let temp_path = database_sidecar_path(
+        &marker_path,
+        &format!(
+            ".tmp.{}.{}",
+            std::process::id(),
+            FrankenStorage::now_millis()
+        ),
+    );
+    fs::write(
+        &temp_path,
+        format!("{DOCTOR_RAW_MIRROR_TAIL_METADATA_META_VALUE}\n"),
+    )
+    .with_context(|| {
+        format!(
+            "writing raw-mirror tail metadata marker {}",
+            temp_path.display()
+        )
+    })?;
+    sync_file_if_exists(&temp_path).with_context(|| {
+        format!(
+            "syncing raw-mirror tail metadata marker {}",
+            temp_path.display()
+        )
+    })?;
+    fs::rename(&temp_path, &marker_path).with_context(|| {
+        format!(
+            "publishing raw-mirror tail metadata marker {}",
+            marker_path.display()
+        )
+    })?;
+    sync_parent_directory(marker_path.parent().unwrap_or(Path::new("."))).with_context(|| {
+        format!(
+            "syncing raw-mirror tail metadata marker parent {}",
+            marker_path.parent().unwrap_or(Path::new(".")).display()
+        )
+    })?;
+    Ok(())
 }
 
 impl DoctorSqliteWriter {
@@ -6284,7 +6345,31 @@ impl DoctorSqliteWriter {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "temp_store", "MEMORY")?;
         conn.pragma_update(None, "cache_size", -524_288_i64)?;
-        Ok(Self { conn })
+        let mut raw_mirror_tail_marker_written =
+            doctor_raw_mirror_tail_metadata_sidecar_is_valid(path);
+        if !raw_mirror_tail_marker_written {
+            // A candidate created before the sidecar optimization may already
+            // contain the transactional authority marker. Verify that with
+            // native SQLite while the writer is open; do not route this
+            // compatibility probe through FrankenSQLite's large-archive
+            // pager path.
+            let marker_in_database = conn
+                .query_row(
+                    "SELECT value FROM meta WHERE key = ?1",
+                    rusqlite::params![DOCTOR_RAW_MIRROR_TAIL_METADATA_META_KEY],
+                    |row| row.get::<_, String>(0),
+                )
+                .map(|value| value == DOCTOR_RAW_MIRROR_TAIL_METADATA_META_VALUE)
+                .unwrap_or(false);
+            if marker_in_database && persist_doctor_raw_mirror_tail_metadata_sidecar(path).is_ok() {
+                raw_mirror_tail_marker_written = true;
+            }
+        }
+        Ok(Self {
+            conn,
+            db_path: path.to_path_buf(),
+            raw_mirror_tail_marker_written,
+        })
     }
 
     pub fn insert_doctor_conversation_chunk(
@@ -6313,6 +6398,13 @@ impl DoctorSqliteWriter {
             return Ok(Vec::new());
         }
         let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+            rusqlite::params![
+                DOCTOR_RAW_MIRROR_TAIL_METADATA_META_KEY,
+                DOCTOR_RAW_MIRROR_TAIL_METADATA_META_VALUE,
+            ],
+        )?;
         doctor_native_ensure_reference_rows(&tx, chunks)?;
         let mut outcomes = Vec::with_capacity(chunks.len());
         for &(agent_id, workspace_id, raw_conv) in chunks {
@@ -6324,6 +6416,15 @@ impl DoctorSqliteWriter {
             )?);
         }
         tx.commit()?;
+        if !self.raw_mirror_tail_marker_written {
+            // The database transaction is durable before this sidecar is
+            // published.  A crash between the two leaves the marker absent,
+            // which safely selects the slower legacy planner on resume.
+            // Publishing it after commit also avoids making the marker part
+            // of the 47k-transaction recovery hot path.
+            persist_doctor_raw_mirror_tail_metadata_sidecar(&self.db_path)?;
+            self.raw_mirror_tail_marker_written = true;
+        }
         Ok(outcomes)
     }
 
@@ -8505,6 +8606,8 @@ impl FrankenStorage {
     pub fn list_conversation_footprints_for_lexical_rebuild(
         &self,
     ) -> Result<Vec<LexicalRebuildConversationFootprintRow>> {
+        let prep_profile = std::env::var_os("CASS_PREP_PROFILE").is_some();
+        let profile_started = Instant::now();
         let tail_state_rows: Vec<(i64, Option<i64>)> = match self.conn.query_map_collect(
             "SELECT conversation_id, last_message_idx
              FROM conversation_tail_state
@@ -8518,6 +8621,13 @@ impl FrankenStorage {
                 return Err(err).with_context(|| "listing lexical rebuild tail-state estimates");
             }
         };
+        if prep_profile {
+            eprintln!(
+                "CASS_PREP_PROFILE storage=footprints step=tail_state rows={} elapsed_ms={}",
+                tail_state_rows.len(),
+                profile_started.elapsed().as_secs_f64() * 1000.0
+            );
+        }
         let tail_state_by_conversation: HashMap<i64, Option<i64>> =
             tail_state_rows.into_iter().collect();
 
@@ -8546,6 +8656,13 @@ impl FrankenStorage {
                     .with_context(|| "listing lexical rebuild conversation footprint estimates");
             }
         };
+        if prep_profile {
+            eprintln!(
+                "CASS_PREP_PROFILE storage=footprints step=conversations rows={} elapsed_ms={}",
+                rows.len(),
+                profile_started.elapsed().as_secs_f64() * 1000.0
+            );
+        }
 
         let mut footprints = Vec::with_capacity(rows.len());
         let mut missing_tail_positions = HashMap::new();
@@ -8578,8 +8695,19 @@ impl FrankenStorage {
                 &missing_tail_positions,
             )?;
         }
-        if !every_footprint_was_missing_tail {
+        if !every_footprint_was_missing_tail
+            && !self.lexical_rebuild_tail_footprints_are_authoritative()?
+        {
             self.raise_lexical_rebuild_footprints_to_exact_message_counts(&mut footprints)?;
+        }
+
+        if prep_profile {
+            eprintln!(
+                "CASS_PREP_PROFILE storage=footprints step=complete footprints={} missing_tails={} elapsed_ms={}",
+                footprints.len(),
+                missing_tail_positions.len(),
+                profile_started.elapsed().as_secs_f64() * 1000.0
+            );
         }
 
         Ok(footprints)
@@ -8650,6 +8778,32 @@ impl FrankenStorage {
             total_conversations,
             covered_conversations,
         ))
+    }
+
+    pub(crate) fn lexical_rebuild_tail_footprints_are_authoritative(&self) -> Result<bool> {
+        // Native doctor reconstruction publishes this marker only after the
+        // corresponding SQLite transaction commits.  Reading the tiny
+        // sidecar avoids a FrankenSQLite point lookup whose pager path can
+        // scan/replay a multi-gigabyte candidate before returning a one-row
+        // metadata result.  Missing/corrupt sidecars deliberately fall back
+        // to the database marker for legacy candidates.
+        if doctor_raw_mirror_tail_metadata_sidecar_is_valid(&self.db_path) {
+            return Ok(true);
+        }
+        let marker: Option<String> = match self.conn.query_row_map(
+            "SELECT value FROM meta WHERE key = ?1",
+            fparams![DOCTOR_RAW_MIRROR_TAIL_METADATA_META_KEY],
+            |row| row.get_typed(0),
+        ) {
+            Ok(value) => Some(value),
+            Err(err) if error_indicates_missing_table(&err) => None,
+            Err(err) if err.to_string().to_ascii_lowercase().contains("no rows") => None,
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| "reading lexical rebuild tail metadata authority marker");
+            }
+        };
+        Ok(marker.as_deref() == Some(DOCTOR_RAW_MIRROR_TAIL_METADATA_META_VALUE))
     }
 
     fn raise_lexical_rebuild_footprints_to_exact_message_counts(
@@ -9215,6 +9369,19 @@ impl FrankenStorage {
             return Ok(());
         }
 
+        // Raw-mirror candidates have exact conversation tails and are built
+        // append-only.  Their lexical reader can use one ordered range scan
+        // instead of opening one FrankenSQLite query per conversation.  The
+        // ordinary path deliberately keeps the per-conversation probes: some
+        // legacy archives have poor plans for a broad IN/range query.
+        if self.lexical_rebuild_tail_footprints_are_authoritative()? {
+            return self.stream_authoritative_lexical_rebuild_messages(
+                start_conversation_id,
+                end_conversation_id,
+                f,
+            );
+        }
+
         let conversation_ids: Vec<i64> = self
             .conn
             .query_map_collect(
@@ -9250,6 +9417,82 @@ impl FrankenStorage {
             }
         }
 
+        Ok(())
+    }
+
+    fn stream_authoritative_lexical_rebuild_messages<F>(
+        &self,
+        start_conversation_id: i64,
+        end_conversation_id: i64,
+        mut f: F,
+    ) -> Result<()>
+    where
+        F: FnMut(LexicalRebuildMessageRow) -> Result<()>,
+    {
+        let cap = lexical_max_conversation_content_bytes();
+        let sql = "SELECT id, conversation_id, idx, role, author, created_at, content
+                   FROM messages INDEXED BY sqlite_autoindex_messages_1
+                   WHERE conversation_id >= ?1 AND conversation_id <= ?2
+                   ORDER BY conversation_id, idx";
+        let mut active_conversation_id = None;
+        let mut used_content_bytes = 0usize;
+        let params = [
+            SqliteValue::Integer(start_conversation_id),
+            SqliteValue::Integer(end_conversation_id),
+        ];
+        let mut callback_error = None;
+        self.conn
+            .query_with_params_for_each(sql, &params, |row| {
+                if callback_error.is_some() {
+                    return Ok(());
+                }
+                let row_result: std::result::Result<(), frankensqlite::FrankenError> = (|| {
+                    let conversation_id: i64 = row.get_typed(1)?;
+                    if active_conversation_id != Some(conversation_id) {
+                        active_conversation_id = Some(conversation_id);
+                        used_content_bytes = 0;
+                    }
+
+                    let mut content: String = row.get_typed(6)?;
+                    if used_content_bytes >= cap {
+                        content.clear();
+                    } else {
+                        let remaining = cap - used_content_bytes;
+                        let boundary = lexical_content_truncation_boundary(&content, remaining);
+                        content.truncate(boundary);
+                        used_content_bytes = used_content_bytes.saturating_add(boundary);
+                    }
+
+                    f(LexicalRebuildMessageRow {
+                        conversation_id,
+                        id: row.get_typed(0)?,
+                        idx: row.get_typed(2)?,
+                        role: match row.get_typed::<String>(3)?.as_str() {
+                            "user" => "user",
+                            "agent" | "assistant" => "assistant",
+                            "tool" => "tool",
+                            "system" => "system",
+                            other => other,
+                        }
+                        .to_string(),
+                        author: row.get_typed(4)?,
+                        created_at: row.get_typed(5)?,
+                        content,
+                    })
+                    .map_err(|err| frankensqlite::FrankenError::Internal(err.to_string()))
+                })(
+                );
+                if let Err(err) = row_result {
+                    callback_error = Some(err);
+                }
+                Ok(())
+            })
+            .with_context(|| "streaming authoritative raw-mirror lexical messages")?;
+        if let Some(err) = callback_error {
+            return Err(anyhow!(
+                "streaming authoritative raw-mirror lexical messages: {err}"
+            ));
+        }
         Ok(())
     }
 
@@ -23480,6 +23723,7 @@ mod tests {
                 .all(|outcome| outcome.inserted_indices.is_empty())
         );
         drop(writer);
+        assert!(doctor_raw_mirror_tail_metadata_sidecar_is_valid(&db_path));
 
         let storage = SqliteStorage::open(&db_path).unwrap();
         let row = storage

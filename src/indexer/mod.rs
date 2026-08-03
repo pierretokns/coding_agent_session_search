@@ -7152,6 +7152,30 @@ fn lexical_rebuild_responsiveness_policy() -> LexicalRebuildResponsivenessPolicy
     }
 }
 
+fn lexical_rebuild_db_path_is_doctor_candidate(db_path: &Path) -> bool {
+    db_path.file_name().and_then(|name| name.to_str()) == Some("candidate.db")
+        && db_path
+            .components()
+            .any(|component| component.as_os_str() == "candidates")
+}
+
+fn lexical_rebuild_responsiveness_policy_for_db(
+    db_path: &Path,
+) -> LexicalRebuildResponsivenessPolicy {
+    // A raw-mirror candidate is an offline, disposable rebuild input.  It has
+    // no interactive search workload to protect, so begin at the steady
+    // budget and avoid paying the conservative-startup ramp on every large
+    // recovery. Explicit operator policy still wins.
+    if dotenvy::var("CASS_TANTIVY_REBUILD_CONTROLLER_MODE").is_err()
+        && !responsiveness::disabled_via_env()
+        && lexical_rebuild_db_path_is_doctor_candidate(db_path)
+    {
+        LexicalRebuildResponsivenessPolicy::Steady
+    } else {
+        lexical_rebuild_responsiveness_policy()
+    }
+}
+
 fn lexical_rebuild_controller_restore_clear_samples() -> usize {
     dotenvy::var("CASS_TANTIVY_REBUILD_CONTROLLER_RESTORE_CLEAR_SAMPLES")
         .ok()
@@ -9847,13 +9871,14 @@ fn lexical_rebuild_default_shard_budget(
 
 const LEXICAL_REBUILD_STAGED_SHARD_MESSAGE_BYTES_FLOOR: usize = 16 * 1024 * 1024;
 const LEXICAL_REBUILD_STAGED_SHARD_MESSAGE_BYTES_DEFAULT: usize = 64 * 1024 * 1024;
-const LEXICAL_REBUILD_STAGED_SHARD_MESSAGE_BYTES_CEILING: usize = 128 * 1024 * 1024;
+const LEXICAL_REBUILD_STAGED_SHARD_MESSAGE_BYTES_CEILING: usize = 384 * 1024 * 1024;
 // The staged-shard byte cap is a per-builder working-set guard, not a host
-// allocation target.  A 2,048 divisor made a 64 GiB Mac choose ~22 MiB
-// shards, while the static builder-farm guard below could still collapse the
-// farm to one worker.  Keep the cap bounded, but leave concurrency decisions
-// to the live memory-admission controller.
-const LEXICAL_REBUILD_STAGED_SHARD_MESSAGE_BYTES_MEMORY_FRACTION: u64 = 4_096;
+// allocation target.  A 4,096 divisor made a 64 GiB Mac choose the 16 MiB
+// floor, creating hundreds of avoidably small Tantivy shards on large
+// rebuilds.  Scale to a few hundred MiB on a large Mac, keep a hard ceiling,
+// and leave actual concurrency decisions to the live memory-admission
+// controller.
+const LEXICAL_REBUILD_STAGED_SHARD_MESSAGE_BYTES_MEMORY_FRACTION: u64 = 128;
 
 fn lexical_rebuild_default_staged_shard_max_message_bytes_for_available_memory(
     available_memory_bytes: Option<u64>,
@@ -10052,7 +10077,28 @@ fn plan_lexical_rebuild_shards_from_storage_with_settings(
     settings: &LexicalRebuildPipelineSettingsSnapshot,
     total_conversations: usize,
 ) -> Result<LexicalShardPlan> {
-    if !storage.lexical_rebuild_has_tail_footprint_metadata()? {
+    let prep_profile = std::env::var_os("CASS_PREP_PROFILE").is_some();
+    let profile_started = Instant::now();
+    // Raw-mirror candidates write exact tail indexes in the same transaction
+    // as their messages.  Avoid the expensive FrankenSQLite coverage/count
+    // probes for that explicitly marked path; ordinary databases retain the
+    // conservative metadata-coverage check below.
+    let authoritative_tail_metadata =
+        storage.lexical_rebuild_tail_footprints_are_authoritative()?;
+    if prep_profile {
+        eprintln!(
+            "CASS_PREP_PROFILE storage=footprints step=authority_marker authoritative={} elapsed_ms={}",
+            authoritative_tail_metadata,
+            profile_started.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+    if !authoritative_tail_metadata && !storage.lexical_rebuild_has_tail_footprint_metadata()? {
+        if prep_profile {
+            eprintln!(
+                "CASS_PREP_PROFILE storage=footprints step=tail_coverage_missing elapsed_ms={}",
+                profile_started.elapsed().as_secs_f64() * 1000.0
+            );
+        }
         let total_messages = count_total_messages_exact(storage)?;
         return plan_lexical_rebuild_shards_from_conversation_ids_with_settings(
             storage,
@@ -10063,6 +10109,13 @@ fn plan_lexical_rebuild_shards_from_storage_with_settings(
     }
 
     let conversations = lexical_rebuild_shard_planner_conversations_from_storage(storage)?;
+    if prep_profile {
+        eprintln!(
+            "CASS_PREP_PROFILE storage=footprints step=planner_rows rows={} elapsed_ms={}",
+            conversations.len(),
+            profile_started.elapsed().as_secs_f64() * 1000.0
+        );
+    }
     let total_conversations = conversations.len();
     let total_messages = conversations
         .iter()
@@ -17187,7 +17240,7 @@ pub(crate) fn repair_lexical_index_from_canonical_db_for_search(
 }
 
 #[cfg(test)]
-fn rebuild_tantivy_from_db_deferred_startup(
+pub(crate) fn rebuild_tantivy_from_db_deferred_startup(
     db_path: &Path,
     data_dir: &Path,
     total_conversations: usize,
@@ -20524,7 +20577,7 @@ fn rebuild_tantivy_from_db_with_options(
         steady_commit_interval_messages,
         steady_commit_interval_message_bytes,
     );
-    let controller_policy = lexical_rebuild_responsiveness_policy();
+    let controller_policy = lexical_rebuild_responsiveness_policy_for_db(db_path);
     let available_parallelism = pipeline_settings.available_parallelism;
     let reserved_cores = pipeline_settings.reserved_cores;
     let controller_loadavg_high_watermark_1m_milli =
@@ -34933,6 +34986,26 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn doctor_candidate_rebuild_defaults_to_steady_without_changing_ordinary_archives() {
+        let _responsiveness = unset_env_var("CASS_RESPONSIVENESS_DISABLE");
+        let _controller_mode = unset_env_var("CASS_TANTIVY_REBUILD_CONTROLLER_MODE");
+
+        assert_eq!(
+            lexical_rebuild_responsiveness_policy_for_db(std::path::Path::new(
+                "/tmp/cass-data/doctor/candidates/recovery/database/candidate.db",
+            )),
+            LexicalRebuildResponsivenessPolicy::Steady
+        );
+        assert_eq!(
+            lexical_rebuild_responsiveness_policy_for_db(std::path::Path::new(
+                "/tmp/cass-data/agent_search.db",
+            )),
+            LexicalRebuildResponsivenessPolicy::Auto
+        );
+    }
+
+    #[test]
     fn lexical_rebuild_default_worker_parallelism_reserves_machine_headroom() {
         assert_eq!(lexical_rebuild_default_reserved_cores_for_available(1), 0);
         assert_eq!(
@@ -35115,19 +35188,19 @@ mod tests {
             lexical_rebuild_default_staged_shard_max_message_bytes_for_available_memory(Some(
                 32 * GIB
             )),
-            16 * 1024 * 1024
+            256 * 1024 * 1024
         );
         assert_eq!(
             lexical_rebuild_default_staged_shard_max_message_bytes_for_available_memory(Some(
                 128 * GIB
             )),
-            32 * 1024 * 1024
+            384 * 1024 * 1024
         );
         assert_eq!(
             lexical_rebuild_default_staged_shard_max_message_bytes_for_available_memory(Some(
                 512 * GIB
             )),
-            128 * 1024 * 1024
+            384 * 1024 * 1024
         );
     }
 
