@@ -9848,7 +9848,12 @@ fn lexical_rebuild_default_shard_budget(
 const LEXICAL_REBUILD_STAGED_SHARD_MESSAGE_BYTES_FLOOR: usize = 16 * 1024 * 1024;
 const LEXICAL_REBUILD_STAGED_SHARD_MESSAGE_BYTES_DEFAULT: usize = 64 * 1024 * 1024;
 const LEXICAL_REBUILD_STAGED_SHARD_MESSAGE_BYTES_CEILING: usize = 128 * 1024 * 1024;
-const LEXICAL_REBUILD_STAGED_SHARD_MESSAGE_BYTES_MEMORY_FRACTION: u64 = 2_048;
+// The staged-shard byte cap is a per-builder working-set guard, not a host
+// allocation target.  A 2,048 divisor made a 64 GiB Mac choose ~22 MiB
+// shards, while the static builder-farm guard below could still collapse the
+// farm to one worker.  Keep the cap bounded, but leave concurrency decisions
+// to the live memory-admission controller.
+const LEXICAL_REBUILD_STAGED_SHARD_MESSAGE_BYTES_MEMORY_FRACTION: u64 = 4_096;
 
 fn lexical_rebuild_default_staged_shard_max_message_bytes_for_available_memory(
     available_memory_bytes: Option<u64>,
@@ -10148,7 +10153,11 @@ struct LexicalRebuildShardBuilderSettings {
     writer_parallelism_budget: usize,
 }
 
-const LEXICAL_REBUILD_STAGED_SHARD_BUILDER_MEMORY_SLOT_BYTES: u64 = 32 * 1024 * 1024 * 1024;
+// This is only an initial builder-farm ceiling.  Actual admission uses the
+// observed shard amplification and live reclaimable memory in
+// LexicalRebuildStagedShardBuildController.  Treating each builder as a
+// 32 GiB reservation serialized recovery on ordinary 64 GiB Macs.
+const LEXICAL_REBUILD_STAGED_SHARD_BUILDER_MEMORY_SLOT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const LEXICAL_REBUILD_STAGED_SHARD_BUILDER_MEMORY_BUDGET_NUMERATOR: u64 = 2;
 const LEXICAL_REBUILD_STAGED_SHARD_BUILDER_MEMORY_BUDGET_DENOMINATOR: u64 = 3;
 const LEXICAL_REBUILD_STAGED_SHARD_BUILD_RESERVE_FRACTION: u64 = 8;
@@ -35082,8 +35091,8 @@ mod tests {
                 8,
                 Some(128 * GIB),
             ),
-            2,
-            "128 GiB hosts should not default to an 8-shard Tantivy build storm"
+            8,
+            "the live memory-admission controller, not a fictitious 32 GiB-per-builder reservation, should bound the farm"
         );
         assert_eq!(
             lexical_rebuild_default_staged_shard_builder_parallelism_for_workers_and_memory(
@@ -35112,7 +35121,7 @@ mod tests {
             lexical_rebuild_default_staged_shard_max_message_bytes_for_available_memory(Some(
                 128 * GIB
             )),
-            64 * 1024 * 1024
+            32 * 1024 * 1024
         );
         assert_eq!(
             lexical_rebuild_default_staged_shard_max_message_bytes_for_available_memory(Some(

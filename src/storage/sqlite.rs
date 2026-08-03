@@ -6313,6 +6313,7 @@ impl DoctorSqliteWriter {
             return Ok(Vec::new());
         }
         let tx = self.conn.transaction()?;
+        doctor_native_ensure_reference_rows(&tx, chunks)?;
         let mut outcomes = Vec::with_capacity(chunks.len());
         for &(agent_id, workspace_id, raw_conv) in chunks {
             outcomes.push(Self::insert_doctor_conversation_chunk_in_tx(
@@ -6336,36 +6337,10 @@ impl DoctorSqliteWriter {
 
         let normalized_conv = normalized_conversation_for_storage(raw_conv);
         let conv = normalized_conv.as_ref();
-        let now = FrankenStorage::now_millis();
-        let source = normalized_source_for_conversation(conv);
-        let source_kind = source.kind.to_string();
-        let source_host = source.host_label.as_deref();
-        let workspace_path = conv
-            .workspace
-            .as_ref()
-            .map(|path| path_to_string(path))
-            .unwrap_or_default();
 
         let (metadata_json, metadata_bin) = franken_metadata_insert_payload(&conv.metadata_json)?;
         let (last_message_idx, last_message_created_at) = conversation_tail_state(conv);
         let conversation_key = conversation_merge_key(agent_id, conv);
-
-        tx.execute(
-            "INSERT OR IGNORE INTO agents(id, slug, name, kind, created_at, updated_at)
-             VALUES(?1, ?2, ?2, 'cli', ?3, ?3)",
-            rusqlite::params![agent_id, conv.agent_slug.as_str(), now],
-        )?;
-        if let Some(workspace_id) = workspace_id {
-            tx.execute(
-                "INSERT OR IGNORE INTO workspaces(id, path) VALUES(?1, ?2)",
-                rusqlite::params![workspace_id, workspace_path],
-            )?;
-        }
-        tx.execute(
-            "INSERT OR IGNORE INTO sources(id, kind, host_label, created_at, updated_at)
-             VALUES(?1, ?2, ?3, ?4, ?4)",
-            rusqlite::params![source.id.as_str(), source_kind, source_host, now],
-        )?;
 
         let existing_id: Option<i64> = match &conversation_key {
             PendingConversationKey::External {
@@ -6434,7 +6409,7 @@ impl DoctorSqliteWriter {
             .map(|(first, last)| (first.idx.min(last.idx), first.idx.max(last.idx)))
             .unwrap_or((0, -1));
         let mut existing_indices = HashSet::new();
-        if first_idx <= last_idx {
+        if !conversation_inserted && first_idx <= last_idx {
             let mut statement = tx.prepare(
                 "SELECT idx FROM messages
                  WHERE conversation_id = ?1 AND idx BETWEEN ?2 AND ?3",
@@ -6453,8 +6428,20 @@ impl DoctorSqliteWriter {
             .filter(|message| !existing_indices.contains(&message.idx))
             .collect();
 
-        let (inserted_indices, inserted_message_ids) =
-            doctor_native_insert_messages_batched(&tx, conversation_id, &new_messages)?;
+        // Raw-mirror reconstruction never carries snippets. Avoid collecting
+        // one RETURNING rowid per message on that hot path; IDs are needed
+        // only when snippet rows must be projected into the candidate.
+        let collect_message_ids = new_messages
+            .iter()
+            .any(|message| !message.snippets.is_empty());
+        let (inserted_indices, inserted_message_ids) = if collect_message_ids {
+            doctor_native_insert_messages_batched(&tx, conversation_id, &new_messages)?
+        } else {
+            (
+                doctor_native_insert_messages_without_ids(&tx, conversation_id, &new_messages)?,
+                Vec::new(),
+            )
+        };
 
         if !inserted_message_ids.is_empty() {
             let mut statement = tx.prepare(
@@ -6535,6 +6522,59 @@ impl DoctorSqliteWriter {
     }
 }
 
+fn doctor_native_ensure_reference_rows(
+    tx: &rusqlite::Transaction<'_>,
+    chunks: &[(i64, Option<i64>, &Conversation)],
+) -> Result<()> {
+    let now = FrankenStorage::now_millis();
+    let mut agents = HashSet::new();
+    let mut workspaces = HashSet::new();
+    let mut sources = HashSet::new();
+    for &(agent_id, workspace_id, raw_conv) in chunks {
+        let normalized_conv = normalized_conversation_for_storage(raw_conv);
+        let conv = normalized_conv.as_ref();
+        if agents.insert((agent_id, conv.agent_slug.clone())) {
+            tx.execute(
+                "INSERT OR IGNORE INTO agents(id, slug, name, kind, created_at, updated_at)
+                 VALUES(?1, ?2, ?2, 'cli', ?3, ?3)",
+                rusqlite::params![agent_id, conv.agent_slug.as_str(), now],
+            )?;
+        }
+        if let Some(workspace_id) = workspace_id
+            && workspaces.insert((workspace_id, conv.workspace.clone()))
+        {
+            let workspace_path = conv
+                .workspace
+                .as_ref()
+                .map(|path| path_to_string(path))
+                .unwrap_or_default();
+            tx.execute(
+                "INSERT OR IGNORE INTO workspaces(id, path) VALUES(?1, ?2)",
+                rusqlite::params![workspace_id, workspace_path],
+            )?;
+        }
+        let source = normalized_source_for_conversation(conv);
+        let source_key = (
+            source.id.clone(),
+            source.kind.to_string(),
+            source.host_label.clone(),
+        );
+        if sources.insert(source_key) {
+            tx.execute(
+                "INSERT OR IGNORE INTO sources(id, kind, host_label, created_at, updated_at)
+                 VALUES(?1, ?2, ?3, ?4, ?4)",
+                rusqlite::params![
+                    source.id.as_str(),
+                    source.kind.to_string(),
+                    source.host_label.as_deref(),
+                    now
+                ],
+            )?;
+        }
+    }
+    Ok(())
+}
+
 const DOCTOR_NATIVE_MESSAGE_BATCH_ROWS: usize = 256;
 
 fn doctor_native_message_batch_rows() -> usize {
@@ -6556,22 +6596,33 @@ fn doctor_native_insert_messages_batched(
     conversation_id: i64,
     new_messages: &[&Message],
 ) -> Result<(Vec<i64>, Vec<i64>)> {
+    doctor_native_insert_messages_with_mode(tx, conversation_id, new_messages, true)
+}
+
+fn doctor_native_insert_messages_without_ids(
+    tx: &rusqlite::Transaction<'_>,
+    conversation_id: i64,
+    new_messages: &[&Message],
+) -> Result<Vec<i64>> {
+    let (inserted_indices, _) =
+        doctor_native_insert_messages_with_mode(tx, conversation_id, new_messages, false)?;
+    Ok(inserted_indices)
+}
+
+fn doctor_native_insert_messages_with_mode(
+    tx: &rusqlite::Transaction<'_>,
+    conversation_id: i64,
+    new_messages: &[&Message],
+    return_ids: bool,
+) -> Result<(Vec<i64>, Vec<i64>)> {
     use rusqlite::types::Value;
 
     let mut inserted_indices = Vec::with_capacity(new_messages.len());
     let mut inserted_message_ids = Vec::with_capacity(new_messages.len());
     for batch in new_messages.chunks(doctor_native_message_batch_rows()) {
-        let mut sql = String::from(
-            "INSERT INTO messages(\
-                conversation_id, idx, role, author, created_at, content, extra_json, extra_bin\
-             ) VALUES ",
-        );
+        let sql = doctor_native_message_insert_sql(batch.len(), return_ids);
         let mut values = Vec::with_capacity(batch.len() * 8);
-        for (position, message) in batch.iter().enumerate() {
-            if position > 0 {
-                sql.push(',');
-            }
-            sql.push_str("(?,?,?,?,?,?,?,?)");
+        for message in batch {
             let (extra_json, extra_bin) = franken_message_insert_payload(message)?;
             values.extend([
                 Value::Integer(conversation_id),
@@ -6593,25 +6644,50 @@ fn doctor_native_insert_messages_batched(
                 extra_bin.map(Value::Blob).unwrap_or(Value::Null),
             ]);
         }
-        sql.push_str(" RETURNING id");
 
-        let mut statement = tx.prepare(&sql)?;
-        let mut rows = statement.query(rusqlite::params_from_iter(values.iter()))?;
-        let mut returned_ids = Vec::with_capacity(batch.len());
-        while let Some(row) = rows.next()? {
-            returned_ids.push(row.get::<_, i64>(0)?);
+        let mut statement = tx.prepare(sql.as_ref())?;
+        if return_ids {
+            let mut rows = statement.query(rusqlite::params_from_iter(values.iter()))?;
+            let mut returned_ids = Vec::with_capacity(batch.len());
+            while let Some(row) = rows.next()? {
+                returned_ids.push(row.get::<_, i64>(0)?);
+            }
+            if returned_ids.len() != batch.len() {
+                return Err(anyhow::anyhow!(
+                    "native recovery message batch returned {} rowids for {} inserted messages",
+                    returned_ids.len(),
+                    batch.len()
+                ));
+            }
+            inserted_message_ids.extend(returned_ids);
+        } else {
+            statement.execute(rusqlite::params_from_iter(values.iter()))?;
         }
-        if returned_ids.len() != batch.len() {
-            return Err(anyhow::anyhow!(
-                "native recovery message batch returned {} rowids for {} inserted messages",
-                returned_ids.len(),
-                batch.len()
-            ));
-        }
-        inserted_message_ids.extend(returned_ids);
         inserted_indices.extend(batch.iter().map(|message| message.idx));
     }
     Ok((inserted_indices, inserted_message_ids))
+}
+
+fn doctor_native_message_insert_sql(row_count: usize, return_ids: bool) -> Arc<str> {
+    static CACHE: std::sync::OnceLock<parking_lot::Mutex<HashMap<(usize, bool), Arc<str>>>> =
+        std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| parking_lot::Mutex::new(HashMap::new()));
+    if let Some(sql) = cache.lock().get(&(row_count, return_ids)).cloned() {
+        return sql;
+    }
+
+    let placeholders = (0..row_count)
+        .map(|_| "(?,?,?,?,?,?,?,?)")
+        .collect::<Vec<_>>()
+        .join(",");
+    let suffix = if return_ids { " RETURNING id" } else { "" };
+    let sql: Arc<str> = Arc::from(format!(
+        "INSERT INTO messages(conversation_id, idx, role, author, created_at, content, extra_json, extra_bin) VALUES {placeholders}{suffix}"
+    ));
+    cache
+        .lock()
+        .insert((row_count, return_ids), Arc::clone(&sql));
+    sql
 }
 
 fn last_idx_option(messages: &[&Message]) -> Option<i64> {
@@ -23257,7 +23333,7 @@ mod tests {
 
     #[test]
     fn native_doctor_writer_preserves_exact_indices_and_reopens_with_franken() {
-        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole, Snippet};
         use std::path::PathBuf;
 
         let dir = TempDir::new().unwrap();
@@ -23282,7 +23358,18 @@ mod tests {
             created_at: None,
             content: "native recovery payload".into(),
             extra_json: serde_json::json!({"idx": idx}),
-            snippets: Vec::new(),
+            snippets: if idx == 0 {
+                vec![Snippet {
+                    id: None,
+                    file_path: Some(PathBuf::from("src/lib.rs")),
+                    start_line: Some(1),
+                    end_line: Some(2),
+                    language: Some("rust".into()),
+                    snippet_text: Some("fn main()".into()),
+                }]
+            } else {
+                Vec::new()
+            },
         };
         let conversation = |messages: Vec<Message>| Conversation {
             id: None,
@@ -23324,6 +23411,13 @@ mod tests {
             })
             .unwrap();
         assert_eq!(stored, vec![0, 1, 2]);
+        let snippet_count: i64 = storage
+            .conn
+            .query_row("SELECT COUNT(*) FROM snippets")
+            .unwrap()
+            .get_typed(0)
+            .unwrap();
+        assert_eq!(snippet_count, 1);
     }
 
     #[test]
