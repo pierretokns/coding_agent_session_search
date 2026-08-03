@@ -6262,6 +6262,275 @@ pub struct InsertOutcome {
     pub inserted_indices: Vec<i64>,
 }
 
+/// Recovery-only writer for large candidate archives.
+///
+/// FrankenSQLite remains the canonical runtime storage engine.  The native
+/// SQLite writer exists because the recovery workload is an append-heavy bulk
+/// import into a very large file, and FrankenSQLite's multi-row page-loader
+/// currently stalls on that workload.  Both engines write the same SQLite
+/// schema; the candidate is reopened and verified through FrankenSQLite
+/// before promotion.
+pub struct DoctorSqliteWriter {
+    conn: rusqlite::Connection,
+}
+
+impl DoctorSqliteWriter {
+    pub fn open(path: &Path) -> Result<Self> {
+        let conn = rusqlite::Connection::open(path)
+            .with_context(|| format!("open native recovery writer at {}", path.display()))?;
+        conn.busy_timeout(Duration::from_secs(30))?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        conn.pragma_update(None, "temp_store", "MEMORY")?;
+        conn.pragma_update(None, "cache_size", -524_288_i64)?;
+        Ok(Self { conn })
+    }
+
+    pub fn insert_doctor_conversation_chunk(
+        &mut self,
+        agent_id: i64,
+        workspace_id: Option<i64>,
+        raw_conv: &Conversation,
+    ) -> Result<InsertOutcome> {
+        use rusqlite::OptionalExtension;
+
+        let normalized_conv = normalized_conversation_for_storage(raw_conv);
+        let conv = normalized_conv.as_ref();
+        let now = FrankenStorage::now_millis();
+        let source = normalized_source_for_conversation(conv);
+        let source_kind = source.kind.to_string();
+        let source_host = source.host_label.as_deref();
+        let workspace_path = conv
+            .workspace
+            .as_ref()
+            .map(|path| path_to_string(path))
+            .unwrap_or_default();
+
+        let (metadata_json, metadata_bin) = franken_metadata_insert_payload(&conv.metadata_json)?;
+        let (last_message_idx, last_message_created_at) = conversation_tail_state(conv);
+        let conversation_key = conversation_merge_key(agent_id, conv);
+
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT OR IGNORE INTO agents(id, slug, name, kind, created_at, updated_at)
+             VALUES(?1, ?2, ?2, 'cli', ?3, ?3)",
+            rusqlite::params![agent_id, conv.agent_slug.as_str(), now],
+        )?;
+        if let Some(workspace_id) = workspace_id {
+            tx.execute(
+                "INSERT OR IGNORE INTO workspaces(id, path) VALUES(?1, ?2)",
+                rusqlite::params![workspace_id, workspace_path],
+            )?;
+        }
+        tx.execute(
+            "INSERT OR IGNORE INTO sources(id, kind, host_label, created_at, updated_at)
+             VALUES(?1, ?2, ?3, ?4, ?4)",
+            rusqlite::params![source.id.as_str(), source_kind, source_host, now],
+        )?;
+
+        let existing_id: Option<i64> = match &conversation_key {
+            PendingConversationKey::External {
+                source_id,
+                agent_id,
+                external_id,
+            } => tx
+                .query_row(
+                    "SELECT id FROM conversations
+                     WHERE source_id = ?1 AND agent_id = ?2 AND external_id = ?3
+                     ORDER BY id LIMIT 1",
+                    rusqlite::params![source_id, agent_id, external_id],
+                    |row| row.get(0),
+                )
+                .optional()?,
+            PendingConversationKey::SourcePath {
+                source_id,
+                agent_id,
+                source_path,
+                started_at,
+            } => tx
+                .query_row(
+                    "SELECT id FROM conversations
+                     WHERE source_id = ?1 AND agent_id = ?2 AND source_path = ?3
+                       AND ((started_at IS NULL AND ?4 IS NULL) OR started_at = ?4)
+                     ORDER BY id LIMIT 1",
+                    rusqlite::params![source_id, agent_id, source_path, started_at],
+                    |row| row.get(0),
+                )
+                .optional()?,
+        };
+
+        let (conversation_id, conversation_inserted) = if let Some(id) = existing_id {
+            (id, false)
+        } else {
+            tx.execute(
+                "INSERT INTO conversations(
+                    agent_id, workspace_id, source_id, external_id, title, source_path,
+                    started_at, ended_at, approx_tokens, metadata_json, origin_host, metadata_bin,
+                    last_message_idx, last_message_created_at
+                 ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+                rusqlite::params![
+                    agent_id,
+                    workspace_id,
+                    conv.source_id.as_str(),
+                    conv.external_id.as_deref(),
+                    conv.title.as_deref(),
+                    path_to_string(&conv.source_path),
+                    conv.started_at,
+                    conv.ended_at,
+                    conv.approx_tokens,
+                    metadata_json.as_deref(),
+                    conv.origin_host.as_deref(),
+                    metadata_bin.as_deref(),
+                    last_message_idx,
+                    last_message_created_at,
+                ],
+            )?;
+            (tx.last_insert_rowid(), true)
+        };
+
+        let (first_idx, last_idx) = conv
+            .messages
+            .first()
+            .zip(conv.messages.last())
+            .map(|(first, last)| (first.idx.min(last.idx), first.idx.max(last.idx)))
+            .unwrap_or((0, -1));
+        let mut existing_indices = HashSet::new();
+        if first_idx <= last_idx {
+            let mut statement = tx.prepare(
+                "SELECT idx FROM messages
+                 WHERE conversation_id = ?1 AND idx BETWEEN ?2 AND ?3",
+            )?;
+            let rows = statement.query_map(
+                rusqlite::params![conversation_id, first_idx, last_idx],
+                |row| row.get::<_, i64>(0),
+            )?;
+            for row in rows {
+                existing_indices.insert(row?);
+            }
+        }
+        let new_messages: Vec<&Message> = conv
+            .messages
+            .iter()
+            .filter(|message| !existing_indices.contains(&message.idx))
+            .collect();
+
+        let mut inserted_indices = Vec::with_capacity(new_messages.len());
+        let mut inserted_message_ids = Vec::with_capacity(new_messages.len());
+        {
+            let mut statement = tx.prepare(
+                "INSERT INTO messages(
+                    conversation_id, idx, role, author, created_at, content, extra_json, extra_bin
+                 ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+            )?;
+            for message in &new_messages {
+                let (extra_json, extra_bin) = franken_message_insert_payload(message)?;
+                statement.execute(rusqlite::params![
+                    conversation_id,
+                    message.idx,
+                    role_as_str(&message.role),
+                    message.author.as_deref(),
+                    message.created_at,
+                    message.content.as_str(),
+                    extra_json.as_deref(),
+                    extra_bin.as_deref(),
+                ])?;
+                inserted_message_ids.push(tx.last_insert_rowid());
+                inserted_indices.push(message.idx);
+            }
+        }
+
+        if !inserted_message_ids.is_empty() {
+            let mut statement = tx.prepare(
+                "INSERT INTO snippets(
+                    message_id, file_path, start_line, end_line, language, snippet_text
+                 ) VALUES(?1,?2,?3,?4,?5,?6)",
+            )?;
+            for (message_id, message) in inserted_message_ids.iter().zip(&new_messages) {
+                for snippet in &message.snippets {
+                    statement.execute(rusqlite::params![
+                        message_id,
+                        snippet.file_path.as_ref().map(path_to_string),
+                        snippet.start_line,
+                        snippet.end_line,
+                        snippet.language.as_deref(),
+                        snippet.snippet_text.as_deref(),
+                    ])?;
+                }
+            }
+        }
+
+        let conv_last_ts = conversation_tail_ended_at_candidate(conv);
+        tx.execute(
+            "INSERT INTO conversation_tail_state(
+                conversation_id, ended_at, last_message_idx, last_message_created_at
+             ) VALUES(?1,?2,?3,?4)
+             ON CONFLICT(conversation_id) DO UPDATE SET
+                ended_at = CASE WHEN excluded.ended_at IS NULL THEN conversation_tail_state.ended_at
+                                ELSE MAX(IFNULL(conversation_tail_state.ended_at, 0), excluded.ended_at) END,
+                last_message_idx = CASE WHEN excluded.last_message_idx IS NULL THEN conversation_tail_state.last_message_idx
+                                        WHEN conversation_tail_state.last_message_idx IS NULL
+                                          OR conversation_tail_state.last_message_idx < excluded.last_message_idx
+                                        THEN excluded.last_message_idx ELSE conversation_tail_state.last_message_idx END,
+                last_message_created_at = CASE WHEN excluded.last_message_created_at IS NULL THEN conversation_tail_state.last_message_created_at
+                                               WHEN conversation_tail_state.last_message_created_at IS NULL
+                                                 OR conversation_tail_state.last_message_created_at < excluded.last_message_created_at
+                                               THEN excluded.last_message_created_at ELSE conversation_tail_state.last_message_created_at END",
+            rusqlite::params![conversation_id, conv_last_ts, last_idx_option(&new_messages), last_created_at_option(&new_messages)],
+        )?;
+        tx.execute(
+            "UPDATE conversations SET
+                ended_at = CASE WHEN ?1 IS NULL THEN ended_at ELSE MAX(IFNULL(ended_at, 0), ?1) END,
+                last_message_idx = CASE WHEN ?2 IS NULL THEN last_message_idx
+                                        WHEN last_message_idx IS NULL OR last_message_idx < ?2 THEN ?2
+                                        ELSE last_message_idx END,
+                last_message_created_at = CASE WHEN ?3 IS NULL THEN last_message_created_at
+                                               WHEN last_message_created_at IS NULL OR last_message_created_at < ?3 THEN ?3
+                                               ELSE last_message_created_at END
+             WHERE id = ?4",
+            rusqlite::params![
+                conv_last_ts,
+                last_idx_option(&new_messages),
+                last_created_at_option(&new_messages),
+                conversation_id,
+            ],
+        )?;
+        if let Some(external_id) = conv.external_id.as_deref() {
+            let lookup_key =
+                conversation_external_lookup_key(&conv.source_id, agent_id, external_id);
+            tx.execute(
+                "INSERT OR REPLACE INTO conversation_external_tail_lookup(
+                    lookup_key, conversation_id, ended_at, last_message_idx, last_message_created_at
+                 ) VALUES(?1,?2,?3,?4,?5)",
+                rusqlite::params![
+                    lookup_key,
+                    conversation_id,
+                    conv_last_ts,
+                    last_idx_option(&new_messages),
+                    last_created_at_option(&new_messages),
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(InsertOutcome {
+            conversation_id,
+            conversation_inserted,
+            inserted_indices,
+        })
+    }
+}
+
+fn last_idx_option(messages: &[&Message]) -> Option<i64> {
+    messages.iter().map(|message| message.idx).max()
+}
+
+fn last_created_at_option(messages: &[&Message]) -> Option<i64> {
+    messages
+        .iter()
+        .filter_map(|message| message.created_at)
+        .max()
+}
+
 #[cfg(test)]
 #[derive(Debug, Clone, Default)]
 struct MessageInsertSubstageProfile {
@@ -12745,15 +13014,31 @@ impl FrankenStorage {
             .iter()
             .filter(|message| !existing_indices.contains(&message.idx))
             .collect();
-        // Doctor recovery deliberately avoids the normal multi-row page-loader
-        // path here. On a 50+ GiB candidate table that path can retain a large
-        // parameter/page run for minutes before commit. The outer transaction
-        // still makes the chunk atomic; single-row inserts make progress and
-        // interruption observable at each bounded chunk boundary.
-        let mut inserted_message_ids = Vec::with_capacity(new_messages.len());
-        for message in &new_messages {
-            inserted_message_ids.push(franken_insert_new_message(&tx, conversation_id, message)?);
-        }
+        // The single-row fallback remains available because it was the safe
+        // recovery mode while the candidate database was page-cache bound.
+        // The bulk mode uses the existing bounded multi-row insert helper and
+        // is recovery-only: the caller can disable it without changing normal
+        // ingest semantics if a large-database regression is observed.
+        let inserted_message_ids = if env_flag_enabled("CASS_DOCTOR_BULK_MESSAGE_INSERTS") {
+            let batch_size = dotenvy::var("CASS_DOCTOR_MESSAGE_BATCH_ROWS")
+                .ok()
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .filter(|value| *value > 1)
+                .unwrap_or(32)
+                .min(MESSAGE_INSERT_BATCH_SIZE);
+            franken_batch_insert_new_messages_with_batch_size(
+                &tx,
+                conversation_id,
+                &new_messages,
+                batch_size,
+            )?
+        } else {
+            let mut ids = Vec::with_capacity(new_messages.len());
+            for message in &new_messages {
+                ids.push(franken_insert_new_message(&tx, conversation_id, message)?);
+            }
+            ids
+        };
         let mut inserted_indices = Vec::with_capacity(new_messages.len());
         let mut inserted_chars = 0i64;
         let mut fts_entries = Vec::new();
@@ -22795,6 +23080,7 @@ mod tests {
         use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
         use std::path::PathBuf;
 
+        let _bulk = set_env_var("CASS_DOCTOR_BULK_MESSAGE_INSERTS", "1");
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("doctor-chunk.db");
         let storage = SqliteStorage::open(&db_path).unwrap();
@@ -22873,6 +23159,77 @@ mod tests {
                 .iter()
                 .all(|(_, content)| content == "identical raw payload")
         );
+    }
+
+    #[test]
+    fn native_doctor_writer_preserves_exact_indices_and_reopens_with_franken() {
+        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+        use std::path::PathBuf;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("doctor-native.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let agent_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "codex".into(),
+                name: "Codex".into(),
+                version: Some("doctor-reconstruct".into()),
+                kind: AgentKind::Cli,
+            })
+            .unwrap();
+        drop(storage);
+
+        let message = |idx: i64| Message {
+            id: None,
+            idx,
+            role: MessageRole::Agent,
+            author: None,
+            created_at: None,
+            content: "native recovery payload".into(),
+            extra_json: serde_json::json!({"idx": idx}),
+            snippets: Vec::new(),
+        };
+        let conversation = |messages: Vec<Message>| Conversation {
+            id: None,
+            agent_slug: "codex".into(),
+            workspace: None,
+            external_id: Some("native-doctor-session".into()),
+            title: Some("Native doctor session".into()),
+            source_path: PathBuf::from("/tmp/native-doctor.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: None,
+            approx_tokens: None,
+            metadata_json: serde_json::json!({"native": true}),
+            messages,
+            source_id: "local".into(),
+            origin_host: None,
+        };
+
+        let mut writer = DoctorSqliteWriter::open(&db_path).unwrap();
+        let first = writer
+            .insert_doctor_conversation_chunk(
+                agent_id,
+                None,
+                &conversation(vec![message(0), message(1)]),
+            )
+            .unwrap();
+        let second = writer
+            .insert_doctor_conversation_chunk(agent_id, None, &conversation(vec![message(2)]))
+            .unwrap();
+        assert!(first.conversation_inserted);
+        assert_eq!(first.inserted_indices, vec![0, 1]);
+        assert_eq!(second.inserted_indices, vec![2]);
+        drop(writer);
+
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let stored: Vec<i64> = storage
+            .conn
+            .query_map_collect("SELECT idx FROM messages ORDER BY idx", fparams![], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        assert_eq!(stored, vec![0, 1, 2]);
     }
 
     #[test]
