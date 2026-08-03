@@ -12745,8 +12745,15 @@ impl FrankenStorage {
             .iter()
             .filter(|message| !existing_indices.contains(&message.idx))
             .collect();
-        let inserted_message_ids =
-            franken_batch_insert_new_messages(&tx, conversation_id, &new_messages)?;
+        // Doctor recovery deliberately avoids the normal multi-row page-loader
+        // path here. On a 50+ GiB candidate table that path can retain a large
+        // parameter/page run for minutes before commit. The outer transaction
+        // still makes the chunk atomic; single-row inserts make progress and
+        // interruption observable at each bounded chunk boundary.
+        let mut inserted_message_ids = Vec::with_capacity(new_messages.len());
+        for message in &new_messages {
+            inserted_message_ids.push(franken_insert_new_message(&tx, conversation_id, message)?);
+        }
         let mut inserted_indices = Vec::with_capacity(new_messages.len());
         let mut inserted_chars = 0i64;
         let mut fts_entries = Vec::new();
