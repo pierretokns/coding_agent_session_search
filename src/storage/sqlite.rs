@@ -13541,53 +13541,49 @@ fn franken_message_insert_payload(msg: &Message) -> Result<MessageInsertPayload<
 
 /// Batch size for proven-new message inserts.
 ///
-/// Each row binds 8 values, so 100 rows stays well under SQLite's default
-/// `SQLITE_MAX_VARIABLE_NUMBER` limit of 999 while still amortizing parse cost.
-const MESSAGE_INSERT_BATCH_SIZE: usize = 100;
+/// FrankenSQLite permits 32,766 bound variables. Eight columns per message
+/// therefore allow 4,095 rows per statement; the caller still bounds total
+/// retained payload bytes so a huge conversation cannot cause unbounded growth.
+const MESSAGE_INSERT_BATCH_SIZE: usize = 4095;
 
 /// Append workloads profile fastest with larger chunks on current frankensqlite.
 ///
 /// After the tail-state hot table removed conversation-row rewrites from the
 /// append path, 50-row chunks beat the old 20-row setting on the append-merge
 /// profile. 100-row chunks slightly regress the 20-message workload.
-const APPEND_MESSAGE_INSERT_BATCH_SIZE: usize = 50;
+const APPEND_MESSAGE_INSERT_BATCH_SIZE: usize = 4095;
 
-fn message_insert_batch_sql(row_count: usize) -> &'static str {
-    static MESSAGE_INSERT_BATCH_SQL: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+fn message_insert_batch_sql(row_count: usize) -> Arc<str> {
+    static MESSAGE_INSERT_BATCH_SQL: std::sync::OnceLock<
+        parking_lot::Mutex<HashMap<usize, Arc<str>>>,
+    > = std::sync::OnceLock::new();
+    let cache = MESSAGE_INSERT_BATCH_SQL.get_or_init(|| parking_lot::Mutex::new(HashMap::new()));
+    if let Some(sql) = cache.lock().get(&row_count).cloned() {
+        return sql;
+    }
 
-    let max_batch_size = MESSAGE_INSERT_BATCH_SIZE.max(APPEND_MESSAGE_INSERT_BATCH_SIZE);
-    let cached_sql = MESSAGE_INSERT_BATCH_SQL.get_or_init(|| {
-        let mut sql_by_row_count = Vec::with_capacity(max_batch_size + 1);
-        sql_by_row_count.push(String::new());
-        for row_count in 1..=max_batch_size {
-            let placeholders = (0..row_count)
-                .map(|idx| {
-                    let base = idx * 8;
-                    format!(
-                        "(?{},?{},?{},?{},?{},?{},?{},?{})",
-                        base + 1,
-                        base + 2,
-                        base + 3,
-                        base + 4,
-                        base + 5,
-                        base + 6,
-                        base + 7,
-                        base + 8
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(",");
-            sql_by_row_count.push(format!(
-                "INSERT INTO messages(conversation_id, idx, role, author, created_at, content, extra_json, extra_bin) VALUES {placeholders}"
-            ));
-        }
-        sql_by_row_count
-    });
-
-    cached_sql
-        .get(row_count)
-        .map(String::as_str)
-        .expect("message insert batch size must be covered by the cached SQL table")
+    let placeholders = (0..row_count)
+        .map(|idx| {
+            let base = idx * 8;
+            format!(
+                "(?{},?{},?{},?{},?{},?{},?{},?{})",
+                base + 1,
+                base + 2,
+                base + 3,
+                base + 4,
+                base + 5,
+                base + 6,
+                base + 7,
+                base + 8
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql: Arc<str> = Arc::from(format!(
+        "INSERT INTO messages(conversation_id, idx, role, author, created_at, content, extra_json, extra_bin) VALUES {placeholders}"
+    ));
+    cache.lock().insert(row_count, Arc::clone(&sql));
+    sql
 }
 
 fn franken_batch_insert_new_messages(
@@ -13654,7 +13650,7 @@ fn franken_batch_insert_new_messages_with_batch_size(
             param_values.push(SqliteValue::from(extra_bin.as_deref()));
         }
 
-        tx.execute_with_params(sql, &param_values)?;
+        tx.execute_with_params_skip_statement_savepoint(&sql, &param_values)?;
 
         let last_id = franken_last_rowid(tx)?;
         let first_id = last_id
@@ -13788,7 +13784,7 @@ fn franken_batch_insert_new_messages_with_profile_batch_size(
         }
 
         let execute_start = Instant::now();
-        tx.execute_with_params(sql, &param_values)?;
+        tx.execute_with_params_skip_statement_savepoint(&sql, &param_values)?;
         profile.execute_duration += execute_start.elapsed();
 
         let rowid_start = Instant::now();
@@ -21179,6 +21175,36 @@ mod tests {
 
         assert_eq!(message_count, conv.messages.len() as i64);
         assert_eq!(fts_count, conv.messages.len() as i64);
+    }
+
+    #[test]
+    fn insert_conversations_batched_handles_frankensqlite_variable_limit_batch() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("large-message-batch.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let agent = Agent {
+            id: None,
+            slug: "codex-large-batch".into(),
+            name: "Codex large batch".into(),
+            version: Some("bulk-test".into()),
+            kind: AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+        let conversation = make_profiled_storage_remote_conversation(91, 4095);
+
+        let outcomes = storage
+            .insert_conversations_batched(&[(agent_id, None, &conversation)])
+            .unwrap();
+
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].inserted_indices.len(), 4095);
+        let message_count: i64 = storage
+            .conn
+            .query_row_map("SELECT COUNT(*) FROM messages", fparams![], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        assert_eq!(message_count, 4095);
     }
 
     fn make_profiled_storage_remote_conversation(
