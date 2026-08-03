@@ -13519,34 +13519,6 @@ fn franken_insert_new_message(
     franken_last_rowid(tx)
 }
 
-fn franken_insert_new_message_ignore_duplicate(
-    tx: &FrankenTransaction<'_>,
-    conversation_id: i64,
-    msg: &Message,
-) -> Result<Option<i64>> {
-    let (extra_json_str, extra_bin) = franken_message_insert_payload(msg)?;
-    let extra_bin_bytes = extra_bin.as_deref();
-
-    let changed = tx.execute_compat(
-        "INSERT OR IGNORE INTO messages(conversation_id, idx, role, author, created_at, content, extra_json, extra_bin)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
-            fparams![
-                conversation_id,
-                msg.idx,
-                role_as_str(&msg.role),
-                msg.author.as_deref(),
-                msg.created_at,
-                msg.content.as_str(),
-                extra_json_str.as_deref(),
-                extra_bin_bytes
-        ],
-    )?;
-    if changed == 0 {
-        return Ok(None);
-    }
-    franken_last_rowid(tx).map(Some)
-}
-
 type MessageInsertPayload<'a> = (Option<Cow<'a, str>>, Option<Vec<u8>>);
 
 fn franken_message_insert_payload(msg: &Message) -> Result<MessageInsertPayload<'_>> {
@@ -13636,15 +13608,22 @@ fn franken_append_insert_new_messages<'a>(
     conversation_id: i64,
     messages: &[&'a Message],
 ) -> Result<Vec<(i64, &'a Message)>> {
-    let mut inserted = Vec::with_capacity(messages.len());
-    for msg in messages {
-        if let Some(message_id) =
-            franken_insert_new_message_ignore_duplicate(tx, conversation_id, msg)?
-        {
-            inserted.push((message_id, *msg));
-        }
-    }
-    Ok(inserted)
+    // `collect_append_only_tail_messages` and
+    // `collect_new_messages_for_existing_conversation` have already removed
+    // same-index and replay-equivalent duplicates before this function is
+    // called. The active transaction also serializes the writer, so these are
+    // proven-new rows: use the same bounded batch insert as the profiled path
+    // instead of one INSERT + last_insert_rowid round trip per message.
+    let inserted_ids = franken_batch_insert_new_messages_with_batch_size(
+        tx,
+        conversation_id,
+        messages,
+        APPEND_MESSAGE_INSERT_BATCH_SIZE,
+    )?;
+    Ok(inserted_ids
+        .into_iter()
+        .zip(messages.iter().copied())
+        .collect())
 }
 
 fn franken_batch_insert_new_messages_with_batch_size(
