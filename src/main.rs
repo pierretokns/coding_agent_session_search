@@ -222,6 +222,14 @@ fn apply_default_fsqlite_read_witness_cap() {
 }
 
 fn main() -> anyhow::Result<()> {
+    let trace = |stage: &str| {
+        if matches!(
+            std::env::var("CASS_DOCTOR_TRACE").as_deref(),
+            Ok("1") | Ok("true") | Ok("yes")
+        ) {
+            eprintln!("cass startup trace: {stage}");
+        }
+    };
     // (cass #356) Restore the default SIGPIPE disposition so an early-exiting
     // pipe consumer (`cass ... --json | head`) terminates cass quietly with
     // the conventional 141 instead of panicking on EPIPE — which, under the
@@ -241,18 +249,21 @@ fn main() -> anyhow::Result<()> {
 
     // Load .env early; ignore if missing.
     dotenvy::dotenv().ok();
+    trace("dotenv");
 
     // Apply cass-tuned defaults before any code path constructs a frankensqlite
     // cursor (which caches the FSQLITE_READ_WITNESS_CAP value once and ignores
     // later mutations). The Health fast path below may open the SQL store, so
     // this must run before try_run_with_parsed_fast.
     apply_default_fsqlite_read_witness_cap();
+    trace("fsqlite_cap");
 
     let raw_args: Vec<String> = std::env::args().collect();
     let parsed = match coding_agent_search::parse_cli(raw_args) {
         Ok(parsed) => parsed,
         Err(err) => handle_fatal_error(err),
     };
+    trace("parse_cli");
 
     let parsed = match coding_agent_search::try_run_with_parsed_fast(parsed) {
         Ok(result) => {
@@ -263,8 +274,10 @@ fn main() -> anyhow::Result<()> {
         }
         Err(parsed) => *parsed,
     };
+    trace("fast_path");
 
     apply_default_tantivy_writer_thread_cap();
+    trace("tantivy_cap");
 
     let use_current_thread = matches!(
         parsed.cli.command,
@@ -278,6 +291,7 @@ fn main() -> anyhow::Result<()> {
     } else {
         asupersync::runtime::RuntimeBuilder::multi_thread().build()?
     };
+    trace("runtime");
 
     match runtime.block_on(coding_agent_search::run_with_parsed(parsed)) {
         Ok(()) => Ok(()),
