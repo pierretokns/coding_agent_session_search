@@ -6293,6 +6293,45 @@ impl DoctorSqliteWriter {
         workspace_id: Option<i64>,
         raw_conv: &Conversation,
     ) -> Result<InsertOutcome> {
+        let chunks = [(agent_id, workspace_id, raw_conv)];
+        self.insert_doctor_conversation_batch(&chunks)
+            .map(|mut outcomes| outcomes.remove(0))
+    }
+
+    /// Insert multiple recovery chunks under one SQLite transaction.
+    ///
+    /// The recovery caller already has an idempotent manifest/cursor ledger,
+    /// so committing once per conversation only adds sync and B-tree churn.
+    /// A batch commit preserves crash safety: the progress ledger advances
+    /// only after this transaction returns successfully, and a crash before
+    /// that point replays the same exact-index inserts safely.
+    pub fn insert_doctor_conversation_batch(
+        &mut self,
+        chunks: &[(i64, Option<i64>, &Conversation)],
+    ) -> Result<Vec<InsertOutcome>> {
+        if chunks.is_empty() {
+            return Ok(Vec::new());
+        }
+        let tx = self.conn.transaction()?;
+        let mut outcomes = Vec::with_capacity(chunks.len());
+        for &(agent_id, workspace_id, raw_conv) in chunks {
+            outcomes.push(Self::insert_doctor_conversation_chunk_in_tx(
+                &tx,
+                agent_id,
+                workspace_id,
+                raw_conv,
+            )?);
+        }
+        tx.commit()?;
+        Ok(outcomes)
+    }
+
+    fn insert_doctor_conversation_chunk_in_tx(
+        tx: &rusqlite::Transaction<'_>,
+        agent_id: i64,
+        workspace_id: Option<i64>,
+        raw_conv: &Conversation,
+    ) -> Result<InsertOutcome> {
         use rusqlite::OptionalExtension;
 
         let normalized_conv = normalized_conversation_for_storage(raw_conv);
@@ -6311,7 +6350,6 @@ impl DoctorSqliteWriter {
         let (last_message_idx, last_message_created_at) = conversation_tail_state(conv);
         let conversation_key = conversation_merge_key(agent_id, conv);
 
-        let tx = self.conn.transaction()?;
         tx.execute(
             "INSERT OR IGNORE INTO agents(id, slug, name, kind, created_at, updated_at)
              VALUES(?1, ?2, ?2, 'cli', ?3, ?3)",
@@ -6415,30 +6453,8 @@ impl DoctorSqliteWriter {
             .filter(|message| !existing_indices.contains(&message.idx))
             .collect();
 
-        let mut inserted_indices = Vec::with_capacity(new_messages.len());
-        let mut inserted_message_ids = Vec::with_capacity(new_messages.len());
-        {
-            let mut statement = tx.prepare(
-                "INSERT INTO messages(
-                    conversation_id, idx, role, author, created_at, content, extra_json, extra_bin
-                 ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
-            )?;
-            for message in &new_messages {
-                let (extra_json, extra_bin) = franken_message_insert_payload(message)?;
-                statement.execute(rusqlite::params![
-                    conversation_id,
-                    message.idx,
-                    role_as_str(&message.role),
-                    message.author.as_deref(),
-                    message.created_at,
-                    message.content.as_str(),
-                    extra_json.as_deref(),
-                    extra_bin.as_deref(),
-                ])?;
-                inserted_message_ids.push(tx.last_insert_rowid());
-                inserted_indices.push(message.idx);
-            }
-        }
+        let (inserted_indices, inserted_message_ids) =
+            doctor_native_insert_messages_batched(&tx, conversation_id, &new_messages)?;
 
         if !inserted_message_ids.is_empty() {
             let mut statement = tx.prepare(
@@ -6511,13 +6527,91 @@ impl DoctorSqliteWriter {
                 ],
             )?;
         }
-        tx.commit()?;
         Ok(InsertOutcome {
             conversation_id,
             conversation_inserted,
             inserted_indices,
         })
     }
+}
+
+const DOCTOR_NATIVE_MESSAGE_BATCH_ROWS: usize = 256;
+
+fn doctor_native_message_batch_rows() -> usize {
+    dotenvy::var("CASS_DOCTOR_NATIVE_MESSAGE_BATCH_ROWS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DOCTOR_NATIVE_MESSAGE_BATCH_ROWS)
+        .min(4096)
+}
+
+/// Insert recovery messages in bounded multi-row statements and return the
+/// generated rowids in input order.  The explicit RETURNING query avoids a
+/// per-message last_insert_rowid call while retaining the IDs needed for
+/// exact snippet projection.  The batch stays below SQLite's variable limit
+/// and is independent of the enclosing transaction size.
+fn doctor_native_insert_messages_batched(
+    tx: &rusqlite::Transaction<'_>,
+    conversation_id: i64,
+    new_messages: &[&Message],
+) -> Result<(Vec<i64>, Vec<i64>)> {
+    use rusqlite::types::Value;
+
+    let mut inserted_indices = Vec::with_capacity(new_messages.len());
+    let mut inserted_message_ids = Vec::with_capacity(new_messages.len());
+    for batch in new_messages.chunks(doctor_native_message_batch_rows()) {
+        let mut sql = String::from(
+            "INSERT INTO messages(\
+                conversation_id, idx, role, author, created_at, content, extra_json, extra_bin\
+             ) VALUES ",
+        );
+        let mut values = Vec::with_capacity(batch.len() * 8);
+        for (position, message) in batch.iter().enumerate() {
+            if position > 0 {
+                sql.push(',');
+            }
+            sql.push_str("(?,?,?,?,?,?,?,?)");
+            let (extra_json, extra_bin) = franken_message_insert_payload(message)?;
+            values.extend([
+                Value::Integer(conversation_id),
+                Value::Integer(message.idx),
+                Value::Text(role_as_str(&message.role).to_string()),
+                message
+                    .author
+                    .as_ref()
+                    .map(|author| Value::Text(author.clone()))
+                    .unwrap_or(Value::Null),
+                message
+                    .created_at
+                    .map(Value::Integer)
+                    .unwrap_or(Value::Null),
+                Value::Text(message.content.clone()),
+                extra_json
+                    .map(|value| Value::Text(value.into_owned()))
+                    .unwrap_or(Value::Null),
+                extra_bin.map(Value::Blob).unwrap_or(Value::Null),
+            ]);
+        }
+        sql.push_str(" RETURNING id");
+
+        let mut statement = tx.prepare(&sql)?;
+        let mut rows = statement.query(rusqlite::params_from_iter(values.iter()))?;
+        let mut returned_ids = Vec::with_capacity(batch.len());
+        while let Some(row) = rows.next()? {
+            returned_ids.push(row.get::<_, i64>(0)?);
+        }
+        if returned_ids.len() != batch.len() {
+            return Err(anyhow::anyhow!(
+                "native recovery message batch returned {} rowids for {} inserted messages",
+                returned_ids.len(),
+                batch.len()
+            ));
+        }
+        inserted_message_ids.extend(returned_ids);
+        inserted_indices.extend(batch.iter().map(|message| message.idx));
+    }
+    Ok((inserted_indices, inserted_message_ids))
 }
 
 fn last_idx_option(messages: &[&Message]) -> Option<i64> {
@@ -23230,6 +23324,232 @@ mod tests {
             })
             .unwrap();
         assert_eq!(stored, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn native_doctor_writer_batches_conversations_in_one_transaction() {
+        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+        use std::path::PathBuf;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("doctor-native-batch.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let agent_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "codex".into(),
+                name: "Codex".into(),
+                version: Some("doctor-reconstruct".into()),
+                kind: AgentKind::Cli,
+            })
+            .unwrap();
+        drop(storage);
+
+        let conversation = |external_id: &str, idx: i64| Conversation {
+            id: None,
+            agent_slug: "codex".into(),
+            workspace: None,
+            external_id: Some(external_id.into()),
+            title: Some(external_id.into()),
+            source_path: PathBuf::from(format!("/tmp/{external_id}.jsonl")),
+            started_at: Some(1_700_000_000_000 + idx),
+            ended_at: None,
+            approx_tokens: None,
+            metadata_json: serde_json::json!({"batch": true}),
+            messages: vec![Message {
+                id: None,
+                idx,
+                role: MessageRole::Agent,
+                author: None,
+                created_at: Some(1_700_000_000_000 + idx),
+                content: format!("payload-{external_id}"),
+                extra_json: serde_json::json!({"idx": idx}),
+                snippets: Vec::new(),
+            }],
+            source_id: "local".into(),
+            origin_host: None,
+        };
+        let first = conversation("native-batch-one", 0);
+        let second = conversation("native-batch-two", 1);
+        let chunks = vec![(agent_id, None, &first), (agent_id, None, &second)];
+
+        let mut writer = DoctorSqliteWriter::open(&db_path).unwrap();
+        let outcomes = writer.insert_doctor_conversation_batch(&chunks).unwrap();
+        assert_eq!(outcomes.len(), 2);
+        assert!(outcomes.iter().all(|outcome| outcome.conversation_inserted));
+        assert_eq!(outcomes[0].inserted_indices, vec![0]);
+        assert_eq!(outcomes[1].inserted_indices, vec![1]);
+        let replay = writer.insert_doctor_conversation_batch(&chunks).unwrap();
+        assert!(
+            replay
+                .iter()
+                .all(|outcome| outcome.inserted_indices.is_empty())
+        );
+        drop(writer);
+
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let row = storage
+            .conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM conversations), (SELECT COUNT(*) FROM messages)",
+            )
+            .unwrap();
+        let counts = (
+            row.get_typed::<i64>(0).unwrap(),
+            row.get_typed::<i64>(1).unwrap(),
+        );
+        assert_eq!(counts, (2, 2));
+    }
+
+    #[test]
+    #[ignore = "explicit recovery-writer benchmark"]
+    fn native_doctor_writer_batch_commit_benchmark() {
+        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+        use std::path::PathBuf;
+        use std::time::Instant;
+
+        const CONVERSATIONS: usize = 256;
+        let dir = TempDir::new().unwrap();
+        let agent = Agent {
+            id: None,
+            slug: "codex".into(),
+            name: "Codex".into(),
+            version: Some("doctor-reconstruct".into()),
+            kind: AgentKind::Cli,
+        };
+        let make_conversations = || {
+            (0..CONVERSATIONS)
+                .map(|index| Conversation {
+                    id: None,
+                    agent_slug: "codex".into(),
+                    workspace: None,
+                    external_id: Some(format!("benchmark-{index}")),
+                    title: Some(format!("benchmark-{index}")),
+                    source_path: PathBuf::from(format!("/tmp/benchmark-{index}.jsonl")),
+                    started_at: Some(1_700_000_000_000 + index as i64),
+                    ended_at: None,
+                    approx_tokens: None,
+                    metadata_json: serde_json::json!({"benchmark": true}),
+                    messages: vec![Message {
+                        id: None,
+                        idx: 0,
+                        role: MessageRole::Agent,
+                        author: None,
+                        created_at: Some(1_700_000_000_000 + index as i64),
+                        content: "recovery benchmark payload".into(),
+                        extra_json: serde_json::Value::Null,
+                        snippets: Vec::new(),
+                    }],
+                    source_id: "local".into(),
+                    origin_host: None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let conversations = make_conversations();
+
+        let individual_path = dir.path().join("individual.db");
+        let storage = SqliteStorage::open(&individual_path).unwrap();
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+        drop(storage);
+        let start = Instant::now();
+        let mut individual = DoctorSqliteWriter::open(&individual_path).unwrap();
+        for conversation in &conversations {
+            individual
+                .insert_doctor_conversation_chunk(agent_id, None, conversation)
+                .unwrap();
+        }
+        let individual_elapsed = start.elapsed();
+        drop(individual);
+
+        let batch_path = dir.path().join("batch.db");
+        let storage = SqliteStorage::open(&batch_path).unwrap();
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+        drop(storage);
+        let chunks = conversations
+            .iter()
+            .map(|conversation| (agent_id, None, conversation))
+            .collect::<Vec<_>>();
+        let start = Instant::now();
+        let mut batch = DoctorSqliteWriter::open(&batch_path).unwrap();
+        let outcomes = batch.insert_doctor_conversation_batch(&chunks).unwrap();
+        let batch_elapsed = start.elapsed();
+        assert_eq!(outcomes.len(), CONVERSATIONS);
+        drop(batch);
+
+        eprintln!(
+            "CASS_DOCTOR_BATCH_BENCH conversations={} individual_ms={} batch_ms={} speedup={:.2}x",
+            CONVERSATIONS,
+            individual_elapsed.as_secs_f64() * 1000.0,
+            batch_elapsed.as_secs_f64() * 1000.0,
+            individual_elapsed.as_secs_f64() / batch_elapsed.as_secs_f64()
+        );
+    }
+
+    #[test]
+    #[ignore = "explicit recovery-writer benchmark"]
+    fn native_doctor_writer_message_batch_benchmark() {
+        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+        use std::path::PathBuf;
+        use std::time::Instant;
+
+        const MESSAGES: usize = 4096;
+        let dir = TempDir::new().unwrap();
+        let agent = Agent {
+            id: None,
+            slug: "codex".into(),
+            name: "Codex".into(),
+            version: Some("doctor-reconstruct".into()),
+            kind: AgentKind::Cli,
+        };
+        let conversation = Conversation {
+            id: None,
+            agent_slug: "codex".into(),
+            workspace: None,
+            external_id: Some("message-batch-benchmark".into()),
+            title: Some("message-batch-benchmark".into()),
+            source_path: PathBuf::from("/tmp/message-batch-benchmark.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: None,
+            approx_tokens: None,
+            metadata_json: serde_json::json!({"benchmark": true}),
+            messages: (0..MESSAGES)
+                .map(|idx| Message {
+                    id: None,
+                    idx: idx as i64,
+                    role: MessageRole::Agent,
+                    author: None,
+                    created_at: Some(1_700_000_000_000 + idx as i64),
+                    content: "message batch benchmark payload".into(),
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                })
+                .collect(),
+            source_id: "local".into(),
+            origin_host: None,
+        };
+
+        let run = |path: &PathBuf, rows: &str| {
+            let storage = SqliteStorage::open(path).unwrap();
+            let agent_id = storage.ensure_agent(&agent).unwrap();
+            drop(storage);
+            let _rows = set_env_var("CASS_DOCTOR_NATIVE_MESSAGE_BATCH_ROWS", rows);
+            let start = Instant::now();
+            let mut writer = DoctorSqliteWriter::open(path).unwrap();
+            let outcome = writer
+                .insert_doctor_conversation_chunk(agent_id, None, &conversation)
+                .unwrap();
+            assert_eq!(outcome.inserted_indices.len(), MESSAGES);
+            start.elapsed()
+        };
+        let scalar_elapsed = run(&dir.path().join("scalar.db"), "1");
+        let batched_elapsed = run(&dir.path().join("batched.db"), "256");
+        eprintln!(
+            "CASS_DOCTOR_MESSAGE_BATCH_BENCH messages={} scalar_ms={} batched_ms={} speedup={:.2}x",
+            MESSAGES,
+            scalar_elapsed.as_secs_f64() * 1000.0,
+            batched_elapsed.as_secs_f64() * 1000.0,
+            scalar_elapsed.as_secs_f64() / batched_elapsed.as_secs_f64()
+        );
     }
 
     #[test]
