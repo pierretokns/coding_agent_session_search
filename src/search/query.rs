@@ -8801,11 +8801,14 @@ impl SearchClient {
     /// Generate an interned cache key for the given query and filters.
     /// Returns Arc<str> to enable memory sharing for repeated queries.
     fn cache_key(&self, query: &str, filters: &SearchFilters) -> Arc<str> {
+        let fingerprint = filters_fingerprint(filters);
+        self.cache_key_with_fingerprint(query, &fingerprint)
+    }
+
+    fn cache_key_with_fingerprint(&self, query: &str, filters_fingerprint: &str) -> Arc<str> {
         let key_str = format!(
             "{}|{}::{}",
-            self.cache_namespace,
-            query,
-            filters_fingerprint(filters)
+            self.cache_namespace, query, filters_fingerprint
         );
         intern_cache_key(&key_str)
     }
@@ -8844,11 +8847,12 @@ impl SearchClient {
         let mut byte_indices: Vec<usize> = query.char_indices().map(|(i, _)| i).collect();
         byte_indices.push(query.len());
         let query_len = query.len();
+        let filters_fingerprint = filters_fingerprint(filters);
         for &end in byte_indices.iter().rev() {
             if end == 0 || end == query_len {
                 continue;
             }
-            let key = self.cache_key(&query[..end], filters);
+            let key = self.cache_key_with_fingerprint(&query[..end], &filters_fingerprint);
             if shard.contains(&key) {
                 return true;
             }
@@ -8911,11 +8915,12 @@ impl SearchClient {
         // Iterate over character boundaries to avoid slicing mid-codepoint.
         let mut byte_indices: Vec<usize> = query.char_indices().map(|(i, _)| i).collect();
         byte_indices.push(query.len());
+        let filters_fingerprint = filters_fingerprint(filters);
         for &end in byte_indices.iter().rev() {
             if end == 0 {
                 continue;
             }
-            let key = self.cache_key(&query[..end], filters);
+            let key = self.cache_key_with_fingerprint(&query[..end], &filters_fingerprint);
             // LruCache.peek() accepts &Q where Arc<str>: Borrow<Q>, so &Arc<str> works
             if let Some(hits) = shard.peek(&key) {
                 return Some(hits.clone());
