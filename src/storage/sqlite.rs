@@ -12685,6 +12685,144 @@ impl FrankenStorage {
 
         Ok(outcomes)
     }
+
+    /// Insert one recovery chunk using the raw archive's exact positional
+    /// identity. Doctor reconstruction must not apply replay-fingerprint
+    /// dedupe: two identical raw JSONL lines at different idx values are
+    /// distinct source messages. The bounded range probe also avoids the
+    /// normal missing-timestamp merge scan across the full conversation.
+    pub fn insert_doctor_conversation_chunk(
+        &self,
+        agent_id: i64,
+        workspace_id: Option<i64>,
+        conv: &Conversation,
+    ) -> Result<InsertOutcome> {
+        let normalized_conv = normalized_conversation_for_storage(conv);
+        let conv = normalized_conv.as_ref();
+        self.ensure_source_for_conversation(conv)?;
+        let defer_lexical_updates = defer_storage_lexical_updates_enabled();
+        let defer_analytics_updates = defer_analytics_updates_enabled();
+        let conversation_key = conversation_merge_key(agent_id, conv);
+        let mut tx = self.conn.transaction()?;
+
+        ensure_agents_in_tx(&tx, &[(agent_id, workspace_id, conv)])?;
+        ensure_workspaces_in_tx(&tx, &[(agent_id, workspace_id, conv)])?;
+        ensure_sources_in_tx(&tx, &[(agent_id, workspace_id, conv)])?;
+
+        let (conversation_id, conversation_inserted) =
+            match franken_find_existing_conversation_by_key(&tx, &conversation_key, Some(conv))? {
+                Some(existing_id) => (existing_id, false),
+                None => match franken_insert_conversation_or_get_existing(
+                    &tx,
+                    agent_id,
+                    workspace_id,
+                    conv,
+                )? {
+                    ConversationInsertStatus::Inserted(new_id) => (new_id, true),
+                    ConversationInsertStatus::Existing(existing_id) => (existing_id, false),
+                },
+            };
+
+        let (first_idx, last_idx) = conv
+            .messages
+            .first()
+            .zip(conv.messages.last())
+            .map(|(first, last)| (first.idx.min(last.idx), first.idx.max(last.idx)))
+            .unwrap_or((0, -1));
+        let existing_indices: HashSet<i64> = if first_idx <= last_idx {
+            tx.query_map_collect(
+                "SELECT idx FROM messages WHERE conversation_id = ?1 AND idx BETWEEN ?2 AND ?3",
+                fparams![conversation_id, first_idx, last_idx],
+                |row| row.get_typed(0),
+            )?
+            .into_iter()
+            .collect()
+        } else {
+            HashSet::new()
+        };
+        let new_messages: Vec<&Message> = conv
+            .messages
+            .iter()
+            .filter(|message| !existing_indices.contains(&message.idx))
+            .collect();
+        let inserted_message_ids =
+            franken_batch_insert_new_messages(&tx, conversation_id, &new_messages)?;
+        let mut inserted_indices = Vec::with_capacity(new_messages.len());
+        let mut inserted_chars = 0i64;
+        let mut fts_entries = Vec::new();
+        let mut fts_pending_chars = 0usize;
+        let mut fts_inserted_total = 0usize;
+        for (message_id, message) in inserted_message_ids.into_iter().zip(new_messages.iter()) {
+            franken_insert_snippets(&tx, message_id, &message.snippets)?;
+            if !defer_lexical_updates {
+                fts_entries.push(FtsEntry::from_message(message_id, message, conv));
+                fts_pending_chars = fts_pending_chars.saturating_add(message.content.len());
+                if fts_entries.len() >= FTS_ENTRY_BATCH_MAX_DOCS
+                    || fts_pending_chars >= FTS_ENTRY_BATCH_MAX_CHARS
+                {
+                    flush_pending_fts_entries(
+                        self,
+                        &tx,
+                        &mut fts_entries,
+                        &mut fts_pending_chars,
+                        &mut fts_inserted_total,
+                    )?;
+                }
+            }
+            inserted_indices.push(message.idx);
+            inserted_chars = inserted_chars.saturating_add(message.content.len() as i64);
+        }
+        if !defer_lexical_updates {
+            flush_pending_fts_entries(
+                self,
+                &tx,
+                &mut fts_entries,
+                &mut fts_pending_chars,
+                &mut fts_inserted_total,
+            )?;
+        }
+
+        let (inserted_last_idx, inserted_last_created_at) =
+            borrowed_messages_tail_state(&new_messages);
+        let conv_last_ts = conversation_tail_ended_at_candidate(conv);
+        franken_update_conversation_tail_state(
+            &tx,
+            conversation_id,
+            conv_last_ts,
+            inserted_last_idx,
+            inserted_last_created_at,
+        )?;
+        if let Some(lookup_key) = conversation_external_lookup_key_for_conv(agent_id, conv) {
+            franken_update_external_conversation_tail_lookup_key(
+                &tx,
+                &lookup_key,
+                conv_last_ts,
+                inserted_last_idx,
+                inserted_last_created_at,
+            )?;
+        }
+        if !defer_analytics_updates && !inserted_indices.is_empty() {
+            franken_update_daily_stats_in_tx(
+                self,
+                &tx,
+                &conv.agent_slug,
+                &conv.source_id,
+                conversation_effective_started_at(conv),
+                StatsDelta {
+                    session_count_delta: i64::from(conversation_inserted),
+                    message_count_delta: inserted_indices.len() as i64,
+                    total_chars_delta: inserted_chars,
+                },
+            )?;
+        }
+
+        tx.commit()?;
+        Ok(InsertOutcome {
+            conversation_id,
+            conversation_inserted,
+            inserted_indices,
+        })
+    }
 }
 
 fn normalized_storage_source_parts(
@@ -22643,6 +22781,91 @@ mod tests {
             })
             .unwrap();
         assert_eq!(stored_indices, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn doctor_chunk_insert_preserves_identical_payloads_by_exact_idx() {
+        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+        use std::path::PathBuf;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("doctor-chunk.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let agent_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "codex".into(),
+                name: "Codex".into(),
+                version: Some("doctor-reconstruct".into()),
+                kind: AgentKind::Cli,
+            })
+            .unwrap();
+        let message = |idx: i64| Message {
+            id: None,
+            idx,
+            role: if idx == 0 {
+                MessageRole::User
+            } else {
+                MessageRole::Agent
+            },
+            author: None,
+            created_at: None,
+            content: "identical raw payload".into(),
+            extra_json: serde_json::json!({"cass":{"doctor_reconstruct":{"line":idx+1}}}),
+            snippets: Vec::new(),
+        };
+        let conversation = |messages: Vec<Message>| Conversation {
+            id: None,
+            agent_slug: "codex".into(),
+            workspace: None,
+            external_id: Some("doctor-exact-index-session".into()),
+            title: Some("Doctor exact index session".into()),
+            source_path: PathBuf::from("/tmp/doctor-exact-index.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: None,
+            approx_tokens: None,
+            metadata_json: serde_json::json!({"cass":{"doctor_reconstruct":true}}),
+            messages,
+            source_id: "local".into(),
+            origin_host: None,
+        };
+
+        let first = conversation(vec![message(0), message(1)]);
+        let second = conversation(vec![message(2)]);
+        let first_outcome = storage
+            .insert_doctor_conversation_chunk(agent_id, None, &first)
+            .unwrap();
+        let second_outcome = storage
+            .insert_doctor_conversation_chunk(agent_id, None, &second)
+            .unwrap();
+        let replay_outcome = storage
+            .insert_doctor_conversation_chunk(agent_id, None, &second)
+            .unwrap();
+
+        assert!(first_outcome.conversation_inserted);
+        assert_eq!(first_outcome.inserted_indices, vec![0, 1]);
+        assert!(!second_outcome.conversation_inserted);
+        assert_eq!(second_outcome.inserted_indices, vec![2]);
+        assert!(replay_outcome.inserted_indices.is_empty());
+
+        let stored: Vec<(i64, String)> = storage
+            .conn
+            .query_map_collect(
+                "SELECT idx, content FROM messages ORDER BY idx",
+                fparams![],
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stored.len(), 3);
+        assert_eq!(
+            stored.iter().map(|(idx, _)| *idx).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert!(
+            stored
+                .iter()
+                .all(|(_, content)| content == "identical raw payload")
+        );
     }
 
     #[test]
