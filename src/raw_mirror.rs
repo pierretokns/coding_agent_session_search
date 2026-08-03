@@ -15,6 +15,9 @@ const RAW_MIRROR_VERSION_DIR: &str = "v1";
 const RAW_MIRROR_MANIFEST_KIND: &str = "cass_raw_session_mirror_v1";
 const RAW_MIRROR_HASH_ALGORITHM: &str = "blake3";
 const RAW_MIRROR_BLOB_EXTENSION: &str = "raw";
+// Watch-mode source identities are unbounded over a long-lived process. Keep
+// the process-local cache from retaining every historical edit forever.
+const RAW_MIRROR_BLOB_CACHE_MAX_ENTRIES: usize = 4096;
 
 static TEMP_NONCE: AtomicU64 = AtomicU64::new(0);
 static BLOB_CAPTURE_CACHE: OnceLock<Mutex<HashMap<RawMirrorBlobCacheKey, RawMirrorBlobRecord>>> =
@@ -1464,6 +1467,15 @@ fn remove_cached_raw_mirror_blob_record_if_unchanged(
 fn cache_raw_mirror_blob_record(key: RawMirrorBlobCacheKey, record: RawMirrorBlobRecord) {
     let cache = BLOB_CAPTURE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     if let Ok(mut guard) = cache.lock() {
+        if guard.len() >= RAW_MIRROR_BLOB_CACHE_MAX_ENTRIES && !guard.contains_key(&key) {
+            // HashMap iteration is intentionally sufficient here: this is a
+            // correctness-preserving bounded cache, not an LRU. A future
+            // capture will repopulate an evicted entry and revalidate the
+            // content-addressed blob before reuse.
+            if let Some(evicted) = guard.keys().next().cloned() {
+                guard.remove(&evicted);
+            }
+        }
         guard.insert(key, record);
     }
 }
