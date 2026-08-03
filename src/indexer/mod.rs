@@ -4291,6 +4291,8 @@ struct LexicalRebuildEquivalenceAccumulator {
     probes: Vec<String>,
     probe_hashers: Vec<blake3::Hasher>,
     probe_counts: Vec<u64>,
+    probe_matcher: Option<regex::RegexSet>,
+    probe_match_indices: Vec<Vec<usize>>,
 }
 
 impl LexicalRebuildEquivalenceAccumulator {
@@ -4309,16 +4311,88 @@ impl LexicalRebuildEquivalenceAccumulator {
         let probes: Vec<String> = probes.into_iter().collect();
         let probe_hashers = probes.iter().map(|_| blake3::Hasher::new()).collect();
         let probe_counts = vec![0_u64; probes.len()];
+        let mut matcher_patterns = Vec::new();
+        let mut probe_match_indices: Vec<Vec<usize>> = Vec::new();
+        for (probe_idx, probe) in probes.iter().enumerate() {
+            if probe.is_empty() {
+                // `str::contains("")` is always true. Keep that exact
+                // behavior without asking the regex-set builder to accept
+                // an empty pattern.
+                continue;
+            }
+            if let Some(existing) = matcher_patterns
+                .iter()
+                .position(|pattern: &String| pattern.as_bytes() == probe.as_bytes())
+            {
+                probe_match_indices[existing].push(probe_idx);
+            } else {
+                matcher_patterns.push(probe.clone());
+                probe_match_indices.push(vec![probe_idx]);
+            }
+        }
+        let probe_matcher = if matcher_patterns.is_empty() {
+            None
+        } else {
+            let escaped_patterns = matcher_patterns
+                .iter()
+                .map(|pattern| regex::escape(pattern))
+                .collect::<Vec<_>>();
+            regex::RegexSet::new(&escaped_patterns).ok()
+        };
         Self {
             document_count: 0,
             manifest_hasher: blake3::Hasher::new(),
             probes,
             probe_hashers,
             probe_counts,
+            probe_matcher,
+            probe_match_indices,
         }
     }
 
+    fn probe_hits_for_doc(
+        &self,
+        doc: &frankensearch::lexical_tantivy::CassDocumentRef<'_>,
+    ) -> smallvec::SmallVec<[bool; 8]> {
+        let mut hits = smallvec::SmallVec::<[bool; 8]>::from_elem(false, self.probes.len());
+        for (probe_idx, probe) in self.probes.iter().enumerate() {
+            if probe.is_empty() {
+                hits[probe_idx] = true;
+            }
+        }
+
+        let Some(matcher) = &self.probe_matcher else {
+            return hits;
+        };
+        let fields = [
+            doc.content,
+            doc.title.unwrap_or_default(),
+            doc.workspace.unwrap_or_default(),
+            doc.source_path,
+        ];
+        for field in fields {
+            for pattern_idx in matcher.matches(field).iter() {
+                for &probe_idx in &self.probe_match_indices[pattern_idx] {
+                    hits[probe_idx] = true;
+                }
+            }
+            if hits.iter().all(|hit| *hit) {
+                break;
+            }
+        }
+        hits
+    }
+
+    #[cfg(test)]
     fn absorb_packet(&mut self, packet: &LexicalRebuildConversationPacket) {
+        self.absorb_packet_with_pool(packet, None);
+    }
+
+    fn absorb_packet_with_pool(
+        &mut self,
+        packet: &LexicalRebuildConversationPacket,
+        worker_pool: Option<&rayon::ThreadPool>,
+    ) {
         let fingerprint = packet.fingerprint_input();
         // Packet header: version, identity, provenance, counters. Length-prefixed
         // length-prefixed strings avoid ambiguity across field boundaries.
@@ -4367,7 +4441,19 @@ impl LexicalRebuildEquivalenceAccumulator {
 
         let docs = packet.prebuilt_docs();
         self.document_count = self.document_count.saturating_add(docs.len() as u64);
-        for doc in &docs {
+        let probe_hits = match worker_pool {
+            Some(pool) => pool.install(|| {
+                use rayon::prelude::*;
+                docs.par_iter()
+                    .map(|doc| self.probe_hits_for_doc(doc))
+                    .collect::<Vec<_>>()
+            }),
+            None => docs
+                .iter()
+                .map(|doc| self.probe_hits_for_doc(doc))
+                .collect::<Vec<_>>(),
+        };
+        for (doc, probe_hits) in docs.iter().zip(probe_hits) {
             self.manifest_hasher.update(b"doc");
             lexical_rebuild_equivalence_update_opt_str(&mut self.manifest_hasher, Some(doc.agent));
             lexical_rebuild_equivalence_update_opt_str(&mut self.manifest_hasher, doc.workspace);
@@ -4392,23 +4478,13 @@ impl LexicalRebuildEquivalenceAccumulator {
             );
             lexical_rebuild_equivalence_update_opt_str(&mut self.manifest_hasher, doc.origin_host);
 
-            for ((probe, hasher), count) in self
+            for (((_probe, hasher), count), hit) in self
                 .probes
                 .iter()
                 .zip(self.probe_hashers.iter_mut())
                 .zip(self.probe_counts.iter_mut())
+                .zip(probe_hits)
             {
-                let probe_str = probe.as_str();
-                let hit = doc.content.contains(probe_str)
-                    || doc
-                        .title
-                        .map(|value| value.contains(probe_str))
-                        .unwrap_or(false)
-                    || doc
-                        .workspace
-                        .map(|value| value.contains(probe_str))
-                        .unwrap_or(false)
-                    || doc.source_path.contains(probe_str);
                 if hit {
                     *count = count.saturating_add(1);
                     hasher.update(b"hit");
@@ -4977,6 +5053,18 @@ fn spawn_lexical_rebuild_shard_builder_workers(
                             index_size_bytes,
                             shard_message_bytes,
                         );
+                        if std::env::var_os("CASS_TANTIVY_REBUILD_PROFILE").is_some() {
+                            eprintln!(
+                                "CASS_STAGED_PROFILE stage=shard_build worker={} shard={} writer_parallelism={} duration_ms={} message_bytes={} index_bytes={} amplification_milli={:?}",
+                                worker_idx,
+                                work.shard.shard_index,
+                                work.writer_parallelism,
+                                build_duration_ms,
+                                shard_message_bytes,
+                                index_size_bytes,
+                                amplification_milli,
+                            );
+                        }
                         flow_limiter.release(flow_reservation_bytes);
                         match result {
                             Ok(summary) => {
@@ -5054,6 +5142,7 @@ fn spawn_lexical_rebuild_shard_merge_workers(
                             .iter()
                             .map(|artifact| artifact.index_path.clone())
                             .collect::<Vec<_>>();
+                        let merge_started = Instant::now();
                         // #282: a panicking shard-merge worker used to unwind
                         // silently, leaving the result channel open and parking
                         // the final-frontier reducer forever on
@@ -5077,6 +5166,17 @@ fn spawn_lexical_rebuild_shard_merge_workers(
                         };
                         match result {
                             Ok(merged_index) => {
+                                if std::env::var_os("CASS_TANTIVY_REBUILD_PROFILE").is_some() {
+                                    eprintln!(
+                                        "CASS_STAGED_PROFILE stage=shard_merge worker={} level={} first_shard={} last_shard={} inputs={} duration_ms={}",
+                                        worker_idx,
+                                        work.output_level,
+                                        first_shard_index,
+                                        last_shard_index,
+                                        input_paths.len(),
+                                        merge_started.elapsed().as_secs_f64() * 1000.0,
+                                    );
+                                }
                                 let docs = work
                                     .input_artifacts
                                     .iter()
@@ -6024,6 +6124,7 @@ struct LexicalRebuildPerfProfile {
     conversation_list_duration: Duration,
     message_stream_duration: Duration,
     finish_conversation_duration: Duration,
+    equivalence_duration: Duration,
     prepare_duration: Duration,
     add_duration: Duration,
     commit_duration: Duration,
@@ -6048,6 +6149,7 @@ impl LexicalRebuildPerfProfile {
         let heartbeat_persists = self.heartbeat_persist_count.max(1) as f64;
         let accounted_duration = self.conversation_list_duration
             + self.message_stream_duration
+            + self.equivalence_duration
             + self.prepare_duration
             + self.add_duration
             + self.commit_duration
@@ -6063,6 +6165,7 @@ impl LexicalRebuildPerfProfile {
                 "batch_conversations={} batch_messages={} batch_message_bytes={} ",
                 "total_ms={:.3} conversation_list_ms={:.3} message_stream_ms={:.3} ",
                 "finish_conversation_ms={:.3} residual_ms={:.3} ",
+                "equivalence_ms={:.3} ",
                 "prepare_ms={:.3} add_ms={:.3} commit_ms={:.3} ",
                 "pending_progress_ms={:.3} heartbeat_progress_ms={:.3} ",
                 "checkpoint_persist_ms={:.3} meta_fingerprint_ms={:.3} ",
@@ -6081,6 +6184,7 @@ impl LexicalRebuildPerfProfile {
             Self::millis(self.message_stream_duration),
             Self::millis(self.finish_conversation_duration),
             Self::millis(residual_duration),
+            Self::millis(self.equivalence_duration),
             Self::millis(self.prepare_duration),
             Self::millis(self.add_duration),
             Self::millis(self.commit_duration),
@@ -19772,7 +19876,16 @@ fn rebuild_tantivy_from_db_via_staged_shards(
                                 {
                                     max_message_id = max_message_id.max(last_message_id);
                                 }
-                                equivalence_accumulator.absorb_packet(&packet);
+                                let equivalence_started = perf_profile.as_ref().map(|_| Instant::now());
+                                equivalence_accumulator.absorb_packet_with_pool(
+                                    &packet,
+                                    lexical_rebuild_worker_pool.as_deref(),
+                                );
+                                if let (Some(profile), Some(started)) =
+                                    (perf_profile.as_mut(), equivalence_started)
+                                {
+                                    profile.equivalence_duration += started.elapsed();
+                                }
                                 current_shard_message_bytes =
                                     current_shard_message_bytes.saturating_add(packet.message_bytes);
                                 packet.flow_reservation_bytes = 0;
@@ -21120,7 +21233,16 @@ fn rebuild_tantivy_from_db_with_options(
                             {
                                 max_message_id = max_message_id.max(last_message_id);
                             }
-                            equivalence_accumulator.absorb_packet(&packet);
+                            let equivalence_started = perf_profile.as_ref().map(|_| Instant::now());
+                            equivalence_accumulator.absorb_packet_with_pool(
+                                &packet,
+                                lexical_rebuild_worker_pool.as_deref(),
+                            );
+                            if let (Some(profile), Some(started)) =
+                                (perf_profile.as_mut(), equivalence_started)
+                            {
+                                profile.equivalence_duration += started.elapsed();
+                            }
                             finish_conversation!(packet)?;
                         }
                         if flush_streamed_lexical_rebuild_batch_for_planned_shard_boundary(
@@ -43815,6 +43937,49 @@ mod tests {
         assert_ne!(
             targeted.golden_query_digest, shuffled.golden_query_digest,
             "probe order must be part of the digest"
+        );
+
+        // Exercise the exact substring semantics that a multi-pattern matcher
+        // can accidentally change: empty probes, overlapping probes, and
+        // duplicate probes must agree with the original per-probe `contains`
+        // implementation.
+        let adversarial_probes = [
+            "",
+            "lexical-fixture-1",
+            "ical-fixture-1",
+            "lexical-fixture-1",
+            "missing-golden-query",
+        ];
+        let adversarial = probe_evidence(&adversarial_probes);
+        let expected_counts = adversarial_probes
+            .iter()
+            .map(|probe| {
+                packets
+                    .iter()
+                    .flat_map(|packet| packet.prebuilt_docs())
+                    .filter(|doc| {
+                        doc.content.contains(probe)
+                            || doc
+                                .title
+                                .map(|value| value.contains(probe))
+                                .unwrap_or(false)
+                            || doc
+                                .workspace
+                                .map(|value| value.contains(probe))
+                                .unwrap_or(false)
+                            || doc.source_path.contains(probe)
+                    })
+                    .count() as u64
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            adversarial
+                .golden_query_hit_counts
+                .iter()
+                .map(|hit| hit.hit_count)
+                .collect::<Vec<_>>(),
+            expected_counts,
+            "multi-pattern equivalence matching must preserve per-probe contains semantics"
         );
     }
 

@@ -6288,9 +6288,29 @@ fn doctor_raw_mirror_tail_metadata_sidecar_path(db_path: &Path) -> PathBuf {
     database_sidecar_path(db_path, ".cass-doctor-tail-authoritative")
 }
 
+fn doctor_raw_mirror_tail_metadata_sidecar_fingerprint(db_path: &Path) -> Option<String> {
+    let metadata = fs::metadata(db_path).ok()?;
+    #[cfg(unix)]
+    let identity = {
+        use std::os::unix::fs::MetadataExt;
+        format!("dev={}:ino={}", metadata.dev(), metadata.ino())
+    };
+    #[cfg(not(unix))]
+    let identity = format!("len={}", metadata.len());
+    Some(format!(
+        "v2|db_identity={identity}|path={}",
+        db_path.display()
+    ))
+}
+
 fn doctor_raw_mirror_tail_metadata_sidecar_is_valid(db_path: &Path) -> bool {
+    let Some(fingerprint) = doctor_raw_mirror_tail_metadata_sidecar_fingerprint(db_path) else {
+        return false;
+    };
     fs::read_to_string(doctor_raw_mirror_tail_metadata_sidecar_path(db_path))
-        .map(|value| value.trim() == DOCTOR_RAW_MIRROR_TAIL_METADATA_META_VALUE)
+        .map(|value| {
+            value.trim() == format!("{DOCTOR_RAW_MIRROR_TAIL_METADATA_META_VALUE}|{fingerprint}")
+        })
         .unwrap_or(false)
 }
 
@@ -6306,7 +6326,14 @@ fn persist_doctor_raw_mirror_tail_metadata_sidecar(db_path: &Path) -> Result<()>
     );
     fs::write(
         &temp_path,
-        format!("{DOCTOR_RAW_MIRROR_TAIL_METADATA_META_VALUE}\n"),
+        format!(
+            "{DOCTOR_RAW_MIRROR_TAIL_METADATA_META_VALUE}|{}\n",
+            doctor_raw_mirror_tail_metadata_sidecar_fingerprint(db_path).ok_or_else(
+                || anyhow::anyhow!(
+                    "database disappeared while fingerprinting tail metadata sidecar"
+                )
+            )?
+        ),
     )
     .with_context(|| {
         format!(
@@ -6422,8 +6449,20 @@ impl DoctorSqliteWriter {
             // which safely selects the slower legacy planner on resume.
             // Publishing it after commit also avoids making the marker part
             // of the 47k-transaction recovery hot path.
-            persist_doctor_raw_mirror_tail_metadata_sidecar(&self.db_path)?;
-            self.raw_mirror_tail_marker_written = true;
+            match persist_doctor_raw_mirror_tail_metadata_sidecar(&self.db_path) {
+                Ok(()) => self.raw_mirror_tail_marker_written = true,
+                Err(err) => {
+                    // The database transaction is already durable. The
+                    // sidecar is only a planner shortcut; do not turn a
+                    // sidecar filesystem failure into a reported recovery
+                    // failure that will replay a committed batch.
+                    tracing::warn!(
+                        path = %self.db_path.display(),
+                        error = %err,
+                        "could not publish raw-mirror tail sidecar; retaining safe database-marker fallback"
+                    );
+                }
+            }
         }
         Ok(outcomes)
     }
@@ -23737,6 +23776,23 @@ mod tests {
             row.get_typed::<i64>(1).unwrap(),
         );
         assert_eq!(counts, (2, 2));
+    }
+
+    #[test]
+    fn doctor_tail_sidecar_is_bound_to_database_file_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("candidate.db");
+        std::fs::write(&db_path, b"database-a").unwrap();
+        persist_doctor_raw_mirror_tail_metadata_sidecar(&db_path).unwrap();
+        assert!(doctor_raw_mirror_tail_metadata_sidecar_is_valid(&db_path));
+
+        let replacement = temp.path().join("candidate.db.replacement");
+        std::fs::write(&replacement, b"database-b").unwrap();
+        std::fs::rename(&replacement, &db_path).unwrap();
+        assert!(
+            !doctor_raw_mirror_tail_metadata_sidecar_is_valid(&db_path),
+            "a sidecar from a replaced candidate database must never authorize the fast path"
+        );
     }
 
     #[test]
