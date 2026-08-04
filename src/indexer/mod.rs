@@ -4291,8 +4291,11 @@ struct LexicalRebuildEquivalenceAccumulator {
     probes: Vec<String>,
     probe_hashers: Vec<blake3::Hasher>,
     probe_counts: Vec<u64>,
-    probe_matcher: Option<regex::RegexSet>,
-    probe_match_indices: Vec<Vec<usize>>,
+}
+
+enum LexicalRebuildEquivalenceProbeHits {
+    Compact(Vec<u64>),
+    Wide(Vec<smallvec::SmallVec<[u64; 1]>>),
 }
 
 impl LexicalRebuildEquivalenceAccumulator {
@@ -4311,76 +4314,86 @@ impl LexicalRebuildEquivalenceAccumulator {
         let probes: Vec<String> = probes.into_iter().collect();
         let probe_hashers = probes.iter().map(|_| blake3::Hasher::new()).collect();
         let probe_counts = vec![0_u64; probes.len()];
-        let mut matcher_patterns = Vec::new();
-        let mut probe_match_indices: Vec<Vec<usize>> = Vec::new();
-        for (probe_idx, probe) in probes.iter().enumerate() {
-            if probe.is_empty() {
-                // `str::contains("")` is always true. Keep that exact
-                // behavior without asking the regex-set builder to accept
-                // an empty pattern.
-                continue;
-            }
-            if let Some(existing) = matcher_patterns
-                .iter()
-                .position(|pattern: &String| pattern.as_bytes() == probe.as_bytes())
-            {
-                probe_match_indices[existing].push(probe_idx);
-            } else {
-                matcher_patterns.push(probe.clone());
-                probe_match_indices.push(vec![probe_idx]);
-            }
-        }
-        let probe_matcher = if matcher_patterns.is_empty() {
-            None
-        } else {
-            let escaped_patterns = matcher_patterns
-                .iter()
-                .map(|pattern| regex::escape(pattern))
-                .collect::<Vec<_>>();
-            regex::RegexSet::new(&escaped_patterns).ok()
-        };
         Self {
             document_count: 0,
             manifest_hasher: blake3::Hasher::new(),
             probes,
             probe_hashers,
             probe_counts,
-            probe_matcher,
-            probe_match_indices,
         }
     }
 
-    fn probe_hits_for_doc(
+    fn probe_hit_mask_for_doc(
         &self,
         doc: &frankensearch::lexical_tantivy::CassDocumentRef<'_>,
-    ) -> smallvec::SmallVec<[bool; 8]> {
-        let mut hits = smallvec::SmallVec::<[bool; 8]>::from_elem(false, self.probes.len());
+    ) -> u64 {
+        let mut hits = 0_u64;
         for (probe_idx, probe) in self.probes.iter().enumerate() {
-            if probe.is_empty() {
-                hits[probe_idx] = true;
-            }
-        }
-
-        let Some(matcher) = &self.probe_matcher else {
-            return hits;
-        };
-        let fields = [
-            doc.content,
-            doc.title.unwrap_or_default(),
-            doc.workspace.unwrap_or_default(),
-            doc.source_path,
-        ];
-        for field in fields {
-            for pattern_idx in matcher.matches(field).iter() {
-                for &probe_idx in &self.probe_match_indices[pattern_idx] {
-                    hits[probe_idx] = true;
-                }
-            }
-            if hits.iter().all(|hit| *hit) {
-                break;
+            if doc.content.contains(probe)
+                || doc.title.is_some_and(|title| title.contains(probe))
+                || doc
+                    .workspace
+                    .is_some_and(|workspace| workspace.contains(probe))
+                || doc.source_path.contains(probe)
+            {
+                hits |= 1_u64 << probe_idx;
             }
         }
         hits
+    }
+
+    fn probe_hit_words_for_doc(
+        &self,
+        doc: &frankensearch::lexical_tantivy::CassDocumentRef<'_>,
+    ) -> smallvec::SmallVec<[u64; 1]> {
+        let word_count = self.probes.len().div_ceil(64);
+        let mut hits = smallvec::SmallVec::<[u64; 1]>::from_elem(0, word_count);
+        for (probe_idx, probe) in self.probes.iter().enumerate() {
+            if doc.content.contains(probe)
+                || doc.title.is_some_and(|title| title.contains(probe))
+                || doc
+                    .workspace
+                    .is_some_and(|workspace| workspace.contains(probe))
+                || doc.source_path.contains(probe)
+            {
+                hits[probe_idx / 64] |= 1_u64 << (probe_idx % 64);
+            }
+        }
+        hits
+    }
+
+    fn collect_probe_hits(
+        &self,
+        docs: &[frankensearch::lexical_tantivy::CassDocumentRef<'_>],
+        worker_pool: Option<&rayon::ThreadPool>,
+    ) -> LexicalRebuildEquivalenceProbeHits {
+        if self.probes.len() <= 64 {
+            let collect = || {
+                docs.par_iter()
+                    .map(|doc| self.probe_hit_mask_for_doc(doc))
+                    .collect::<Vec<_>>()
+            };
+            return LexicalRebuildEquivalenceProbeHits::Compact(match worker_pool {
+                Some(pool) => pool.install(collect),
+                None => docs
+                    .iter()
+                    .map(|doc| self.probe_hit_mask_for_doc(doc))
+                    .collect(),
+            });
+        }
+
+        let collect = || {
+            docs.par_iter()
+                .map(|doc| self.probe_hit_words_for_doc(doc))
+                .collect::<Vec<_>>()
+        };
+        LexicalRebuildEquivalenceProbeHits::Wide(match worker_pool {
+            Some(pool) => pool.install(collect),
+            None => docs
+                .iter()
+                .map(|doc| self.probe_hit_words_for_doc(doc))
+                .collect(),
+        })
     }
 
     #[cfg(test)]
@@ -4393,7 +4406,67 @@ impl LexicalRebuildEquivalenceAccumulator {
         packet: &LexicalRebuildConversationPacket,
         worker_pool: Option<&rayon::ThreadPool>,
     ) {
-        let fingerprint = packet.fingerprint_input();
+        self.absorb_packets_with_pool(std::slice::from_ref(packet), worker_pool);
+    }
+
+    fn absorb_packets_with_pool(
+        &mut self,
+        packets: &[LexicalRebuildConversationPacket],
+        worker_pool: Option<&rayon::ThreadPool>,
+    ) {
+        if packets.is_empty() {
+            return;
+        }
+
+        let mut docs = Vec::new();
+        let mut packet_doc_ranges = Vec::with_capacity(packets.len() + 1);
+        packet_doc_ranges.push(0);
+        for packet in packets {
+            let packet_docs = packet.prebuilt_docs();
+            docs.extend(packet_docs);
+            packet_doc_ranges.push(docs.len());
+        }
+
+        // The proof's manifest and golden-query hashers are intentionally
+        // consumed below in packet/doc order. Only the independent substring
+        // probes are batched, so Rayon cannot change duplicate or ordering
+        // semantics while this performs one pool dispatch for the whole page.
+        let probe_hits = self.collect_probe_hits(&docs, worker_pool);
+        match probe_hits {
+            LexicalRebuildEquivalenceProbeHits::Compact(probe_hits) => {
+                for (packet_idx, packet) in packets.iter().enumerate() {
+                    self.absorb_packet_header(packet.fingerprint_input());
+                    let start = packet_doc_ranges[packet_idx];
+                    let end = packet_doc_ranges[packet_idx + 1];
+                    self.document_count = self.document_count.saturating_add((end - start) as u64);
+                    for (doc, probe_hit_mask) in
+                        docs[start..end].iter().zip(&probe_hits[start..end])
+                    {
+                        self.absorb_doc(doc, |probe_idx| {
+                            probe_hit_mask & (1_u64 << probe_idx) != 0
+                        });
+                    }
+                }
+            }
+            LexicalRebuildEquivalenceProbeHits::Wide(probe_hits) => {
+                for (packet_idx, packet) in packets.iter().enumerate() {
+                    self.absorb_packet_header(packet.fingerprint_input());
+                    let start = packet_doc_ranges[packet_idx];
+                    let end = packet_doc_ranges[packet_idx + 1];
+                    self.document_count = self.document_count.saturating_add((end - start) as u64);
+                    for (doc, probe_hit_words) in
+                        docs[start..end].iter().zip(&probe_hits[start..end])
+                    {
+                        self.absorb_doc(doc, |probe_idx| {
+                            probe_hit_words[probe_idx / 64] & (1_u64 << (probe_idx % 64)) != 0
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    fn absorb_packet_header(&mut self, fingerprint: LexicalRebuildPacketFingerprintInput<'_>) {
         // Packet header: version, identity, provenance, counters. Length-prefixed
         // length-prefixed strings avoid ambiguity across field boundaries.
         self.manifest_hasher.update(b"pkt");
@@ -4438,62 +4511,49 @@ impl LexicalRebuildEquivalenceAccumulator {
             .update(&(fingerprint.message_count as u64).to_le_bytes());
         self.manifest_hasher
             .update(&(fingerprint.message_bytes as u64).to_le_bytes());
+    }
 
-        let docs = packet.prebuilt_docs();
-        self.document_count = self.document_count.saturating_add(docs.len() as u64);
-        let probe_hits = match worker_pool {
-            Some(pool) => pool.install(|| {
-                use rayon::prelude::*;
-                docs.par_iter()
-                    .map(|doc| self.probe_hits_for_doc(doc))
-                    .collect::<Vec<_>>()
-            }),
-            None => docs
-                .iter()
-                .map(|doc| self.probe_hits_for_doc(doc))
-                .collect::<Vec<_>>(),
-        };
-        for (doc, probe_hits) in docs.iter().zip(probe_hits) {
-            self.manifest_hasher.update(b"doc");
-            lexical_rebuild_equivalence_update_opt_str(&mut self.manifest_hasher, Some(doc.agent));
-            lexical_rebuild_equivalence_update_opt_str(&mut self.manifest_hasher, doc.workspace);
-            lexical_rebuild_equivalence_update_opt_str(
-                &mut self.manifest_hasher,
-                Some(doc.source_path),
-            );
-            self.manifest_hasher.update(&doc.msg_idx.to_le_bytes());
-            self.manifest_hasher
-                .update(&doc.created_at.unwrap_or(i64::MIN).to_le_bytes());
-            lexical_rebuild_equivalence_update_opt_str(&mut self.manifest_hasher, doc.title);
-            self.manifest_hasher
-                .update(&(doc.content.len() as u64).to_le_bytes());
-            self.manifest_hasher.update(doc.content.as_bytes());
-            lexical_rebuild_equivalence_update_opt_str(
-                &mut self.manifest_hasher,
-                Some(doc.source_id),
-            );
-            lexical_rebuild_equivalence_update_opt_str(
-                &mut self.manifest_hasher,
-                Some(doc.origin_kind),
-            );
-            lexical_rebuild_equivalence_update_opt_str(&mut self.manifest_hasher, doc.origin_host);
+    fn absorb_doc(
+        &mut self,
+        doc: &frankensearch::lexical_tantivy::CassDocumentRef<'_>,
+        probe_hit: impl Fn(usize) -> bool,
+    ) {
+        self.manifest_hasher.update(b"doc");
+        lexical_rebuild_equivalence_update_opt_str(&mut self.manifest_hasher, Some(doc.agent));
+        lexical_rebuild_equivalence_update_opt_str(&mut self.manifest_hasher, doc.workspace);
+        lexical_rebuild_equivalence_update_opt_str(
+            &mut self.manifest_hasher,
+            Some(doc.source_path),
+        );
+        self.manifest_hasher.update(&doc.msg_idx.to_le_bytes());
+        self.manifest_hasher
+            .update(&doc.created_at.unwrap_or(i64::MIN).to_le_bytes());
+        lexical_rebuild_equivalence_update_opt_str(&mut self.manifest_hasher, doc.title);
+        self.manifest_hasher
+            .update(&(doc.content.len() as u64).to_le_bytes());
+        self.manifest_hasher.update(doc.content.as_bytes());
+        lexical_rebuild_equivalence_update_opt_str(&mut self.manifest_hasher, Some(doc.source_id));
+        lexical_rebuild_equivalence_update_opt_str(
+            &mut self.manifest_hasher,
+            Some(doc.origin_kind),
+        );
+        lexical_rebuild_equivalence_update_opt_str(&mut self.manifest_hasher, doc.origin_host);
 
-            for (((_probe, hasher), count), hit) in self
-                .probes
-                .iter()
-                .zip(self.probe_hashers.iter_mut())
-                .zip(self.probe_counts.iter_mut())
-                .zip(probe_hits)
-            {
-                if hit {
-                    *count = count.saturating_add(1);
-                    hasher.update(b"hit");
-                    lexical_rebuild_equivalence_update_opt_str(hasher, Some(doc.source_path));
-                    hasher.update(&doc.msg_idx.to_le_bytes());
-                    hasher.update(&doc.created_at.unwrap_or(i64::MIN).to_le_bytes());
-                    hasher.update(&(doc.content.len() as u64).to_le_bytes());
-                    hasher.update(doc.content.as_bytes());
-                }
+        for (probe_idx, ((_probe, hasher), count)) in self
+            .probes
+            .iter()
+            .zip(self.probe_hashers.iter_mut())
+            .zip(self.probe_counts.iter_mut())
+            .enumerate()
+        {
+            if probe_hit(probe_idx) {
+                *count = count.saturating_add(1);
+                hasher.update(b"hit");
+                lexical_rebuild_equivalence_update_opt_str(hasher, Some(doc.source_path));
+                hasher.update(&doc.msg_idx.to_le_bytes());
+                hasher.update(&doc.created_at.unwrap_or(i64::MIN).to_le_bytes());
+                hasher.update(&(doc.content.len() as u64).to_le_bytes());
+                hasher.update(doc.content.as_bytes());
             }
         }
     }
@@ -19892,21 +19952,21 @@ fn rebuild_tantivy_from_db_via_staged_shards(
                                 ));
                             }
 
+                            let equivalence_started = perf_profile.as_ref().map(|_| Instant::now());
+                            equivalence_accumulator.absorb_packets_with_pool(
+                                &packets,
+                                lexical_rebuild_worker_pool.as_deref(),
+                            );
+                            if let (Some(profile), Some(started)) =
+                                (perf_profile.as_mut(), equivalence_started)
+                            {
+                                profile.equivalence_duration += started.elapsed();
+                            }
                             for mut packet in packets {
                                 if options.defer_initial_content_fingerprint
                                     && let Some(last_message_id) = packet.last_message_id
                                 {
                                     max_message_id = max_message_id.max(last_message_id);
-                                }
-                                let equivalence_started = perf_profile.as_ref().map(|_| Instant::now());
-                                equivalence_accumulator.absorb_packet_with_pool(
-                                    &packet,
-                                    lexical_rebuild_worker_pool.as_deref(),
-                                );
-                                if let (Some(profile), Some(started)) =
-                                    (perf_profile.as_mut(), equivalence_started)
-                                {
-                                    profile.equivalence_duration += started.elapsed();
                                 }
                                 current_shard_message_bytes =
                                     current_shard_message_bytes.saturating_add(packet.message_bytes);
@@ -21249,21 +21309,21 @@ fn rebuild_tantivy_from_db_with_options(
                             message_fetch_duration: _message_fetch_duration,
                             packet_prepare_duration: _packet_prepare_duration,
                         } = prepared_page;
+                        let equivalence_started = perf_profile.as_ref().map(|_| Instant::now());
+                        equivalence_accumulator.absorb_packets_with_pool(
+                            &packets,
+                            lexical_rebuild_worker_pool.as_deref(),
+                        );
+                        if let (Some(profile), Some(started)) =
+                            (perf_profile.as_mut(), equivalence_started)
+                        {
+                            profile.equivalence_duration += started.elapsed();
+                        }
                         for packet in packets {
                             if options.defer_initial_content_fingerprint
                                 && let Some(last_message_id) = packet.last_message_id
                             {
                                 max_message_id = max_message_id.max(last_message_id);
-                            }
-                            let equivalence_started = perf_profile.as_ref().map(|_| Instant::now());
-                            equivalence_accumulator.absorb_packet_with_pool(
-                                &packet,
-                                lexical_rebuild_worker_pool.as_deref(),
-                            );
-                            if let (Some(profile), Some(started)) =
-                                (perf_profile.as_mut(), equivalence_started)
-                            {
-                                profile.equivalence_duration += started.elapsed();
                             }
                             finish_conversation!(packet)?;
                         }
@@ -43941,6 +44001,76 @@ mod tests {
         assert_eq!(legacy_evidence.document_count, 4);
         assert_eq!(legacy_evidence.manifest_fingerprint.len(), 64);
         assert_eq!(legacy_evidence.golden_query_digest.len(), 64);
+
+        let mut batched_accumulator = LexicalRebuildEquivalenceAccumulator::new();
+        batched_accumulator.absorb_packets_with_pool(&legacy_packets, None);
+        assert_eq!(
+            batched_accumulator.finalize(),
+            legacy_evidence,
+            "batch absorption must preserve packet-order equivalence evidence"
+        );
+
+        let worker_pool = ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .expect("equivalence test worker pool");
+        let mut pooled_batched_accumulator = LexicalRebuildEquivalenceAccumulator::new();
+        pooled_batched_accumulator.absorb_packets_with_pool(&keyset_packets, Some(&worker_pool));
+        assert_eq!(
+            pooled_batched_accumulator.finalize(),
+            keyset_evidence,
+            "pooled batch absorption must preserve the golden digests"
+        );
+    }
+
+    #[test]
+    fn lexical_rebuild_equivalence_literal_probe_mask_matches_contains_reference() {
+        let doc = frankensearch::lexical_tantivy::CassDocumentRef {
+            agent: "codex",
+            workspace: Some("/workspace/[literal]"),
+            workspace_original: None,
+            source_path: "/source/overlap-literal.jsonl",
+            msg_idx: 7,
+            created_at: Some(1_700_000_000_000),
+            title: Some("title-only literal"),
+            content: "content-only",
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            conversation_id: Some(1),
+        };
+        let probes = [
+            "",
+            "[",
+            "overlap",
+            "lap",
+            "title-only",
+            "/workspace/[",
+            "/source/",
+            "literal",
+            "literal",
+            "missing",
+        ];
+        let accumulator = LexicalRebuildEquivalenceAccumulator::with_probes(
+            probes.iter().map(|probe| (*probe).to_string()),
+        );
+        let mask = accumulator.probe_hit_mask_for_doc(&doc);
+
+        for (probe_idx, probe) in probes.iter().enumerate() {
+            let expected = doc.content.contains(probe)
+                || doc.title.is_some_and(|title| title.contains(probe))
+                || doc
+                    .workspace
+                    .is_some_and(|workspace| workspace.contains(probe))
+                || doc.source_path.contains(probe);
+            assert_eq!(
+                mask & (1_u64 << probe_idx) != 0,
+                expected,
+                "literal probe bit {probe_idx} disagrees for {probe:?}"
+            );
+        }
+        assert_ne!(mask & (1_u64 << 7), 0, "first duplicate probe must hit");
+        assert_ne!(mask & (1_u64 << 8), 0, "second duplicate probe must hit");
     }
 
     #[test]
