@@ -15,6 +15,27 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_session_search>
 
 ---
 
+## [v0.6.28] -- 2026-08-04
+
+Lexical-generation reuse release.
+
+### Fixed
+
+- **Missing lexical checkpoints no longer force a redundant full rebuild.** A
+  validated and published lexical-generation manifest can now restore the
+  completed-generation identity when the checkpoint sidecar is missing. Reuse
+  requires an exact canonical DB fingerprint, conversation count, searchable
+  Tantivy contract, and live document count; incomplete, stale, or mismatched
+  generations still rebuild.
+
+### Verified
+
+- Red/green tests prove that a changed conversation count or content
+  fingerprint rejects reuse, while an unchanged generation is accepted with
+  its existing identity and document count.
+
+---
+
 ## [v0.6.27] -- 2026-08-04
 
 Bounded semantic throughput release.

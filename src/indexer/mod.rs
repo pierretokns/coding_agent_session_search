@@ -2511,13 +2511,90 @@ fn matching_lexical_rebuild_state_status_if_present(
     index_path: &Path,
     load_current_db_state: impl FnOnce() -> Result<LexicalRebuildDbState>,
 ) -> Result<MatchingLexicalRebuildStateStatus> {
-    let Some(state) = load_lexical_rebuild_state(index_path)? else {
-        return Ok(MatchingLexicalRebuildStateStatus::default());
-    };
     let db_state = load_current_db_state()?;
+    let Some(state) = load_lexical_rebuild_state(index_path)? else {
+        // The generation manifest is published atomically after the Tantivy
+        // commit, but older materialization/recovery paths could lose the
+        // checkpoint sidecar while leaving the validated live generation
+        // intact. Treat that manifest as a conservative identity anchor so a
+        // missing sidecar does not trigger a full rebuild loop.
+        return Ok(matching_published_lexical_generation_status(
+            index_path, &db_state,
+        ));
+    };
     Ok(matching_lexical_rebuild_state_status_for_loaded_state(
         state, &db_state,
     ))
+}
+
+fn published_lexical_generation_matches_db_state(
+    manifest: &lexical_generation::LexicalGenerationManifest,
+    db_state: &LexicalRebuildDbState,
+    observed_tantivy_docs: usize,
+) -> bool {
+    manifest.is_serveable()
+        && manifest.source_db_fingerprint == db_state.storage_fingerprint
+        && manifest.conversation_count
+            == u64::try_from(db_state.total_conversations).unwrap_or(u64::MAX)
+        && manifest.indexed_doc_count == u64::try_from(observed_tantivy_docs).unwrap_or(u64::MAX)
+        && manifest.message_count >= manifest.indexed_doc_count
+}
+
+fn matching_published_lexical_generation_status(
+    index_path: &Path,
+    db_state: &LexicalRebuildDbState,
+) -> MatchingLexicalRebuildStateStatus {
+    let manifest = match lexical_generation::load_manifest(index_path) {
+        Ok(Some(manifest)) => manifest,
+        Ok(None) => return MatchingLexicalRebuildStateStatus::default(),
+        Err(err) => {
+            tracing::debug!(
+                error = %err,
+                "could not load lexical generation manifest while recovering missing rebuild checkpoint"
+            );
+            return MatchingLexicalRebuildStateStatus::default();
+        }
+    };
+    let observed_tantivy_docs = match crate::search::tantivy::validate_searchable_index_contract(
+        index_path,
+    )
+    .and_then(|()| live_tantivy_doc_count(index_path))
+    {
+        Ok(Some(docs)) => docs,
+        Ok(None) => return MatchingLexicalRebuildStateStatus::default(),
+        Err(err) => {
+            tracing::debug!(
+                error = %err,
+                "could not validate lexical generation while recovering missing rebuild checkpoint"
+            );
+            return MatchingLexicalRebuildStateStatus::default();
+        }
+    };
+    if !published_lexical_generation_matches_db_state(&manifest, db_state, observed_tantivy_docs) {
+        tracing::debug!(
+            generation_id = %manifest.generation_id,
+            source_fingerprint_matches = manifest.source_db_fingerprint == db_state.storage_fingerprint,
+            manifest_conversations = manifest.conversation_count,
+            db_conversations = db_state.total_conversations,
+            manifest_indexed_docs = manifest.indexed_doc_count,
+            observed_tantivy_docs,
+            "published lexical generation is not reusable for the current canonical DB"
+        );
+        return MatchingLexicalRebuildStateStatus::default();
+    }
+
+    tracing::info!(
+        generation_id = %manifest.generation_id,
+        indexed_docs = observed_tantivy_docs,
+        "reusing validated lexical generation after rebuild checkpoint sidecar went missing"
+    );
+    MatchingLexicalRebuildStateStatus {
+        has_pending_resume: false,
+        has_completed_checkpoint: true,
+        completed_indexed_docs: Some(observed_tantivy_docs),
+        completed_exact_totals: Some((db_state.total_conversations, observed_tantivy_docs)),
+        completed_storage_fingerprint: Some(db_state.storage_fingerprint.clone()),
+    }
 }
 
 fn matching_completed_lexical_rebuild_state_status_without_fingerprint(
@@ -52234,7 +52311,7 @@ mod tests {
     }
 
     #[test]
-    fn matching_lexical_rebuild_state_status_if_present_skips_db_state_without_checkpoint() {
+    fn matching_lexical_rebuild_state_status_if_present_loads_db_state_without_checkpoint() {
         let tmp = TempDir::new().unwrap();
         let index_path = tmp.path().join("index");
         fs::create_dir_all(&index_path).unwrap();
@@ -52252,7 +52329,63 @@ mod tests {
         .unwrap();
 
         assert_eq!(status, MatchingLexicalRebuildStateStatus::default());
-        assert!(!load_current_db_state_called.get());
+        assert!(load_current_db_state_called.get());
+    }
+
+    #[test]
+    fn published_lexical_generation_reuse_gate_is_red_then_green() {
+        let db_state = LexicalRebuildDbState {
+            db_path: "agent_search.db".to_string(),
+            total_conversations: 62_352,
+            total_messages: 2_034_592,
+            storage_fingerprint: "content-v1:62352:62352:4189224".to_string(),
+        };
+        let mut manifest = lexical_generation::LexicalGenerationManifest::new_scratch(
+            "gen-test",
+            "attempt-test",
+            db_state.storage_fingerprint.clone(),
+            1,
+        );
+        manifest.conversation_count = 62_352;
+        manifest.message_count = 2_034_592;
+        manifest.indexed_doc_count = 2_034_592;
+        manifest.transition_build(
+            lexical_generation::LexicalGenerationBuildState::Validated,
+            2,
+        );
+        manifest.transition_publish(
+            lexical_generation::LexicalGenerationPublishState::Published,
+            3,
+        );
+
+        assert!(published_lexical_generation_matches_db_state(
+            &manifest, &db_state, 2_034_592,
+        ));
+
+        // Red: a single new conversation must not reuse the old generation.
+        let mut changed_db = db_state.clone();
+        changed_db.total_conversations += 1;
+        assert!(!published_lexical_generation_matches_db_state(
+            &manifest,
+            &changed_db,
+            2_034_592,
+        ));
+
+        // Red: a content fingerprint mismatch must not be hidden by matching
+        // row counts.
+        changed_db = db_state.clone();
+        changed_db.storage_fingerprint = "content-v1:62352:62352:4189225".to_string();
+        assert!(!published_lexical_generation_matches_db_state(
+            &manifest,
+            &changed_db,
+            2_034_592,
+        ));
+
+        // Green remains exact when the canonical DB and live Tantivy doc
+        // count match the published manifest.
+        assert!(published_lexical_generation_matches_db_state(
+            &manifest, &db_state, 2_034_592,
+        ));
     }
 
     #[test]
