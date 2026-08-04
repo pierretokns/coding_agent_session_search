@@ -19448,20 +19448,26 @@ fn rebuild_tantivy_from_db_via_staged_shards(
          enqueued_shards: &mut usize,
          producer_finished: bool|
          -> Result<()> {
-            let staged_merge_runtime = staged_merge_controller.decide(
+            let mut staged_merge_runtime = staged_merge_controller.decide(
                 producer_finished,
                 latest_pipeline_runtime,
                 merge_coordinator,
             );
+            // Eager staged merges are file-backed assembly now, so they do
+            // not need to reserve builder slots while the producer is still
+            // feeding shards.  Deferring this metadata-only work until the
+            // producer drains lets the builder farm use its full admission
+            // budget without changing the merge fan-in or final topology.
+            if !producer_finished && staged_merge_runtime.allowed_jobs > 0 {
+                staged_merge_runtime.allowed_jobs = 0;
+                staged_merge_runtime.controller_reason =
+                    "deferring_file_backed_staged_assembly_until_producer_drains".to_string();
+            }
             merge_coordinator.set_allowed_pending_merge_jobs(
                 staged_merge_runtime.allowed_jobs,
                 &merge_work_tx,
             )?;
-            let applied_runtime = staged_merge_controller.decide(
-                producer_finished,
-                latest_pipeline_runtime,
-                merge_coordinator,
-            );
+            let applied_runtime = staged_merge_runtime;
             apply_staged_merge_runtime_snapshot(
                 latest_pipeline_runtime,
                 progress.as_ref(),
