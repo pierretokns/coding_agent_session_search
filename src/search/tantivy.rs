@@ -1981,6 +1981,10 @@ fn write_searchable_generation_metadata(
 mod tests {
     use super::*;
     use crate::connectors::{NormalizedConversation, NormalizedMessage};
+    use frankensearch::lexical_tantivy::tantivy_crate::{
+        Term, collector::TopDocs, query::TermQuery, schema::IndexRecordOption,
+    };
+    use frankensearch::lexical_tantivy::{TantivyDocument, Value as TantivyValue};
     use serde_json::Value;
     use std::path::PathBuf;
     use tempfile::TempDir;
@@ -2459,6 +2463,100 @@ mod tests {
             assembled.join(".managed.json").exists(),
             "assembled index generation should persist a Tantivy managed-file manifest"
         );
+    }
+
+    #[test]
+    fn assembled_eager_merge_preserves_term_ranking_and_document_identity() {
+        let root = TempDir::new().expect("temp dir");
+        let shard_a = root.path().join("shard-a");
+        let shard_b = root.path().join("shard-b");
+        let merged = root.path().join("merged");
+        let assembled = root.path().join("assembled");
+
+        let make_conv = |external_id: &str, content: &str| NormalizedConversation {
+            agent_slug: "codex".to_string(),
+            external_id: Some(external_id.to_string()),
+            title: Some(external_id.to_string()),
+            workspace: Some(PathBuf::from("/tmp/workspace")),
+            source_path: PathBuf::from(format!("/tmp/{external_id}.jsonl")),
+            started_at: Some(1_700_000_003_000),
+            ended_at: Some(1_700_000_003_100),
+            metadata: Value::Null,
+            messages: vec![NormalizedMessage {
+                idx: 0,
+                role: "assistant".to_string(),
+                author: None,
+                created_at: Some(1_700_000_003_010),
+                content: content.to_string(),
+                extra: Value::Null,
+                snippets: Vec::new(),
+                invocations: Vec::new(),
+            }],
+        };
+
+        let mut shard_a_index = TantivyIndex::open_or_create(&shard_a).expect("create shard a");
+        let mut shard_b_index = TantivyIndex::open_or_create(&shard_b).expect("create shard b");
+        for (id, content) in [
+            ("rank-a1", "alpha alpha alpha common"),
+            ("rank-a2", "alpha common"),
+        ] {
+            shard_a_index
+                .add_conversation_with_id(&make_conv(id, content), Some(100))
+                .expect("index shard a document");
+        }
+        for (id, content) in [
+            ("rank-b1", "alpha alpha common"),
+            ("rank-b2", "alpha beta common"),
+        ] {
+            shard_b_index
+                .add_conversation_with_id(&make_conv(id, content), Some(200))
+                .expect("index shard b document");
+        }
+        shard_a_index.commit().expect("commit shard a");
+        shard_b_index.commit().expect("commit shard b");
+        drop(shard_a_index);
+        drop(shard_b_index);
+
+        let merged_index =
+            TantivyIndex::merge_compatible_index_directories(&merged, &[&shard_a, &shard_b])
+                .expect("physical merge");
+        let assembled_index =
+            TantivyIndex::assemble_compatible_index_directories(&assembled, &[&shard_a, &shard_b])
+                .expect("file-backed assembly");
+
+        let ranked_paths = |index: &TantivyIndex| -> Vec<(String, u32)> {
+            let reader = index.reader().expect("open reader");
+            reader.reload().expect("reload reader");
+            let searcher = reader.searcher();
+            let query = TermQuery::new(
+                Term::from_field_text(index.fields.content, "alpha"),
+                IndexRecordOption::WithFreqsAndPositions,
+            );
+            searcher
+                .search(&query, &TopDocs::with_limit(16).order_by_score())
+                .expect("search ranked term")
+                .into_iter()
+                .map(|(score, address)| {
+                    let document: TantivyDocument =
+                        searcher.doc(address).expect("load ranked document");
+                    (
+                        document
+                            .get_first(index.fields.source_path)
+                            .and_then(|value| value.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        score.to_bits(),
+                    )
+                })
+                .collect()
+        };
+
+        assert_eq!(ranked_paths(&merged_index), ranked_paths(&assembled_index));
+        drop(merged_index);
+        std::fs::remove_dir_all(&shard_a).expect("remove source shard a");
+        std::fs::remove_dir_all(&shard_b).expect("remove source shard b");
+        assert!(!shard_a.exists() && !shard_b.exists());
+        assert_eq!(ranked_paths(&assembled_index).len(), 4);
     }
 
     #[test]

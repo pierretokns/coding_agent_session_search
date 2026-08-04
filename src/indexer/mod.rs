@@ -5152,7 +5152,7 @@ fn spawn_lexical_rebuild_shard_merge_workers(
                             || {
                                 #[cfg(test)]
                                 lexical_rebuild_shard_merge_injected_panic_hook();
-                                crate::search::tantivy::TantivyIndex::merge_compatible_index_directories(
+                                crate::search::tantivy::TantivyIndex::assemble_compatible_index_directories(
                                     &work.output_path,
                                     &input_paths,
                                 )
