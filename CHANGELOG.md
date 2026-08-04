@@ -19,6 +19,29 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_session_search>
 
 - Speed up fork release assembly by validating the root package version without recloning sibling repositories.
 
+## [v0.6.29] -- 2026-08-04
+
+Storage and approximate-search correctness release.
+
+### Fixed
+
+- **Storage reports now deduplicate hardlinked evidence.** Raw-mirror files and
+  doctor evidence that reference the same inode are counted once in physical
+  footprint reports, while existing logical cleanup accounting remains
+  unchanged.
+- **Normal semantic builds now publish HNSW metadata.** Approximate search has
+  a durable pairing between the HNSW sidecar and its exact FSVI artifact, and
+  exact rebuilds invalidate the derived graph for that tier.
+- **Filtered approximate pages repair from exact FSVI.** Stored-only session
+  path filters can no longer leave an underfilled ANN page marked as an
+  approximate result when a bounded exact retry is required.
+
+### Verified
+
+- Focused storage deduplication tests, the full exact-artifact contract suite,
+  semantic session-path retry coverage, and the native-ANN selective-filter
+  regression all pass under the optimized profile.
+
 ## [v0.6.28] -- 2026-08-04
 
 Lexical-generation reuse release.

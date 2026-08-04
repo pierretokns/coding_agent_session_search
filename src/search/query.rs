@@ -4575,14 +4575,19 @@ impl SearchClient {
             let ann = request
                 .ann_index
                 .ok_or_else(|| anyhow!("HNSW index failed to initialize"))?;
+            let exact_index = context
+                .artifacts
+                .first()
+                .map(SemanticIndexArtifact::index)
+                .ok_or_else(|| anyhow!("HNSW search has no paired exact vector index"))?;
             let candidate = request
                 .fetch_limit
                 .saturating_mul(ANN_CANDIDATE_MULTIPLIER)
                 .max(request.fetch_limit);
             let ef = FS_HNSW_DEFAULT_EF_SEARCH.max(candidate);
-            let (ann_results, search_stats) =
-                ann.knn_search_with_stats(embedding, candidate, ef)
-                    .map_err(|err| anyhow!("frankensearch approximate search failed: {err}"))?;
+            let (ann_results, search_stats) = ann
+                .knn_search_with_stats_against(exact_index, embedding, candidate, ef)
+                .map_err(|err| anyhow!("frankensearch approximate search failed: {err}"))?;
             let ann_stats = Some(crate::search::ann_index::AnnSearchStats {
                 index_size: search_stats.index_size,
                 dimension: search_stats.dimension,
@@ -4622,8 +4627,38 @@ impl SearchClient {
                     });
             }
 
+            let collapsed = Self::collapse_semantic_results(best_by_message, request.fetch_limit);
+            if collapsed.len() < request.fetch_limit {
+                // ANN filtering happens after graph traversal. A selective
+                // filter can therefore discard every returned neighbor even
+                // when matching rows exist farther down the exact vector
+                // index. Repair this underfill from the authoritative FSVI;
+                // do not inflate ef_search repeatedly and still return an
+                // incomplete page.
+                let (exact_results, _) = Self::search_exact_semantic_indexes(
+                    context,
+                    embedding,
+                    request.fetch_limit,
+                    fs_filter,
+                )?;
+                tracing::debug!(
+                    requested = request.fetch_limit,
+                    ann_returned = collapsed.len(),
+                    exact_returned = exact_results.len(),
+                    "repaired filtered ANN underfill with exact FSVI search"
+                );
+                return Ok((
+                    exact_results,
+                    SemanticCandidateRetryState {
+                        has_more_candidates: false,
+                        exact_window_may_omit_competitor: false,
+                    },
+                    None,
+                ));
+            }
+
             return Ok((
-                Self::collapse_semantic_results(best_by_message, request.fetch_limit),
+                collapsed,
                 SemanticCandidateRetryState {
                     has_more_candidates: ann_results.len() >= candidate,
                     exact_window_may_omit_competitor: false,
@@ -5847,8 +5882,16 @@ impl SearchClient {
             }
             let (mut available_hits, mut paged_hits) = finalize_hits(&results)?;
 
+            // session_paths is a stored-only filter applied after ANN
+            // traversal. Even when the graph returned fewer than its
+            // candidate window, a filtered page can still be incomplete
+            // relative to the authoritative exact index.
+            let needs_exact_filter_repair = effective_approximate
+                && !filters.session_paths.is_empty()
+                && available_hits < target_hits;
             let needs_retry = initial_fetch_limit < fallback_fetch_limit
-                && ((available_hits < target_hits && retry_state.has_more_candidates)
+                && ((available_hits < target_hits
+                    && (retry_state.has_more_candidates || needs_exact_filter_repair))
                     || retry_state.exact_window_may_omit_competitor);
 
             if needs_retry {
@@ -5860,16 +5903,17 @@ impl SearchClient {
                     fallback_fetch_limit,
                     "retrying semantic fetch due to candidate-window shortfall"
                 );
+                let retry_approximate = !needs_exact_filter_repair;
                 let (retry_results, _, retry_ann_stats) = self.search_semantic_candidates(
                     &candidate_context,
                     &embedding,
                     &filters,
                     SemanticCandidateSearchRequest {
                         fetch_limit: fallback_fetch_limit,
-                        approximate: effective_approximate,
+                        approximate: retry_approximate,
                         tier_mode: effective_tier_mode,
                         in_memory_two_tier_index: in_memory_two_tier_index.as_ref(),
-                        ann_index: ann_index.as_ref(),
+                        ann_index: retry_approximate.then_some(ann_index.as_ref()).flatten(),
                     },
                 )?;
                 if !self.semantic_context_matches(&context_token)? {
@@ -19205,6 +19249,33 @@ mod tests {
             semantic_artifact_tree_snapshot(&fixture.vector_dir)?,
             artifacts_before,
             "native ANN serving must preserve bytes, mtimes, permissions, and inventory"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn native_ann_repairs_selective_filter_underfill_with_exact_fsvi() -> Result<()> {
+        let fixture = build_semantic_test_fixture_with_ann(SemanticAnnFixtureMode::Native)?;
+        let mut filters = SearchFilters::default();
+        filters
+            .session_paths
+            .insert(fixture.source_paths[2].clone());
+
+        let (hits, ann_stats) = fixture.client.search_semantic(
+            "semantic fixture query",
+            filters,
+            3,
+            0,
+            FieldMask::FULL,
+            true,
+        )?;
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].source_path, fixture.source_paths[2]);
+        assert!(
+            ann_stats.is_none(),
+            "a selectively filtered ANN page repaired from exact FSVI must not claim ANN stats"
         );
 
         Ok(())

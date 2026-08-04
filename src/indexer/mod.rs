@@ -35,7 +35,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, never, select};
-use frankensearch::index::VectorIndex as FsVectorIndex;
+use frankensearch::index::{
+    HNSW_DEFAULT_EF_SEARCH as FS_HNSW_DEFAULT_EF_SEARCH, VectorIndex as FsVectorIndex,
+};
 use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
 #[cfg(test)]
 use frankensqlite::compat::{
@@ -93,7 +95,7 @@ use semantic::{
 
 use crate::search::policy::{CHUNKING_STRATEGY_VERSION, SEMANTIC_SCHEMA_VERSION};
 use crate::search::semantic_manifest::{
-    ArtifactRecord, SemanticManifest, TierKind as SemanticTierKind,
+    ArtifactRecord, HnswRecord, SemanticManifest, TierKind as SemanticTierKind,
 };
 
 #[cfg(test)]
@@ -15140,6 +15142,26 @@ pub fn run_index(
                     embedder = semantic_indexer.embedder_id(),
                     "saved HNSW index for approximate nearest neighbor search"
                 );
+                let size_bytes = fs::metadata(&hnsw_path)
+                    .with_context(|| format!("stat semantic HNSW index {}", hnsw_path.display()))?
+                    .len();
+                let relative_hnsw_path = hnsw_path
+                    .strip_prefix(&opts.data_dir)
+                    .unwrap_or(hnsw_path.as_path())
+                    .to_string_lossy()
+                    .to_string();
+                semantic_manifest.publish_hnsw(HnswRecord {
+                    base_tier: semantic_tier,
+                    embedder_id: semantic_indexer.embedder_id().to_string(),
+                    ef_search: FS_HNSW_DEFAULT_EF_SEARCH,
+                    index_path: relative_hnsw_path,
+                    size_bytes,
+                    built_at_ms: semantic_indexing_now_ms(),
+                    ready: true,
+                });
+                semantic_manifest.save(&opts.data_dir).map_err(|err| {
+                    anyhow::anyhow!("saving semantic HNSW manifest after build: {err}")
+                })?;
             }
 
             // Set watermark so incremental watch-mode embedding only sees new messages

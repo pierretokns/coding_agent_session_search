@@ -3066,6 +3066,17 @@ impl SemanticIndexer {
                 .unwrap_or(final_path.as_path())
                 .to_string_lossy()
                 .to_string();
+            // An exact artifact rebuild invalidates the derived HNSW graph for
+            // the same tier. Preserve an accelerator for the other tier, but
+            // never let a graph from the previous generation appear paired
+            // with this newly published vector index.
+            if manifest
+                .hnsw
+                .as_ref()
+                .is_some_and(|hnsw| hnsw.base_tier == plan.tier)
+            {
+                manifest.hnsw = None;
+            }
             manifest.publish_artifact(ArtifactRecord {
                 tier: plan.tier,
                 embedder_id: self.embedder_id().to_string(),
