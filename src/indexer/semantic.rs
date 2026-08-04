@@ -1493,9 +1493,17 @@ fn materialize_checkpoint_capped_conversations(
     let max_raw_message_bytes = resolved_semantic_max_raw_message_bytes();
 
     for conversation in conversations {
-        // Fetch one candidate at a time, and only after the length-only raw
-        // guard has passed. The former batch fetch loaded every over-fetched
-        // candidate before applying the checkpoint cap.
+        // Fetch one candidate at a time, and only after the aggregate and
+        // length-only guards have passed. The former batch fetch loaded every
+        // over-fetched candidate before applying the checkpoint cap.
+        if caps.message_limited() || caps.byte_limited() {
+            storage.check_semantic_backfill_conversation_bounds(
+                conversation.conversation_id,
+                after_message_id,
+                caps.max_messages,
+                caps.max_bytes,
+            )?;
+        }
         let messages = storage.fetch_messages_for_semantic_backfill(
             conversation.conversation_id,
             after_message_id,

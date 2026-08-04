@@ -9525,6 +9525,64 @@ impl FrankenStorage {
             })
     }
 
+    /// Check aggregate post-cursor size before semantic backfill transfers any
+    /// message bodies into Rust. SQLite still scans the content bytes to
+    /// calculate `LENGTH`, but this avoids allocating a `Vec<Message>` for a
+    /// conversation that cannot fit inside the caller's checkpoint budget.
+    pub fn check_semantic_backfill_conversation_bounds(
+        &self,
+        conversation_id: i64,
+        after_message_id: Option<i64>,
+        max_messages: usize,
+        max_raw_bytes: u64,
+    ) -> Result<(u64, u64)> {
+        if max_messages == 0 && max_raw_bytes == 0 {
+            return Ok((0, 0));
+        }
+
+        let (sql, params) = if let Some(after_message_id) = after_message_id {
+            (
+                "SELECT COUNT(*), COALESCE(SUM(LENGTH(CAST(content AS BLOB))), 0)
+                 FROM messages
+                 WHERE conversation_id = ?1 AND id > ?2",
+                vec![
+                    ParamValue::from(conversation_id),
+                    ParamValue::from(after_message_id),
+                ],
+            )
+        } else {
+            (
+                "SELECT COUNT(*), COALESCE(SUM(LENGTH(CAST(content AS BLOB))), 0)
+                 FROM messages
+                 WHERE conversation_id = ?1",
+                vec![ParamValue::from(conversation_id)],
+            )
+        };
+        let (message_count, raw_bytes): (i64, i64) = self
+            .conn
+            .query_row_map(sql, &params, |row| {
+                Ok((row.get_typed(0)?, row.get_typed(1)?))
+            })
+            .with_context(|| {
+                format!("checking semantic conversation bounds for conversation {conversation_id}")
+            })?;
+        let message_count = u64::try_from(message_count).unwrap_or(u64::MAX);
+        let raw_bytes = u64::try_from(raw_bytes).unwrap_or(u64::MAX);
+
+        if max_messages > 0 && message_count > max_messages as u64 {
+            bail!(
+                "semantic backfill conversation message-count guardrail rejected conversation {conversation_id}: messages={message_count} limit={max_messages}"
+            );
+        }
+        if max_raw_bytes > 0 && raw_bytes > max_raw_bytes {
+            bail!(
+                "semantic backfill conversation byte guardrail rejected conversation {conversation_id}: bytes={raw_bytes} limit={max_raw_bytes}"
+            );
+        }
+
+        Ok((message_count, raw_bytes))
+    }
+
     /// Inner fetch without the per-conversation content cap. Kept separate so the
     /// cap is applied at exactly one chokepoint (every lexical-rebuild content
     /// load — batch and streaming — funnels through `fetch_messages_for_lexical_rebuild`).
@@ -27359,6 +27417,78 @@ mod tests {
             .unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].content, "ok");
+    }
+
+    #[test]
+    fn semantic_backfill_conversation_bounds_reject_large_conversation_before_fetch() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("semantic-guard-bounds.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let agent_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "codex".into(),
+                name: "Codex".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            })
+            .unwrap();
+        let conversation_id = storage
+            .insert_conversation_tree(
+                agent_id,
+                None,
+                &Conversation {
+                    id: None,
+                    agent_slug: "codex".into(),
+                    workspace: None,
+                    external_id: Some("semantic-guard-bounds".into()),
+                    title: None,
+                    source_path: PathBuf::from("/tmp/semantic-guard-bounds.jsonl"),
+                    started_at: None,
+                    ended_at: None,
+                    approx_tokens: None,
+                    metadata_json: serde_json::Value::Null,
+                    messages: vec![
+                        Message {
+                            id: None,
+                            idx: 0,
+                            role: MessageRole::User,
+                            author: None,
+                            created_at: None,
+                            content: "first".into(),
+                            extra_json: serde_json::Value::Null,
+                            snippets: Vec::new(),
+                        },
+                        Message {
+                            id: None,
+                            idx: 1,
+                            role: MessageRole::Agent,
+                            author: None,
+                            created_at: None,
+                            content: "second".into(),
+                            extra_json: serde_json::Value::Null,
+                            snippets: Vec::new(),
+                        },
+                    ],
+                    source_id: LOCAL_SOURCE_ID.into(),
+                    origin_host: None,
+                },
+            )
+            .unwrap()
+            .conversation_id;
+
+        let error = storage
+            .check_semantic_backfill_conversation_bounds(conversation_id, None, 1, 0)
+            .expect_err("aggregate message guardrail should reject before fetch");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("conversation message-count guardrail"),
+            "expected aggregate guardrail reason in error, got {message}"
+        );
+        let (messages, bytes) = storage
+            .check_semantic_backfill_conversation_bounds(conversation_id, Some(1), 1, 0)
+            .unwrap();
+        assert_eq!((messages, bytes), (1, 6));
     }
 
     #[test]

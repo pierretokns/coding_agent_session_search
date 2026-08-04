@@ -39,13 +39,15 @@ jobs:
 
       - name: Validate SemVer tag, package version, and changelog entry
         shell: bash
+        env:
+          RELEASE_INPUT_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
 
           if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
             RAW_TAG="${GITHUB_REF#refs/tags/}"
           else
-            RAW_TAG="${{ inputs.tag }}"
+            RAW_TAG="${RELEASE_INPUT_TAG}"
           fi
           if [[ ! "${RAW_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.+][0-9A-Za-z.-]+)?$ ]]; then
             echo "::error::Release tag must be SemVer with a leading v (received: ${RAW_TAG})"
@@ -359,11 +361,13 @@ jobs:
       - name: Extract version from tag
         id: version
         shell: bash
+        env:
+          RELEASE_INPUT_TAG: ${{ inputs.tag }}
         run: |
           if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
             RAW_TAG="${GITHUB_REF#refs/tags/}"
           else
-            RAW_TAG="${{ inputs.tag }}"
+            RAW_TAG="${RELEASE_INPUT_TAG}"
           fi
           if [[ -z "${RAW_TAG}" ]]; then
             echo "Tag is required."
@@ -530,7 +534,7 @@ jobs:
     needs: release
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    if: ${{ !contains(needs.release.outputs.version, '-') }}
+    if: ${{ github.repository == 'Dicklesworthstone/coding_agent_session_search' && !contains(needs.release.outputs.version, '-') }}
     env:
       CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
     steps:

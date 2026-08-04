@@ -15,6 +15,23 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_session_search>
 
 ---
 
+## [v0.6.26] -- 2026-08-04
+
+Semantic backfill guardrail follow-up release.
+
+### Fixed
+
+- **Large conversations are bounded before message materialization.** Semantic
+  backfill now performs aggregate post-cursor message-count and raw-byte
+  preflights against the checkpoint limits, preventing a conversation with
+  many individually-small messages from bypassing the memory guardrail.
+
+### Release engineering
+
+- Manual release tag inputs are passed through environment variables before
+  shell validation, and crates.io publication is restricted to the upstream
+  repository. Fork releases remain binary-and-checksum releases only.
+
 ## [v0.6.25] -- 2026-08-04
 
 Semantic backfill safety and fork-release patch release.
@@ -23,13 +40,15 @@ Semantic backfill safety and fork-release patch release.
 
 - **Semantic backfill now bounds pathological message materialization.** A
   length-only SQLite probe rejects a single raw message over 16 MiB before its
-  body is loaded or sent to the embedder. Set
+  body is transferred into a Rust `Message` or sent to the embedder. Set
   `CASS_SEMANTIC_MAX_RAW_MESSAGE_BYTES=0` only when unbounded input is
   intentional.
 - **Checkpoint-capped semantic batches materialize candidates incrementally.**
   The backfill now fetches one ordered conversation at a time and stops before
   the next whole conversation would exceed the checkpoint budget, reducing
-  peak memory and preserving crash-safe cursor semantics.
+  peak memory and preserving crash-safe cursor semantics. Aggregate
+  message-count and raw-byte preflights reject a conversation that cannot fit
+  within the configured checkpoint limits before its bodies are transferred.
 
 ### Release engineering
 
