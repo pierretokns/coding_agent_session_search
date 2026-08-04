@@ -4518,26 +4518,22 @@ impl LexicalRebuildEquivalenceAccumulator {
         doc: &frankensearch::lexical_tantivy::CassDocumentRef<'_>,
         probe_hit: impl Fn(usize) -> bool,
     ) {
-        self.manifest_hasher.update(b"doc");
-        lexical_rebuild_equivalence_update_opt_str(&mut self.manifest_hasher, Some(doc.agent));
-        lexical_rebuild_equivalence_update_opt_str(&mut self.manifest_hasher, doc.workspace);
-        lexical_rebuild_equivalence_update_opt_str(
-            &mut self.manifest_hasher,
-            Some(doc.source_path),
-        );
-        self.manifest_hasher.update(&doc.msg_idx.to_le_bytes());
-        self.manifest_hasher
-            .update(&doc.created_at.unwrap_or(i64::MIN).to_le_bytes());
-        lexical_rebuild_equivalence_update_opt_str(&mut self.manifest_hasher, doc.title);
-        self.manifest_hasher
-            .update(&(doc.content.len() as u64).to_le_bytes());
+        let mut manifest_prefix = smallvec::SmallVec::<[u8; 256]>::new();
+        manifest_prefix.extend_from_slice(b"doc");
+        lexical_rebuild_equivalence_append_opt_str(&mut manifest_prefix, Some(doc.agent));
+        lexical_rebuild_equivalence_append_opt_str(&mut manifest_prefix, doc.workspace);
+        lexical_rebuild_equivalence_append_opt_str(&mut manifest_prefix, Some(doc.source_path));
+        manifest_prefix.extend_from_slice(&doc.msg_idx.to_le_bytes());
+        manifest_prefix.extend_from_slice(&doc.created_at.unwrap_or(i64::MIN).to_le_bytes());
+        lexical_rebuild_equivalence_append_opt_str(&mut manifest_prefix, doc.title);
+        manifest_prefix.extend_from_slice(&(doc.content.len() as u64).to_le_bytes());
+        self.manifest_hasher.update(&manifest_prefix);
         self.manifest_hasher.update(doc.content.as_bytes());
-        lexical_rebuild_equivalence_update_opt_str(&mut self.manifest_hasher, Some(doc.source_id));
-        lexical_rebuild_equivalence_update_opt_str(
-            &mut self.manifest_hasher,
-            Some(doc.origin_kind),
-        );
-        lexical_rebuild_equivalence_update_opt_str(&mut self.manifest_hasher, doc.origin_host);
+        let mut manifest_suffix = smallvec::SmallVec::<[u8; 128]>::new();
+        lexical_rebuild_equivalence_append_opt_str(&mut manifest_suffix, Some(doc.source_id));
+        lexical_rebuild_equivalence_append_opt_str(&mut manifest_suffix, Some(doc.origin_kind));
+        lexical_rebuild_equivalence_append_opt_str(&mut manifest_suffix, doc.origin_host);
+        self.manifest_hasher.update(&manifest_suffix);
 
         for (probe_idx, ((_probe, hasher), count)) in self
             .probes
@@ -4548,11 +4544,13 @@ impl LexicalRebuildEquivalenceAccumulator {
         {
             if probe_hit(probe_idx) {
                 *count = count.saturating_add(1);
-                hasher.update(b"hit");
-                lexical_rebuild_equivalence_update_opt_str(hasher, Some(doc.source_path));
-                hasher.update(&doc.msg_idx.to_le_bytes());
-                hasher.update(&doc.created_at.unwrap_or(i64::MIN).to_le_bytes());
-                hasher.update(&(doc.content.len() as u64).to_le_bytes());
+                let mut hit_prefix = smallvec::SmallVec::<[u8; 128]>::new();
+                hit_prefix.extend_from_slice(b"hit");
+                lexical_rebuild_equivalence_append_opt_str(&mut hit_prefix, Some(doc.source_path));
+                hit_prefix.extend_from_slice(&doc.msg_idx.to_le_bytes());
+                hit_prefix.extend_from_slice(&doc.created_at.unwrap_or(i64::MIN).to_le_bytes());
+                hit_prefix.extend_from_slice(&(doc.content.len() as u64).to_le_bytes());
+                hasher.update(&hit_prefix);
                 hasher.update(doc.content.as_bytes());
             }
         }
@@ -4597,6 +4595,20 @@ fn lexical_rebuild_equivalence_update_opt_str(hasher: &mut blake3::Hasher, value
         None => {
             hasher.update(&[0x00_u8]);
         }
+    }
+}
+
+fn lexical_rebuild_equivalence_append_opt_str<const N: usize>(
+    output: &mut smallvec::SmallVec<[u8; N]>,
+    value: Option<&str>,
+) {
+    match value {
+        Some(s) => {
+            output.push(0x01_u8);
+            output.extend_from_slice(&(s.len() as u64).to_le_bytes());
+            output.extend_from_slice(s.as_bytes());
+        }
+        None => output.push(0x00_u8),
     }
 }
 
@@ -44071,6 +44083,26 @@ mod tests {
         }
         assert_ne!(mask & (1_u64 << 7), 0, "first duplicate probe must hit");
         assert_ne!(mask & (1_u64 << 8), 0, "second duplicate probe must hit");
+    }
+
+    #[test]
+    fn lexical_rebuild_equivalence_coalesced_string_framing_matches_reference_bytes() {
+        let long = "x".repeat(300);
+        let values = [Some("agent"), None, Some(""), Some(long.as_str())];
+        let mut coalesced = smallvec::SmallVec::<[u8; 8]>::new();
+        let mut reference = Vec::new();
+        for value in values {
+            lexical_rebuild_equivalence_append_opt_str(&mut coalesced, value);
+            match value {
+                Some(s) => {
+                    reference.push(0x01_u8);
+                    reference.extend_from_slice(&(s.len() as u64).to_le_bytes());
+                    reference.extend_from_slice(s.as_bytes());
+                }
+                None => reference.push(0x00_u8),
+            }
+        }
+        assert_eq!(coalesced.as_slice(), reference.as_slice());
     }
 
     #[test]
