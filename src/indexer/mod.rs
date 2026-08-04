@@ -10430,7 +10430,11 @@ fn lexical_rebuild_default_staged_shard_builder_parallelism_for_workers_and_memo
     workers: usize,
     available_memory_bytes: Option<u64>,
 ) -> usize {
-    let cpu_ceiling = workers.clamp(1, 8);
+    // Each shard builder owns a Tantivy writer pool. Keep the default outer
+    // farm small enough that builders × writer threads do not oversubscribe
+    // the host; explicit environment overrides remain available for tuned
+    // machines.
+    let cpu_ceiling = workers.div_ceil(3).clamp(1, 4);
     let Some(available_memory_bytes) = available_memory_bytes else {
         return cpu_ceiling;
     };
@@ -10441,7 +10445,7 @@ fn lexical_rebuild_default_staged_shard_builder_parallelism_for_workers_and_memo
         memory_budget / LEXICAL_REBUILD_STAGED_SHARD_BUILDER_MEMORY_SLOT_BYTES.max(1),
     )
     .unwrap_or(usize::MAX)
-    .clamp(1, 8);
+    .clamp(1, 4);
     cpu_ceiling.min(memory_ceiling).max(1)
 }
 
@@ -10556,7 +10560,11 @@ fn lexical_rebuild_staged_shard_builder_settings(
     planned_shard_count: usize,
 ) -> LexicalRebuildShardBuilderSettings {
     let planned_shard_count = planned_shard_count.max(1);
-    let writer_threads_per_builder = settings.tantivy_writer_threads.max(1);
+    let writer_threads_per_builder = if dotenvy::var("CASS_TANTIVY_MAX_WRITER_THREADS").is_ok() {
+        settings.tantivy_writer_threads.max(1)
+    } else {
+        settings.tantivy_writer_threads.clamp(1, 2)
+    };
     let max_builders = planned_shard_count
         .min(settings.staged_shard_builders.max(1))
         .max(1);
@@ -35408,22 +35416,22 @@ mod tests {
             lexical_rebuild_default_staged_shard_builder_parallelism_for_workers_and_memory(
                 4, None,
             ),
-            4
+            2
         );
         assert_eq!(
             lexical_rebuild_default_staged_shard_builder_parallelism_for_workers_and_memory(
                 8,
                 Some(128 * GIB),
             ),
-            8,
-            "the live memory-admission controller, not a fictitious 32 GiB-per-builder reservation, should bound the farm"
+            3,
+            "the default farm should leave CPU headroom for Tantivy writer threads and the merge stage"
         );
         assert_eq!(
             lexical_rebuild_default_staged_shard_builder_parallelism_for_workers_and_memory(
                 32,
                 Some(512 * GIB),
             ),
-            8
+            4
         );
     }
 
@@ -35639,14 +35647,14 @@ mod tests {
             lexical_rebuild_staged_shard_builder_settings(&settings, 3),
             LexicalRebuildShardBuilderSettings {
                 max_builders: 3,
-                writer_threads_per_builder: 8,
+                writer_threads_per_builder: 2,
             }
         );
         assert_eq!(
             lexical_rebuild_staged_shard_builder_settings(&settings, 32),
             LexicalRebuildShardBuilderSettings {
                 max_builders: 8,
-                writer_threads_per_builder: 8,
+                writer_threads_per_builder: 2,
             }
         );
 
@@ -35658,7 +35666,7 @@ mod tests {
             lexical_rebuild_staged_shard_builder_settings(&constrained_writer_threads, 32),
             LexicalRebuildShardBuilderSettings {
                 max_builders: 8,
-                writer_threads_per_builder: 4,
+                writer_threads_per_builder: 2,
             }
         );
 
@@ -35671,7 +35679,7 @@ mod tests {
             lexical_rebuild_staged_shard_builder_settings(&many_builders_low_writer_threads, 32),
             LexicalRebuildShardBuilderSettings {
                 max_builders: 16,
-                writer_threads_per_builder: 3,
+                writer_threads_per_builder: 2,
             }
         );
     }
