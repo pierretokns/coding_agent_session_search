@@ -4364,12 +4364,22 @@ pub(crate) struct LexicalRebuildEquivalenceGoldenHit {
 const LEXICAL_REBUILD_EQUIVALENCE_DEFAULT_PROBES: &[&str] =
     &["error", "TODO", "function", "import", "test"];
 
+// BLAKE3's own documentation puts the crossover for its Rayon-backed update
+// above roughly 128 KiB on x86_64. Keep short messages on the cheaper serial
+// path; use the exact same byte stream and only change the internal join
+// strategy for pathological/large documents.
+const LEXICAL_REBUILD_EQUIVALENCE_RAYON_MIN_BYTES: usize = 128 * 1024;
+const LEXICAL_REBUILD_EQUIVALENCE_PARALLEL_CHUNK_BYTES: usize = 8 * 1024 * 1024;
+
 struct LexicalRebuildEquivalenceAccumulator {
     document_count: u64,
     manifest_hasher: blake3::Hasher,
     probes: Vec<String>,
     probe_hashers: Vec<blake3::Hasher>,
     probe_counts: Vec<u64>,
+    materialize_duration: Duration,
+    probe_duration: Duration,
+    ordered_hash_duration: Duration,
 }
 
 enum LexicalRebuildEquivalenceProbeHits {
@@ -4399,6 +4409,9 @@ impl LexicalRebuildEquivalenceAccumulator {
             probes,
             probe_hashers,
             probe_counts,
+            materialize_duration: Duration::ZERO,
+            probe_duration: Duration::ZERO,
+            ordered_hash_duration: Duration::ZERO,
         }
     }
 
@@ -4497,6 +4510,7 @@ impl LexicalRebuildEquivalenceAccumulator {
             return;
         }
 
+        let materialize_started = Instant::now();
         let mut docs = Vec::new();
         let mut packet_doc_ranges = Vec::with_capacity(packets.len() + 1);
         packet_doc_ranges.push(0);
@@ -4505,22 +4519,40 @@ impl LexicalRebuildEquivalenceAccumulator {
             docs.extend(packet_docs);
             packet_doc_ranges.push(docs.len());
         }
+        self.materialize_duration += materialize_started.elapsed();
 
         // The proof's manifest and golden-query hashers are intentionally
         // consumed below in packet/doc order. Only the independent substring
         // probes are batched, so Rayon cannot change duplicate or ordering
         // semantics while this performs one pool dispatch for the whole page.
+        let probe_started = Instant::now();
         let probe_hits = self.collect_probe_hits(&docs, worker_pool);
+        self.probe_duration += probe_started.elapsed();
+        let ordered_hash_started = Instant::now();
+        let mut manifest_chunk = Vec::with_capacity(
+            LEXICAL_REBUILD_EQUIVALENCE_PARALLEL_CHUNK_BYTES.min(
+                packets
+                    .iter()
+                    .map(|packet| packet.message_bytes)
+                    .sum::<usize>()
+                    .saturating_add(packets.len().saturating_mul(256)),
+            ),
+        );
         match probe_hits {
             LexicalRebuildEquivalenceProbeHits::Compact(probe_hits) => {
                 for (packet_idx, packet) in packets.iter().enumerate() {
-                    self.absorb_packet_header(packet.fingerprint_input());
+                    lexical_rebuild_equivalence_append_packet_header(
+                        &mut manifest_chunk,
+                        packet.fingerprint_input(),
+                    );
                     let start = packet_doc_ranges[packet_idx];
                     let end = packet_doc_ranges[packet_idx + 1];
                     self.document_count = self.document_count.saturating_add((end - start) as u64);
                     for (doc, probe_hit_mask) in
                         docs[start..end].iter().zip(&probe_hits[start..end])
                     {
+                        lexical_rebuild_equivalence_append_doc(&mut manifest_chunk, doc);
+                        self.flush_manifest_chunk_if_ready(&mut manifest_chunk);
                         self.absorb_doc(doc, |probe_idx| {
                             probe_hit_mask & (1_u64 << probe_idx) != 0
                         });
@@ -4529,13 +4561,18 @@ impl LexicalRebuildEquivalenceAccumulator {
             }
             LexicalRebuildEquivalenceProbeHits::Wide(probe_hits) => {
                 for (packet_idx, packet) in packets.iter().enumerate() {
-                    self.absorb_packet_header(packet.fingerprint_input());
+                    lexical_rebuild_equivalence_append_packet_header(
+                        &mut manifest_chunk,
+                        packet.fingerprint_input(),
+                    );
                     let start = packet_doc_ranges[packet_idx];
                     let end = packet_doc_ranges[packet_idx + 1];
                     self.document_count = self.document_count.saturating_add((end - start) as u64);
                     for (doc, probe_hit_words) in
                         docs[start..end].iter().zip(&probe_hits[start..end])
                     {
+                        lexical_rebuild_equivalence_append_doc(&mut manifest_chunk, doc);
+                        self.flush_manifest_chunk_if_ready(&mut manifest_chunk);
                         self.absorb_doc(doc, |probe_idx| {
                             probe_hit_words[probe_idx / 64] & (1_u64 << (probe_idx % 64)) != 0
                         });
@@ -4543,53 +4580,22 @@ impl LexicalRebuildEquivalenceAccumulator {
                 }
             }
         }
+        self.flush_manifest_chunk(&mut manifest_chunk);
+        self.ordered_hash_duration += ordered_hash_started.elapsed();
     }
 
-    fn absorb_packet_header(&mut self, fingerprint: LexicalRebuildPacketFingerprintInput<'_>) {
-        // Packet header: version, identity, provenance, counters. Length-prefixed
-        // length-prefixed strings avoid ambiguity across field boundaries.
-        self.manifest_hasher.update(b"pkt");
-        self.manifest_hasher
-            .update(&fingerprint.version.to_le_bytes());
-        lexical_rebuild_equivalence_update_opt_str(
-            &mut self.manifest_hasher,
-            Some(fingerprint.agent),
-        );
-        lexical_rebuild_equivalence_update_opt_str(
-            &mut self.manifest_hasher,
-            fingerprint.external_id,
-        );
-        lexical_rebuild_equivalence_update_opt_str(
-            &mut self.manifest_hasher,
-            fingerprint.workspace,
-        );
-        lexical_rebuild_equivalence_update_opt_str(
-            &mut self.manifest_hasher,
-            Some(fingerprint.source_path),
-        );
-        lexical_rebuild_equivalence_update_opt_str(&mut self.manifest_hasher, fingerprint.title);
-        self.manifest_hasher
-            .update(&fingerprint.started_at.unwrap_or(i64::MIN).to_le_bytes());
-        self.manifest_hasher
-            .update(&fingerprint.ended_at.unwrap_or(i64::MIN).to_le_bytes());
-        lexical_rebuild_equivalence_update_opt_str(
-            &mut self.manifest_hasher,
-            Some(fingerprint.source_id),
-        );
-        lexical_rebuild_equivalence_update_opt_str(
-            &mut self.manifest_hasher,
-            Some(fingerprint.origin_kind),
-        );
-        lexical_rebuild_equivalence_update_opt_str(
-            &mut self.manifest_hasher,
-            fingerprint.origin_host,
-        );
-        self.manifest_hasher
-            .update(&(fingerprint.lexical_projected_content_bytes as u64).to_le_bytes());
-        self.manifest_hasher
-            .update(&(fingerprint.message_count as u64).to_le_bytes());
-        self.manifest_hasher
-            .update(&(fingerprint.message_bytes as u64).to_le_bytes());
+    fn flush_manifest_chunk_if_ready(&mut self, chunk: &mut Vec<u8>) {
+        if chunk.len() >= LEXICAL_REBUILD_EQUIVALENCE_PARALLEL_CHUNK_BYTES {
+            self.flush_manifest_chunk(chunk);
+        }
+    }
+
+    fn flush_manifest_chunk(&mut self, chunk: &mut Vec<u8>) {
+        if chunk.is_empty() {
+            return;
+        }
+        lexical_rebuild_equivalence_update_content(&mut self.manifest_hasher, chunk);
+        chunk.clear();
     }
 
     fn absorb_doc(
@@ -4597,23 +4603,6 @@ impl LexicalRebuildEquivalenceAccumulator {
         doc: &frankensearch::lexical_tantivy::CassDocumentRef<'_>,
         probe_hit: impl Fn(usize) -> bool,
     ) {
-        let mut manifest_prefix = smallvec::SmallVec::<[u8; 256]>::new();
-        manifest_prefix.extend_from_slice(b"doc");
-        lexical_rebuild_equivalence_append_opt_str(&mut manifest_prefix, Some(doc.agent));
-        lexical_rebuild_equivalence_append_opt_str(&mut manifest_prefix, doc.workspace);
-        lexical_rebuild_equivalence_append_opt_str(&mut manifest_prefix, Some(doc.source_path));
-        manifest_prefix.extend_from_slice(&doc.msg_idx.to_le_bytes());
-        manifest_prefix.extend_from_slice(&doc.created_at.unwrap_or(i64::MIN).to_le_bytes());
-        lexical_rebuild_equivalence_append_opt_str(&mut manifest_prefix, doc.title);
-        manifest_prefix.extend_from_slice(&(doc.content.len() as u64).to_le_bytes());
-        self.manifest_hasher.update(&manifest_prefix);
-        self.manifest_hasher.update(doc.content.as_bytes());
-        let mut manifest_suffix = smallvec::SmallVec::<[u8; 128]>::new();
-        lexical_rebuild_equivalence_append_opt_str(&mut manifest_suffix, Some(doc.source_id));
-        lexical_rebuild_equivalence_append_opt_str(&mut manifest_suffix, Some(doc.origin_kind));
-        lexical_rebuild_equivalence_append_opt_str(&mut manifest_suffix, doc.origin_host);
-        self.manifest_hasher.update(&manifest_suffix);
-
         for (probe_idx, ((_probe, hasher), count)) in self
             .probes
             .iter()
@@ -4630,12 +4619,20 @@ impl LexicalRebuildEquivalenceAccumulator {
                 hit_prefix.extend_from_slice(&doc.created_at.unwrap_or(i64::MIN).to_le_bytes());
                 hit_prefix.extend_from_slice(&(doc.content.len() as u64).to_le_bytes());
                 hasher.update(&hit_prefix);
-                hasher.update(doc.content.as_bytes());
+                lexical_rebuild_equivalence_update_content(hasher, doc.content.as_bytes());
             }
         }
     }
 
     fn finalize(self) -> LexicalRebuildEquivalenceEvidence {
+        if std::env::var_os("CASS_TANTIVY_REBUILD_PROFILE").is_some() {
+            eprintln!(
+                "CASS_EQUIVALENCE_PROFILE materialize_ms={:.3} probe_ms={:.3} ordered_hash_ms={:.3}",
+                self.materialize_duration.as_secs_f64() * 1000.0,
+                self.probe_duration.as_secs_f64() * 1000.0,
+                self.ordered_hash_duration.as_secs_f64() * 1000.0,
+            );
+        }
         let manifest_fingerprint = self.manifest_hasher.finalize().to_hex().to_string();
         let mut combined = blake3::Hasher::new();
         let mut golden_query_hit_counts = Vec::with_capacity(self.probes.len());
@@ -4664,16 +4661,61 @@ impl LexicalRebuildEquivalenceAccumulator {
     }
 }
 
-fn lexical_rebuild_equivalence_update_opt_str(hasher: &mut blake3::Hasher, value: Option<&str>) {
+fn lexical_rebuild_equivalence_update_content(hasher: &mut blake3::Hasher, content: &[u8]) {
+    if content.len() >= LEXICAL_REBUILD_EQUIVALENCE_RAYON_MIN_BYTES {
+        hasher.update_rayon(content);
+    } else {
+        hasher.update(content);
+    }
+}
+
+fn lexical_rebuild_equivalence_append_packet_header(
+    output: &mut Vec<u8>,
+    fingerprint: LexicalRebuildPacketFingerprintInput<'_>,
+) {
+    output.extend_from_slice(b"pkt");
+    output.extend_from_slice(&fingerprint.version.to_le_bytes());
+    lexical_rebuild_equivalence_append_opt_str_vec(output, Some(fingerprint.agent));
+    lexical_rebuild_equivalence_append_opt_str_vec(output, fingerprint.external_id);
+    lexical_rebuild_equivalence_append_opt_str_vec(output, fingerprint.workspace);
+    lexical_rebuild_equivalence_append_opt_str_vec(output, Some(fingerprint.source_path));
+    lexical_rebuild_equivalence_append_opt_str_vec(output, fingerprint.title);
+    output.extend_from_slice(&fingerprint.started_at.unwrap_or(i64::MIN).to_le_bytes());
+    output.extend_from_slice(&fingerprint.ended_at.unwrap_or(i64::MIN).to_le_bytes());
+    lexical_rebuild_equivalence_append_opt_str_vec(output, Some(fingerprint.source_id));
+    lexical_rebuild_equivalence_append_opt_str_vec(output, Some(fingerprint.origin_kind));
+    lexical_rebuild_equivalence_append_opt_str_vec(output, fingerprint.origin_host);
+    output.extend_from_slice(&(fingerprint.lexical_projected_content_bytes as u64).to_le_bytes());
+    output.extend_from_slice(&(fingerprint.message_count as u64).to_le_bytes());
+    output.extend_from_slice(&(fingerprint.message_bytes as u64).to_le_bytes());
+}
+
+fn lexical_rebuild_equivalence_append_doc(
+    output: &mut Vec<u8>,
+    doc: &frankensearch::lexical_tantivy::CassDocumentRef<'_>,
+) {
+    output.extend_from_slice(b"doc");
+    lexical_rebuild_equivalence_append_opt_str_vec(output, Some(doc.agent));
+    lexical_rebuild_equivalence_append_opt_str_vec(output, doc.workspace);
+    lexical_rebuild_equivalence_append_opt_str_vec(output, Some(doc.source_path));
+    output.extend_from_slice(&doc.msg_idx.to_le_bytes());
+    output.extend_from_slice(&doc.created_at.unwrap_or(i64::MIN).to_le_bytes());
+    lexical_rebuild_equivalence_append_opt_str_vec(output, doc.title);
+    output.extend_from_slice(&(doc.content.len() as u64).to_le_bytes());
+    output.extend_from_slice(doc.content.as_bytes());
+    lexical_rebuild_equivalence_append_opt_str_vec(output, Some(doc.source_id));
+    lexical_rebuild_equivalence_append_opt_str_vec(output, Some(doc.origin_kind));
+    lexical_rebuild_equivalence_append_opt_str_vec(output, doc.origin_host);
+}
+
+fn lexical_rebuild_equivalence_append_opt_str_vec(output: &mut Vec<u8>, value: Option<&str>) {
     match value {
         Some(s) => {
-            hasher.update(&[0x01_u8]);
-            hasher.update(&(s.len() as u64).to_le_bytes());
-            hasher.update(s.as_bytes());
+            output.push(0x01_u8);
+            output.extend_from_slice(&(s.len() as u64).to_le_bytes());
+            output.extend_from_slice(s.as_bytes());
         }
-        None => {
-            hasher.update(&[0x00_u8]);
-        }
+        None => output.push(0x00_u8),
     }
 }
 
@@ -44287,6 +44329,16 @@ mod tests {
             }
         }
         assert_eq!(coalesced.as_slice(), reference.as_slice());
+    }
+
+    #[test]
+    fn lexical_rebuild_equivalence_large_content_parallel_update_is_byte_identical() {
+        let content = vec![b'x'; LEXICAL_REBUILD_EQUIVALENCE_RAYON_MIN_BYTES + 17];
+        let mut optimized = blake3::Hasher::new();
+        lexical_rebuild_equivalence_update_content(&mut optimized, &content);
+        let mut reference = blake3::Hasher::new();
+        reference.update(&content);
+        assert_eq!(optimized.finalize(), reference.finalize());
     }
 
     #[test]

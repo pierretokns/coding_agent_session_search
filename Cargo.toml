@@ -1,6 +1,6 @@
 [package]
 name = "coding-agent-search"
-version = "0.6.29"
+version = "0.6.30"
 edition = "2024"
 authors = ["Jeffrey Emanuel"]
 description = "Unified TUI search over local coding agent histories"
@@ -72,7 +72,7 @@ glob = "0.3.3"
 # archive writes and salvage still use FrankenSQLite.
 rusqlite = { version = "0.39.0", features = ["bundled", "modern_sqlite"] }
 base64 = ">=0.21"
-blake3 = "1.8.5"
+blake3 = { version = "1.8.5", features = ["rayon"] }
 mime_guess = "2.0.5"
 pulldown-cmark = { version = "0.13.3", default-features = false, features = ["html"] }
 chrono = { version = "0.4.44", features = ["serde"] }

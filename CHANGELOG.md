@@ -17,9 +17,26 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_session_search>
 
 ## [Unreleased]
 
+## [v0.6.30] -- 2026-08-04
+
+Lexical equivalence throughput release.
+
+### Performance
+
+- Use BLAKE3's exact Rayon-backed update path for lexical equivalence content
+  at the documented large-buffer crossover, while retaining the serial path for
+  ordinary messages and preserving byte-identical evidence.
 - Speed up fork release assembly by validating the root package version without recloning sibling repositories.
 - Make the Windows release matrix leg non-blocking so a transient Windows
   toolchain failure cannot suppress verified Linux/macOS release artifacts.
+
+### Verified
+
+- Exact lexical equivalence evidence tests pass, including legacy/keyset replay
+  equality and byte-identical large-content hashing.
+- Two release-profile scale-4 reconstruction runs processed 435.9 MB and
+  400,000 messages in 6.44–9.11 seconds (45.6–64.6 MiB/s), with ordered
+  equivalence hashing at 0.26–0.64 seconds.
 
 ## [v0.6.29] -- 2026-08-04
 

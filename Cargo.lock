@@ -488,6 +488,7 @@ dependencies = [
  "cfg-if",
  "constant_time_eq",
  "cpufeatures 0.3.0",
+ "rayon-core",
 ]
 
 [[package]]
@@ -848,7 +849,7 @@ checksum = "3f88a43d011fc4a6876cb7344703e297c71dda42494fee094d5f7c76bf13f746"
 
 [[package]]
 name = "coding-agent-search"
-version = "0.6.29"
+version = "0.6.30"
 dependencies = [
  "aes-gcm",
  "anyhow",
