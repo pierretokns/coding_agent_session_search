@@ -6284,6 +6284,19 @@ pub struct DoctorSqliteWriter {
 pub(crate) const DOCTOR_RAW_MIRROR_TAIL_METADATA_META_KEY: &str =
     "cass.doctor.raw_mirror_tail_metadata";
 const DOCTOR_RAW_MIRROR_TAIL_METADATA_META_VALUE: &str = "authoritative-v1";
+const DOCTOR_WAL_AUTOCHECKPOINT_DEFAULT_PAGES: i64 = 65_536;
+
+fn doctor_wal_autocheckpoint_pages_from_value(value: Option<&str>) -> i64 {
+    value
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .filter(|pages| *pages > 0)
+        .unwrap_or(DOCTOR_WAL_AUTOCHECKPOINT_DEFAULT_PAGES)
+}
+
+fn doctor_wal_autocheckpoint_pages() -> i64 {
+    let value = dotenvy::var("CASS_DOCTOR_WAL_AUTOCHECKPOINT_PAGES").ok();
+    doctor_wal_autocheckpoint_pages_from_value(value.as_deref())
+}
 
 fn doctor_raw_mirror_tail_metadata_sidecar_path(db_path: &Path) -> PathBuf {
     database_sidecar_path(db_path, ".cass-doctor-tail-authoritative")
@@ -6373,6 +6386,16 @@ impl DoctorSqliteWriter {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "temp_store", "MEMORY")?;
         conn.pragma_update(None, "cache_size", -524_288_i64)?;
+        // SQLite's default 1,000-page (~4 MiB) WAL checkpoint cadence is too
+        // small for Doctor's append-heavy 64 MiB transaction batches. A
+        // bounded 256 MiB cadence amortizes checkpoint work without making
+        // the WAL unbounded; the environment override is retained for
+        // host-specific experiments and incident recovery.
+        conn.pragma_update(
+            None,
+            "wal_autocheckpoint",
+            doctor_wal_autocheckpoint_pages(),
+        )?;
         let mut raw_mirror_tail_marker_written =
             doctor_raw_mirror_tail_metadata_sidecar_is_valid(path);
         if !raw_mirror_tail_marker_written {
@@ -23894,6 +23917,35 @@ mod tests {
             !doctor_raw_mirror_tail_metadata_sidecar_is_valid(&db_path),
             "a sidecar from a replaced candidate database must never authorize the fast path"
         );
+    }
+
+    #[test]
+    fn doctor_wal_autocheckpoint_defaults_to_bounded_bulk_import_cadence() {
+        assert_eq!(doctor_wal_autocheckpoint_pages_from_value(None), 65_536);
+        assert_eq!(
+            doctor_wal_autocheckpoint_pages_from_value(Some("65536")),
+            65_536
+        );
+        assert_eq!(
+            doctor_wal_autocheckpoint_pages_from_value(Some("0")),
+            65_536
+        );
+        assert_eq!(
+            doctor_wal_autocheckpoint_pages_from_value(Some("not-a-number")),
+            65_536
+        );
+    }
+
+    #[test]
+    fn doctor_writer_applies_bounded_wal_autocheckpoint() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("doctor-wal.db");
+        let writer = DoctorSqliteWriter::open(&db_path).unwrap();
+        let pages: i64 = writer
+            .conn
+            .query_row("PRAGMA wal_autocheckpoint", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(pages, 65_536);
     }
 
     #[test]
