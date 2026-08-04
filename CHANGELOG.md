@@ -15,6 +15,29 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_session_search>
 
 ---
 
+## [v0.6.25] -- 2026-08-04
+
+Semantic backfill safety and fork-release patch release.
+
+### Fixed
+
+- **Semantic backfill now bounds pathological message materialization.** A
+  length-only SQLite probe rejects a single raw message over 16 MiB before its
+  body is loaded or sent to the embedder. Set
+  `CASS_SEMANTIC_MAX_RAW_MESSAGE_BYTES=0` only when unbounded input is
+  intentional.
+- **Checkpoint-capped semantic batches materialize candidates incrementally.**
+  The backfill now fetches one ordered conversation at a time and stops before
+  the next whole conversation would exceed the checkpoint budget, reducing
+  peak memory and preserving crash-safe cursor semantics.
+
+### Release engineering
+
+- Fork tags are validated for SemVer, Cargo version, and a matching changelog
+  heading before cross-platform builds run. The fork's default-branch release
+  dispatcher publishes tagged archives and checksums to the fork's GitHub
+  Releases page.
+
 ## [v0.6.24] -- 2026-08-04
 
 Performance and fork-release maintenance release.

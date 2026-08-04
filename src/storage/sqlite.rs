@@ -9399,6 +9399,132 @@ impl FrankenStorage {
         Ok(messages)
     }
 
+    /// Fetch only the post-cursor message projection needed by semantic
+    /// backfill. When `max_raw_message_bytes` is nonzero, a length-only probe
+    /// rejects an oversized body before it is materialized into a Rust String.
+    pub fn fetch_messages_for_semantic_backfill(
+        &self,
+        conversation_id: i64,
+        after_message_id: Option<i64>,
+        max_raw_message_bytes: usize,
+    ) -> Result<Vec<Message>> {
+        if max_raw_message_bytes > 0 {
+            let limit = i64::try_from(max_raw_message_bytes).unwrap_or(i64::MAX);
+            let (sql, params) = if let Some(after_message_id) = after_message_id {
+                (
+                    "SELECT id, LENGTH(CAST(content AS BLOB))
+                     FROM messages
+                     WHERE conversation_id = ?1 AND id > ?2
+                       AND LENGTH(CAST(content AS BLOB)) > ?3
+                     ORDER BY idx LIMIT 1",
+                    vec![
+                        ParamValue::from(conversation_id),
+                        ParamValue::from(after_message_id),
+                        ParamValue::from(limit),
+                    ],
+                )
+            } else {
+                (
+                    "SELECT id, LENGTH(CAST(content AS BLOB))
+                     FROM messages
+                     WHERE conversation_id = ?1
+                       AND LENGTH(CAST(content AS BLOB)) > ?2
+                     ORDER BY idx LIMIT 1",
+                    vec![ParamValue::from(conversation_id), ParamValue::from(limit)],
+                )
+            };
+            let oversized: Vec<(i64, i64)> = self
+                .conn
+                .query_map_collect(sql, &params, |row| {
+                    Ok((row.get_typed(0)?, row.get_typed(1)?))
+                })
+                .with_context(|| {
+                    format!("checking semantic raw-message size for conversation {conversation_id}")
+                })?;
+            if let Some((message_id, byte_len)) = oversized.first().copied() {
+                bail!(
+                    "semantic backfill raw-message guardrail rejected conversation {conversation_id} message {message_id}: bytes={byte_len} limit={max_raw_message_bytes}"
+                );
+            }
+        }
+
+        let (hinted_sql, fallback_sql, params) = if let Some(after_message_id) = after_message_id {
+            (
+                "SELECT id, idx, role, author, created_at, content
+                 FROM messages INDEXED BY sqlite_autoindex_messages_1
+                 WHERE conversation_id = ?1 AND id > ?2 ORDER BY idx",
+                "SELECT id, idx, role, author, created_at, content
+                 FROM messages
+                 WHERE conversation_id = ?1 AND id > ?2 ORDER BY idx",
+                vec![
+                    ParamValue::from(conversation_id),
+                    ParamValue::from(after_message_id),
+                ],
+            )
+        } else {
+            (
+                "SELECT id, idx, role, author, created_at, content
+                 FROM messages INDEXED BY sqlite_autoindex_messages_1
+                 WHERE conversation_id = ?1 ORDER BY idx",
+                "SELECT id, idx, role, author, created_at, content
+                 FROM messages
+                 WHERE conversation_id = ?1 ORDER BY idx",
+                vec![ParamValue::from(conversation_id)],
+            )
+        };
+
+        self.conn
+            .query_map_collect(hinted_sql, &params, |row| {
+                let role: String = row.get_typed(2)?;
+                Ok(Message {
+                    id: Some(row.get_typed(0)?),
+                    idx: row.get_typed(1)?,
+                    role: match role.as_str() {
+                        "user" => MessageRole::User,
+                        "agent" | "assistant" => MessageRole::Agent,
+                        "tool" => MessageRole::Tool,
+                        "system" => MessageRole::System,
+                        other => MessageRole::Other(other.to_string()),
+                    },
+                    author: row.get_typed(3)?,
+                    created_at: row.get_typed(4)?,
+                    content: row.get_typed(5)?,
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                })
+            })
+            .or_else(|err| {
+                if err
+                    .to_string()
+                    .contains("no such index: sqlite_autoindex_messages_1")
+                {
+                    return self.conn.query_map_collect(fallback_sql, &params, |row| {
+                        let role: String = row.get_typed(2)?;
+                        Ok(Message {
+                            id: Some(row.get_typed(0)?),
+                            idx: row.get_typed(1)?,
+                            role: match role.as_str() {
+                                "user" => MessageRole::User,
+                                "agent" | "assistant" => MessageRole::Agent,
+                                "tool" => MessageRole::Tool,
+                                "system" => MessageRole::System,
+                                other => MessageRole::Other(other.to_string()),
+                            },
+                            author: row.get_typed(3)?,
+                            created_at: row.get_typed(4)?,
+                            content: row.get_typed(5)?,
+                            extra_json: serde_json::Value::Null,
+                            snippets: Vec::new(),
+                        })
+                    });
+                }
+                Err(err)
+            })
+            .with_context(|| {
+                format!("fetching semantic backfill messages for conversation {conversation_id}")
+            })
+    }
+
     /// Inner fetch without the per-conversation content cap. Kept separate so the
     /// cap is applied at exactly one chokepoint (every lexical-rebuild content
     /// load — batch and streaming — funnels through `fetch_messages_for_lexical_rebuild`).
@@ -27102,6 +27228,137 @@ mod tests {
             message.contains("content-byte guardrail"),
             "expected guardrail reason in error, got {message}"
         );
+    }
+
+    #[test]
+    fn semantic_backfill_message_guardrail_rejects_before_body_materialization() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("semantic-guard.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let agent_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "codex".into(),
+                name: "Codex".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            })
+            .unwrap();
+        let conversation_id = storage
+            .insert_conversation_tree(
+                agent_id,
+                None,
+                &Conversation {
+                    id: None,
+                    agent_slug: "codex".into(),
+                    workspace: None,
+                    external_id: Some("semantic-guard".into()),
+                    title: None,
+                    source_path: PathBuf::from("/tmp/semantic-guard.jsonl"),
+                    started_at: None,
+                    ended_at: None,
+                    approx_tokens: None,
+                    metadata_json: serde_json::Value::Null,
+                    messages: vec![Message {
+                        id: None,
+                        idx: 0,
+                        role: MessageRole::User,
+                        author: None,
+                        created_at: None,
+                        content: "x".repeat(64),
+                        extra_json: serde_json::Value::Null,
+                        snippets: Vec::new(),
+                    }],
+                    source_id: LOCAL_SOURCE_ID.into(),
+                    origin_host: None,
+                },
+            )
+            .unwrap()
+            .conversation_id;
+
+        let error = storage
+            .fetch_messages_for_semantic_backfill(conversation_id, None, 32)
+            .expect_err("semantic raw-message guardrail should reject before loading content");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("semantic backfill raw-message guardrail"),
+            "expected semantic guardrail reason in error, got {message}"
+        );
+
+        let messages = storage
+            .fetch_messages_for_semantic_backfill(conversation_id, None, 0)
+            .unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content.len(), 64);
+    }
+
+    #[test]
+    fn semantic_backfill_message_guardrail_only_checks_post_cursor_rows() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("semantic-guard-cursor.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let agent_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "codex".into(),
+                name: "Codex".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            })
+            .unwrap();
+        let conversation_id = storage
+            .insert_conversation_tree(
+                agent_id,
+                None,
+                &Conversation {
+                    id: None,
+                    agent_slug: "codex".into(),
+                    workspace: None,
+                    external_id: Some("semantic-guard-cursor".into()),
+                    title: None,
+                    source_path: PathBuf::from("/tmp/semantic-guard-cursor.jsonl"),
+                    started_at: None,
+                    ended_at: None,
+                    approx_tokens: None,
+                    metadata_json: serde_json::Value::Null,
+                    messages: vec![
+                        Message {
+                            id: None,
+                            idx: 0,
+                            role: MessageRole::User,
+                            author: None,
+                            created_at: None,
+                            content: "x".repeat(64),
+                            extra_json: serde_json::Value::Null,
+                            snippets: Vec::new(),
+                        },
+                        Message {
+                            id: None,
+                            idx: 1,
+                            role: MessageRole::Agent,
+                            author: None,
+                            created_at: None,
+                            content: "ok".into(),
+                            extra_json: serde_json::Value::Null,
+                            snippets: Vec::new(),
+                        },
+                    ],
+                    source_id: LOCAL_SOURCE_ID.into(),
+                    origin_host: None,
+                },
+            )
+            .unwrap()
+            .conversation_id;
+
+        let all_messages = storage
+            .fetch_messages_for_semantic_backfill(conversation_id, None, 0)
+            .unwrap();
+        let first_message_id = all_messages[0].id.unwrap();
+        let messages = storage
+            .fetch_messages_for_semantic_backfill(conversation_id, Some(first_message_id), 32)
+            .unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content, "ok");
     }
 
     #[test]

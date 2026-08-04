@@ -67,6 +67,10 @@ const DEFAULT_SEMANTIC_EMBED_BATCH_WARN_AFTER_MS: u64 = 30_000;
 const DEFAULT_SEMANTIC_EMBED_BATCH_FAIL_AFTER_MS: u64 = 300_000;
 const DEFAULT_SEMANTIC_MAX_MESSAGES_PER_CHECKPOINT: usize = 10_000;
 const DEFAULT_SEMANTIC_MAX_BYTES_PER_CHECKPOINT: u64 = 8 * 1024 * 1024;
+/// Refuse a single raw message before loading its body for semantic
+/// canonicalization. Set `CASS_SEMANTIC_MAX_RAW_MESSAGE_BYTES=0` only when an
+/// operator has explicitly accepted unbounded pathological-input risk.
+const DEFAULT_SEMANTIC_MAX_RAW_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 const DEFAULT_SEMANTIC_RECONCILIATION_SCAN_CONVERSATIONS: usize = 64;
 const SEMANTIC_PREP_MEMO_ALGORITHM: &str = "semantic_prepare_window";
 const SEMANTIC_PREP_MEMO_VERSION: &str = "canonicalize_for_embedding:v2:stable-content-hash";
@@ -117,6 +121,13 @@ fn resolved_semantic_embed_batch_char_budget() -> usize {
     resolved_env_usize(
         "CASS_SEMANTIC_EMBED_BATCH_CHAR_BUDGET",
         DEFAULT_SEMANTIC_EMBED_BATCH_CHAR_BUDGET,
+    )
+}
+
+fn resolved_semantic_max_raw_message_bytes() -> usize {
+    resolved_env_usize(
+        "CASS_SEMANTIC_MAX_RAW_MESSAGE_BYTES",
+        DEFAULT_SEMANTIC_MAX_RAW_MESSAGE_BYTES,
     )
 }
 
@@ -1421,18 +1432,17 @@ fn fetch_canonical_embedding_batch_inner_with_caps_and_total(
 
     let conversations = fetch_canonical_embedding_conversations(storage, &conversation_ids)?;
 
-    let mut grouped_messages =
-        storage.fetch_messages_for_lexical_rebuild_batch(&conversation_ids, None, None)?;
     let CheckpointCappedSelection {
         conversations,
+        mut grouped_messages,
         last_conversation_id,
         stopped_before_candidate,
-    } = select_checkpoint_capped_conversations(
+    } = materialize_checkpoint_capped_conversations(
+        storage,
         conversations,
-        &mut grouped_messages,
         after_message_id,
         caps,
-    );
+    )?;
     let (inputs, _) = packet_embedding_inputs_from_materialized_canonical_messages(
         &conversations,
         &mut grouped_messages,
@@ -1463,29 +1473,34 @@ fn fetch_canonical_embedding_batch_inner_with_caps_and_total(
 
 struct CheckpointCappedSelection {
     conversations: Vec<CanonicalEmbeddingConversationRow>,
+    grouped_messages: HashMap<i64, Vec<Message>>,
     last_conversation_id: Option<i64>,
     stopped_before_candidate: bool,
 }
 
-fn select_checkpoint_capped_conversations(
+fn materialize_checkpoint_capped_conversations(
+    storage: &FrankenStorage,
     conversations: Vec<CanonicalEmbeddingConversationRow>,
-    grouped_messages: &mut HashMap<i64, Vec<Message>>,
     after_message_id: Option<i64>,
     caps: SemanticCheckpointCaps,
-) -> CheckpointCappedSelection {
+) -> Result<CheckpointCappedSelection> {
     let mut selected = Vec::new();
+    let mut grouped_messages = HashMap::new();
     let mut selected_messages = 0usize;
     let mut selected_bytes = 0u64;
     let mut last_conversation_id = None;
     let mut stopped_before_candidate = false;
+    let max_raw_message_bytes = resolved_semantic_max_raw_message_bytes();
 
     for conversation in conversations {
-        let mut messages = grouped_messages
-            .remove(&conversation.conversation_id)
-            .unwrap_or_default();
-        if let Some(min_exclusive) = after_message_id {
-            messages.retain(|message| message.id.is_some_and(|id| id > min_exclusive));
-        }
+        // Fetch one candidate at a time, and only after the length-only raw
+        // guard has passed. The former batch fetch loaded every over-fetched
+        // candidate before applying the checkpoint cap.
+        let messages = storage.fetch_messages_for_semantic_backfill(
+            conversation.conversation_id,
+            after_message_id,
+            max_raw_message_bytes,
+        )?;
         if messages.is_empty() {
             continue;
         }
@@ -1524,11 +1539,12 @@ fn select_checkpoint_capped_conversations(
         selected.push(conversation);
     }
 
-    CheckpointCappedSelection {
+    Ok(CheckpointCappedSelection {
         conversations: selected,
+        grouped_messages,
         last_conversation_id,
         stopped_before_candidate,
-    }
+    })
 }
 
 #[cfg(test)]
