@@ -6399,6 +6399,66 @@ impl DoctorSqliteWriter {
         })
     }
 
+    /// Ensure the recovery agent exists without opening a second
+    /// frankensqlite connection to the candidate database.
+    pub fn ensure_agent(&mut self, agent: &Agent) -> Result<i64> {
+        let now = FrankenStorage::now_millis();
+        let kind = agent_kind_str(agent.kind.clone());
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT INTO agents(slug, name, version, kind, created_at, updated_at)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(slug) DO UPDATE SET
+                 name = excluded.name,
+                 version = excluded.version,
+                 kind = excluded.kind,
+                 updated_at = excluded.updated_at
+             WHERE NOT (
+                 agents.name IS excluded.name
+                 AND agents.version IS excluded.version
+                 AND agents.kind IS excluded.kind
+             )",
+            rusqlite::params![
+                agent.slug.as_str(),
+                agent.name.as_str(),
+                agent.version.as_deref(),
+                kind,
+                now,
+                now
+            ],
+        )?;
+        let id = tx.query_row(
+            "SELECT id FROM agents WHERE slug = ?1 LIMIT 1",
+            rusqlite::params![agent.slug.as_str()],
+            |row| row.get::<_, i64>(0),
+        )?;
+        tx.commit()?;
+        Ok(id)
+    }
+
+    /// Initialize the exact candidate row-count ledger used by native Doctor
+    /// recovery. A fresh candidate starts ready; an older resumed candidate
+    /// starts unready and is seeded by the first full validation pass.
+    pub fn initialize_doctor_candidate_counts(&mut self, ready: bool) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS cass_doctor_candidate_counts (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                conversation_count INTEGER NOT NULL,
+                message_count INTEGER NOT NULL,
+                counts_ready INTEGER NOT NULL
+            );",
+        )?;
+        tx.execute(
+            "INSERT OR IGNORE INTO cass_doctor_candidate_counts
+             (singleton, conversation_count, message_count, counts_ready)
+             VALUES (1, 0, 0, ?1)",
+            rusqlite::params![i64::from(ready)],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn insert_doctor_conversation_chunk(
         &mut self,
         agent_id: i64,
@@ -6432,6 +6492,17 @@ impl DoctorSqliteWriter {
                 DOCTOR_RAW_MIRROR_TAIL_METADATA_META_VALUE,
             ],
         )?;
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS cass_doctor_candidate_counts (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                conversation_count INTEGER NOT NULL,
+                message_count INTEGER NOT NULL,
+                counts_ready INTEGER NOT NULL
+            );
+            INSERT OR IGNORE INTO cass_doctor_candidate_counts
+                (singleton, conversation_count, message_count, counts_ready)
+                VALUES (1, 0, 0, 0);",
+        )?;
         doctor_native_ensure_reference_rows(&tx, chunks)?;
         let mut outcomes = Vec::with_capacity(chunks.len());
         for &(agent_id, workspace_id, raw_conv) in chunks {
@@ -6442,6 +6513,20 @@ impl DoctorSqliteWriter {
                 raw_conv,
             )?);
         }
+        let conversation_delta = outcomes
+            .iter()
+            .filter(|outcome| outcome.conversation_inserted)
+            .count() as i64;
+        let message_delta = outcomes
+            .iter()
+            .map(|outcome| outcome.inserted_indices.len() as i64)
+            .sum::<i64>();
+        tx.execute(
+            "UPDATE cass_doctor_candidate_counts
+             SET conversation_count = conversation_count + ?1,
+                 message_count = message_count + ?2",
+            rusqlite::params![conversation_delta, message_delta],
+        )?;
         tx.commit()?;
         if !self.raw_mirror_tail_marker_written {
             // The database transaction is durable before this sidecar is
@@ -23776,6 +23861,16 @@ mod tests {
             row.get_typed::<i64>(1).unwrap(),
         );
         assert_eq!(counts, (2, 2));
+        let ledger = storage
+            .conn
+            .query_row(
+                "SELECT conversation_count, message_count, counts_ready
+                 FROM cass_doctor_candidate_counts WHERE singleton = 1",
+            )
+            .unwrap();
+        assert_eq!(ledger.get_typed::<i64>(0).unwrap(), 2);
+        assert_eq!(ledger.get_typed::<i64>(1).unwrap(), 2);
+        assert_eq!(ledger.get_typed::<i64>(2).unwrap(), 0);
     }
 
     #[test]
