@@ -94,6 +94,10 @@ jobs:
     name: Build ${{ matrix.target }}
     needs: validate-release-config
     runs-on: ${{ matrix.os }}
+    # A broken Windows toolchain must not prevent the release job from
+    # publishing the verified Unix artifacts. The failed Windows matrix leg
+    # remains visible in the workflow, but is intentionally non-blocking.
+    continue-on-error: ${{ matrix.target == 'x86_64-pc-windows-msvc' }}
     timeout-minutes: 60
     strategy:
       fail-fast: false

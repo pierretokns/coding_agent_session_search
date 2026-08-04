@@ -18,6 +18,8 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_session_search>
 ## [Unreleased]
 
 - Speed up fork release assembly by validating the root package version without recloning sibling repositories.
+- Make the Windows release matrix leg non-blocking so a transient Windows
+  toolchain failure cannot suppress verified Linux/macOS release artifacts.
 
 ## [v0.6.29] -- 2026-08-04
 
