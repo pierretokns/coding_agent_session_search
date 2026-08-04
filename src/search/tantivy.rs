@@ -82,8 +82,6 @@ pub const SCHEMA_HASH: &str = CASS_SCHEMA_HASH;
 const ENV_TANTIVY_ADD_BATCH_MAX_CHARS: &str = "CASS_TANTIVY_ADD_BATCH_MAX_CHARS";
 const ENV_TANTIVY_ADD_BATCH_MAX_MESSAGES: &str = "CASS_TANTIVY_ADD_BATCH_MAX_MESSAGES";
 const ENV_TANTIVY_MAX_WRITER_THREADS: &str = "CASS_TANTIVY_MAX_WRITER_THREADS";
-const ENV_TANTIVY_REBUILD_STAGED_SHARD_BUILDERS: &str =
-    "CASS_TANTIVY_REBUILD_STAGED_SHARD_BUILDERS";
 const DEFAULT_TANTIVY_MAX_WRITER_THREADS_CEILING: usize = 26;
 const DEFAULT_TANTIVY_ASSUMED_CONCURRENT_WRITERS: u64 = 8;
 const DEFAULT_TANTIVY_WRITER_HEAP_PER_THREAD_BYTES: u64 = 128 * 1024 * 1024;
@@ -161,10 +159,10 @@ pub(crate) fn default_tantivy_max_writer_threads_for_memory_bytes_and_concurrent
 }
 
 fn default_tantivy_assumed_concurrent_writers() -> u64 {
-    positive_usize_env(ENV_TANTIVY_REBUILD_STAGED_SHARD_BUILDERS)
-        .and_then(|value| u64::try_from(value).ok())
-        .unwrap_or(DEFAULT_TANTIVY_ASSUMED_CONCURRENT_WRITERS)
-        .max(1)
+    // The staged builder count is independent from the number of Tantivy
+    // threads inside each writer.  Keep the default conservative and stable;
+    // otherwise changing builder fan-out silently changes the per-writer cap.
+    DEFAULT_TANTIVY_ASSUMED_CONCURRENT_WRITERS
 }
 
 pub fn default_tantivy_max_writer_threads() -> usize {

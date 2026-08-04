@@ -5663,6 +5663,7 @@ impl LexicalRebuildStagedMergeController {
 #[derive(Debug)]
 struct LexicalRebuildStagedShardBuildController {
     max_workers: usize,
+    writer_threads_per_builder: usize,
     loadavg_high_watermark_1m_milli: Option<u32>,
     memory_reserve_bytes: usize,
     emergency_memory_reserve_bytes: usize,
@@ -5670,11 +5671,12 @@ struct LexicalRebuildStagedShardBuildController {
 
 impl LexicalRebuildStagedShardBuildController {
     fn new(max_workers: usize, loadavg_high_watermark_1m_milli: Option<u32>) -> Self {
-        Self::new_with_memory_reserves(
+        Self::new_with_memory_reserves_and_writer_threads(
             max_workers,
             loadavg_high_watermark_1m_milli,
             lexical_rebuild_staged_shard_build_memory_reserve_bytes(),
             lexical_rebuild_staged_shard_build_emergency_memory_reserve_bytes(),
+            1,
         )
     }
 
@@ -5684,9 +5686,26 @@ impl LexicalRebuildStagedShardBuildController {
         memory_reserve_bytes: usize,
         emergency_memory_reserve_bytes: usize,
     ) -> Self {
+        Self::new_with_memory_reserves_and_writer_threads(
+            max_workers,
+            loadavg_high_watermark_1m_milli,
+            memory_reserve_bytes,
+            emergency_memory_reserve_bytes,
+            1,
+        )
+    }
+
+    fn new_with_memory_reserves_and_writer_threads(
+        max_workers: usize,
+        loadavg_high_watermark_1m_milli: Option<u32>,
+        memory_reserve_bytes: usize,
+        emergency_memory_reserve_bytes: usize,
+        writer_threads_per_builder: usize,
+    ) -> Self {
         let memory_reserve_bytes = memory_reserve_bytes.max(1);
         Self {
             max_workers: max_workers.max(1),
+            writer_threads_per_builder: writer_threads_per_builder.max(1),
             loadavg_high_watermark_1m_milli,
             memory_reserve_bytes,
             emergency_memory_reserve_bytes: emergency_memory_reserve_bytes
@@ -5866,11 +5885,15 @@ impl LexicalRebuildStagedShardBuildController {
                 usize::try_from(scaled).unwrap_or(usize::MAX)
             })
             .unwrap_or(0);
-        amplified_message_bytes
+        let estimated_indexing_bytes = amplified_message_bytes
             .max(usize_from_u64_saturating(
                 LEXICAL_REBUILD_STAGED_SHARD_BUILD_MIN_ESTIMATED_BYTES,
             ))
-            .max(1)
+            .max(1);
+        let writer_heap_bytes = (self.writer_threads_per_builder as u64)
+            .saturating_mul(LEXICAL_REBUILD_STAGED_SHARD_BUILD_WRITER_HEAP_PER_THREAD_BYTES)
+            .max(LEXICAL_REBUILD_STAGED_SHARD_BUILD_MIN_WRITER_HEAP_BYTES);
+        estimated_indexing_bytes.saturating_add(usize_from_u64_saturating(writer_heap_bytes))
     }
 }
 
@@ -10307,7 +10330,7 @@ impl LexicalRebuildPlannedShardCursor {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct LexicalRebuildShardBuilderSettings {
     max_builders: usize,
-    writer_parallelism_budget: usize,
+    writer_threads_per_builder: usize,
 }
 
 // This is only an initial builder-farm ceiling.  Actual admission uses the
@@ -10328,6 +10351,8 @@ const LEXICAL_REBUILD_STAGED_SHARD_BUILD_EMERGENCY_CEILING_BYTES: u64 = 8 * 1024
 const LEXICAL_REBUILD_STAGED_SHARD_BUILD_AMPLIFICATION_FLOOR_MILLI: u64 = 8_000;
 const LEXICAL_REBUILD_STAGED_SHARD_BUILD_AMPLIFICATION_HEADROOM_MILLI: u64 = 1_500;
 const LEXICAL_REBUILD_STAGED_SHARD_BUILD_MIN_ESTIMATED_BYTES: u64 = 512 * 1024 * 1024;
+const LEXICAL_REBUILD_STAGED_SHARD_BUILD_WRITER_HEAP_PER_THREAD_BYTES: u64 = 128 * 1024 * 1024;
+const LEXICAL_REBUILD_STAGED_SHARD_BUILD_MIN_WRITER_HEAP_BYTES: u64 = 256 * 1024 * 1024;
 
 fn lexical_rebuild_default_staged_shard_builder_parallelism_for_workers_and_memory(
     workers: usize,
@@ -10459,35 +10484,22 @@ fn lexical_rebuild_staged_shard_builder_settings(
     planned_shard_count: usize,
 ) -> LexicalRebuildShardBuilderSettings {
     let planned_shard_count = planned_shard_count.max(1);
-    let writer_parallelism_budget = settings.tantivy_writer_threads.max(1);
+    let writer_threads_per_builder = settings.tantivy_writer_threads.max(1);
     let max_builders = planned_shard_count
         .min(settings.staged_shard_builders.max(1))
-        .min(writer_parallelism_budget)
         .max(1);
     LexicalRebuildShardBuilderSettings {
         max_builders,
-        writer_parallelism_budget,
+        writer_threads_per_builder,
     }
 }
 
 fn lexical_rebuild_staged_shard_builder_writer_parallelism_for_dispatch(
-    writer_parallelism_budget: usize,
-    allowed_jobs: usize,
-    dispatch_slot_index: usize,
+    writer_threads_per_builder: usize,
+    _allowed_jobs: usize,
+    _dispatch_slot_index: usize,
 ) -> usize {
-    let writer_parallelism_budget = writer_parallelism_budget.max(1);
-    let allowed_jobs = allowed_jobs.max(1);
-    if dispatch_slot_index >= allowed_jobs {
-        return 1;
-    }
-    if allowed_jobs >= writer_parallelism_budget {
-        return 1;
-    }
-
-    let base = writer_parallelism_budget / allowed_jobs;
-    let remainder = writer_parallelism_budget % allowed_jobs;
-    base.saturating_add(usize::from(dispatch_slot_index < remainder))
-        .max(1)
+    writer_threads_per_builder.max(1)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19346,8 +19358,8 @@ fn rebuild_tantivy_from_db_via_staged_shards(
         planned_shards = shard_plan.shards.len(),
         plan_id = %shard_plan.plan_id,
         shard_builders_max = shard_builder_settings.max_builders,
-        shard_builder_writer_parallelism_budget =
-            shard_builder_settings.writer_parallelism_budget,
+        shard_builder_writer_threads_per_builder =
+            shard_builder_settings.writer_threads_per_builder,
         eager_merge_workers = shard_merge_settings.workers,
         "running fresh authoritative lexical rebuild via staged shard-build path"
     );
@@ -19406,10 +19418,14 @@ fn rebuild_tantivy_from_db_via_staged_shards(
         shard_merge_settings.workers,
         pipeline_settings.controller_loadavg_high_watermark_1m_milli,
     );
-    let staged_shard_build_controller = LexicalRebuildStagedShardBuildController::new(
-        shard_builder_settings.max_builders,
-        pipeline_settings.controller_loadavg_high_watermark_1m_milli,
-    );
+    let staged_shard_build_controller =
+        LexicalRebuildStagedShardBuildController::new_with_memory_reserves_and_writer_threads(
+            shard_builder_settings.max_builders,
+            pipeline_settings.controller_loadavg_high_watermark_1m_milli,
+            lexical_rebuild_staged_shard_build_memory_reserve_bytes(),
+            lexical_rebuild_staged_shard_build_emergency_memory_reserve_bytes(),
+            shard_builder_settings.writer_threads_per_builder,
+        );
     let shard_build_telemetry = LexicalRebuildShardBuildTelemetry::default();
     let mut max_conversation_id = 0i64;
     let mut max_message_id = 0i64;
@@ -19498,7 +19514,7 @@ fn rebuild_tantivy_from_db_via_staged_shards(
                 let dispatch_slot_index = *active_shard_build_jobs;
                 work.writer_parallelism =
                     lexical_rebuild_staged_shard_builder_writer_parallelism_for_dispatch(
-                        shard_builder_settings.writer_parallelism_budget,
+                        shard_builder_settings.writer_threads_per_builder,
                         staged_shard_build_runtime.allowed_jobs,
                         dispatch_slot_index,
                     );
@@ -34892,7 +34908,7 @@ mod tests {
             GIB,
         );
         let runtime = LexicalRebuildPipelineRuntimeSnapshot {
-            host_available_memory_bytes: Some(768 * MIB as u64),
+            host_available_memory_bytes: Some(1024 * MIB as u64),
             ..LexicalRebuildPipelineRuntimeSnapshot::default()
         };
         let staged_merge_runtime = LexicalRebuildStagedMergeRuntimeSnapshot::default();
@@ -34904,9 +34920,9 @@ mod tests {
             decision.controller_reason,
             format!(
                 "host_available_memory_bytes_{}_below_emergency_reserve_{}_admitting_single_small_staged_shard_build_estimated_builder_bytes_{}",
-                768 * MIB,
+                1024 * MIB,
                 GIB,
-                512 * MIB
+                768 * MIB
             )
         );
     }
@@ -34956,9 +34972,44 @@ mod tests {
                 "host_available_memory_bytes_{}_reserve_{}_estimated_builder_bytes_{}_limiting_staged_shard_builds_to_1",
                 8 * GIB,
                 4 * GIB,
-                36usize * (64usize << 20)
+                36usize * (64usize << 20) + 256usize * 1024usize * 1024usize
             )
         );
+    }
+
+    #[test]
+    fn lexical_rebuild_staged_shard_build_controller_accounts_for_writer_heap() {
+        const GIB: usize = 1024 * 1024 * 1024;
+        let runtime = LexicalRebuildPipelineRuntimeSnapshot {
+            host_available_memory_bytes: Some(8 * GIB as u64),
+            ..LexicalRebuildPipelineRuntimeSnapshot::default()
+        };
+        let staged_merge_runtime = LexicalRebuildStagedMergeRuntimeSnapshot::default();
+        let one_thread =
+            LexicalRebuildStagedShardBuildController::new_with_memory_reserves_and_writer_threads(
+                8,
+                None,
+                4 * GIB,
+                GIB,
+                1,
+            );
+        let eight_threads =
+            LexicalRebuildStagedShardBuildController::new_with_memory_reserves_and_writer_threads(
+                8,
+                None,
+                4 * GIB,
+                GIB,
+                8,
+            );
+
+        let one_thread_decision =
+            one_thread.decide(&runtime, &staged_merge_runtime, 0, 8, Some(64 << 20));
+        let eight_thread_decision =
+            eight_threads.decide(&runtime, &staged_merge_runtime, 0, 8, Some(64 << 20));
+
+        assert_eq!(one_thread_decision.allowed_jobs, 4);
+        assert_eq!(eight_thread_decision.allowed_jobs, 2);
+        assert!(eight_thread_decision.allowed_jobs < one_thread_decision.allowed_jobs);
     }
 
     #[test]
@@ -35485,7 +35536,7 @@ mod tests {
     }
 
     #[test]
-    fn lexical_rebuild_staged_shard_builder_settings_preserve_total_writer_budget() {
+    fn lexical_rebuild_staged_shard_builder_settings_separate_builder_and_writer_fanout() {
         let settings = LexicalRebuildPipelineSettingsSnapshot {
             workers: 12,
             available_parallelism: 12,
@@ -35516,46 +35567,58 @@ mod tests {
             lexical_rebuild_staged_shard_builder_settings(&settings, 3),
             LexicalRebuildShardBuilderSettings {
                 max_builders: 3,
-                writer_parallelism_budget: 8,
+                writer_threads_per_builder: 8,
             }
         );
         assert_eq!(
             lexical_rebuild_staged_shard_builder_settings(&settings, 32),
             LexicalRebuildShardBuilderSettings {
                 max_builders: 8,
-                writer_parallelism_budget: 8,
+                writer_threads_per_builder: 8,
             }
         );
 
-        let constrained_writer_budget = LexicalRebuildPipelineSettingsSnapshot {
+        let constrained_writer_threads = LexicalRebuildPipelineSettingsSnapshot {
             tantivy_writer_threads: 4,
+            ..settings.clone()
+        };
+        assert_eq!(
+            lexical_rebuild_staged_shard_builder_settings(&constrained_writer_threads, 32),
+            LexicalRebuildShardBuilderSettings {
+                max_builders: 8,
+                writer_threads_per_builder: 4,
+            }
+        );
+
+        let many_builders_low_writer_threads = LexicalRebuildPipelineSettingsSnapshot {
+            tantivy_writer_threads: 3,
+            staged_shard_builders: 16,
             ..settings
         };
         assert_eq!(
-            lexical_rebuild_staged_shard_builder_settings(&constrained_writer_budget, 32),
+            lexical_rebuild_staged_shard_builder_settings(&many_builders_low_writer_threads, 32),
             LexicalRebuildShardBuilderSettings {
-                max_builders: 4,
-                writer_parallelism_budget: 4,
+                max_builders: 16,
+                writer_threads_per_builder: 3,
             }
         );
     }
 
     #[test]
-    fn lexical_rebuild_staged_shard_builder_dispatch_writer_parallelism_rebalances_budget() {
+    fn lexical_rebuild_staged_shard_builder_dispatch_uses_per_builder_cap() {
         let balanced = (0..6)
             .map(|slot| {
                 lexical_rebuild_staged_shard_builder_writer_parallelism_for_dispatch(8, 6, slot)
             })
             .collect::<Vec<_>>();
-        assert_eq!(balanced, vec![2, 2, 1, 1, 1, 1]);
-        assert_eq!(balanced.iter().sum::<usize>(), 8);
+        assert_eq!(balanced, vec![8; 6]);
 
         let widened = (0..2)
             .map(|slot| {
                 lexical_rebuild_staged_shard_builder_writer_parallelism_for_dispatch(8, 2, slot)
             })
             .collect::<Vec<_>>();
-        assert_eq!(widened, vec![4, 4]);
+        assert_eq!(widened, vec![8, 8]);
     }
 
     #[test]
