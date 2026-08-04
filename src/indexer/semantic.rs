@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -899,45 +899,36 @@ fn fetch_bounded_semantic_candidate_conversation_ids(
         // ineligible parents and retained more than 2 GiB before finding two
         // candidates.
         //
-        // `messages.id` is the canonical INTEGER PRIMARY KEY cursor.  Force a
-        // table/rowid traversal so FrankenSQLite can stream every eligible
-        // post-cursor message through one statement.  A bounded BTreeSet keeps
-        // only the smallest `max_candidates` conversation IDs.  This final
-        // reconciliation is essential: messages may be appended to older
-        // conversations, so global message-id order is not necessarily
-        // conversation-id order, while the durable conversation checkpoint
-        // must advance in ascending order without skipping an older candidate.
-        let mut selected = BTreeSet::new();
+        // `messages.id` remains the canonical global message cursor, but the
+        // result we need is a bounded set of conversation IDs.  Ask the
+        // covering `(conversation_id, idx)` index to group and order those
+        // candidates directly.  The old `NOT INDEXED` path scanned the entire
+        // messages table for every checkpoint batch, which made a 4M-message
+        // archive spend minutes selecting just 64 conversations.
+        //
+        // The conversation predicate is intentionally retained: a durable
+        // conversation cursor must advance monotonically, while the message
+        // cursor prevents already-embedded tails from being materialized.
+        let mut selected = Vec::with_capacity(max_candidates);
         let mut rows_scanned = 0_usize;
         storage
             .raw()
             .query_with_params_for_each(
                 "SELECT conversation_id
-                 FROM messages NOT INDEXED
-                 WHERE id > ?1 AND conversation_id > ?2",
+                 FROM messages
+                 WHERE id > ?1 AND conversation_id > ?2
+                 GROUP BY conversation_id
+                 ORDER BY conversation_id ASC
+                 LIMIT ?3",
                 &[
                     SqliteValue::from(after_message_id),
                     SqliteValue::from(after_conversation_id),
+                    SqliteValue::from(i64::try_from(max_candidates).unwrap_or(i64::MAX)),
                 ],
                 |row| {
                     let conversation_id: i64 = row.get_typed(0)?;
                     rows_scanned = rows_scanned.saturating_add(1);
-                    if selected.contains(&conversation_id) {
-                        return Ok(());
-                    }
-                    if selected.len() < max_candidates {
-                        selected.insert(conversation_id);
-                        return Ok(());
-                    }
-                    if selected
-                        .last()
-                        .is_some_and(|largest| conversation_id < *largest)
-                    {
-                        selected.insert(conversation_id);
-                        if let Some(largest) = selected.last().copied() {
-                            selected.remove(&largest);
-                        }
-                    }
+                    selected.push(conversation_id);
                     Ok(())
                 },
             )
@@ -946,7 +937,7 @@ fn fetch_bounded_semantic_candidate_conversation_ids(
                     "streaming semantic candidates after conversation {after_conversation_id} and message {after_message_id}"
                 )
             })?;
-        return Ok((selected.into_iter().collect(), rows_scanned));
+        return Ok((selected, rows_scanned));
     }
 
     // Scan the narrow parent table in bounded pages, then issue an indexed
@@ -5353,8 +5344,8 @@ mod tests {
             ]
         );
         assert_eq!(
-            eligible_message_rows_scanned, 3,
-            "the selector should stream only eligible post-cursor messages, not execute 6,668 parent probes"
+            eligible_message_rows_scanned, 2,
+            "the selector should return only the bounded candidate conversations, not stream every eligible message"
         );
         assert!(
             elapsed < std::time::Duration::from_secs(10),
