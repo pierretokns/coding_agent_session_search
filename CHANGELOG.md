@@ -15,6 +15,27 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_session_search>
 
 ---
 
+## [v0.6.24] -- 2026-08-04
+
+Performance and fork-release maintenance release.
+
+### Fixed
+
+- **Semantic resume candidate selection no longer forces a full messages-table
+  scan.** The post-checkpoint selector now uses a bounded, ordered distinct
+  query, preserving the message/conversation cursor invariants while avoiding
+  repeated O(total-messages) scans on large archives.
+- **Fork releases now validate their release contract.** Tag SemVer, Cargo
+  version, and Keep-a-Changelog heading must agree before artifact builds run.
+  Release notes, installer links, and checksum URLs resolve against the fork
+  repository instead of the upstream project.
+
+### Release engineering
+
+- Fork tags publish the existing cross-platform archives, SHA256 manifests,
+  SBOM, provenance attestations, and signatures without attempting to update
+  the upstream Homebrew or Scoop repositories.
+
 ## [v0.6.23] -- 2026-07-30
 
 **Everything landed in the 128 commits between the [v0.6.22 GitHub
@@ -1709,7 +1730,8 @@ Initial development. Project scaffolding, architecture design, and first impleme
 
 ---
 
-[Unreleased]: https://github.com/Dicklesworthstone/coding_agent_session_search/compare/v0.2.2...HEAD
+[Unreleased]: https://github.com/pierretokns/coding_agent_session_search/compare/v0.6.24...HEAD
+[v0.6.24]: https://github.com/pierretokns/coding_agent_session_search/compare/v0.6.23...v0.6.24
 [v0.2.2]: https://github.com/Dicklesworthstone/coding_agent_session_search/compare/v0.2.1...v0.2.2
 [v0.2.1]: https://github.com/Dicklesworthstone/coding_agent_session_search/compare/v0.2.0...v0.2.1
 [v0.2.0]: https://github.com/Dicklesworthstone/coding_agent_session_search/compare/v0.1.64...v0.2.0

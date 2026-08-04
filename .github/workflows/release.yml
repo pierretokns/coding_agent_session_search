@@ -33,6 +33,48 @@ jobs:
       HAS_HOMEBREW_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN != '' }}
       HAS_SCOOP_TOKEN: ${{ secrets.SCOOP_BUCKET_TOKEN != '' }}
     steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Validate SemVer tag, package version, and changelog entry
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            RAW_TAG="${GITHUB_REF#refs/tags/}"
+          else
+            RAW_TAG="${{ inputs.tag }}"
+          fi
+          if [[ ! "${RAW_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.+][0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Release tag must be SemVer with a leading v (received: ${RAW_TAG})"
+            exit 1
+          fi
+
+          VERSION="${RAW_TAG#v}"
+          CARGO_VERSION="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          if [[ "${CARGO_VERSION}" != "${VERSION}" ]]; then
+            echo "::error::Tag ${RAW_TAG} does not match Cargo.toml version ${CARGO_VERSION}."
+            exit 1
+          fi
+
+          python3 - "${VERSION}" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+
+          version = sys.argv[1]
+          changelog = Path("CHANGELOG.md").read_text(encoding="utf-8")
+          heading = re.compile(rf"^## \[v?{re.escape(version)}\](?:\s|$)", re.MULTILINE)
+          if not heading.search(changelog):
+              raise SystemExit(
+                  f"CHANGELOG.md has no release heading for v{version}; "
+                  "add the entry before tagging."
+              )
+          print(f"Release metadata validated for v{version}.")
+          PY
+
       - name: Check package manager token availability
         run: |
           if [[ "${HAS_HOMEBREW_TOKEN}" != "true" ]]; then
@@ -446,21 +488,14 @@ jobs:
           ### Quick Install (recommended)
           ```bash
           # Linux/macOS
-          curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/coding_agent_session_search/main/install.sh" | bash -s -- --easy-mode --verify
+          curl -fsSL "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/install.sh" | bash -s -- --easy-mode --verify
 
           # Windows (PowerShell)
-          & ([scriptblock]::Create((irm "https://raw.githubusercontent.com/Dicklesworthstone/coding_agent_session_search/main/install.ps1"))) -EasyMode -Verify
+          & ([scriptblock]::Create((irm "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/install.ps1"))) -EasyMode -Verify
           ```
 
-          ### Package Managers
-          ```bash
-          # Homebrew
-          brew install dicklesworthstone/tap/cass
-
-          # Scoop
-          scoop bucket add dicklesworthstone https://github.com/Dicklesworthstone/scoop-bucket
-          scoop install dicklesworthstone/cass
-          ```
+          Package-manager instructions are published by the upstream repository;
+          fork releases install directly from this repository's signed assets.
 
           ### Verify Downloads
           All binaries include SHA256 checksums. Download `SHA256SUMS.txt` and verify:
@@ -580,6 +615,7 @@ jobs:
     name: Notify Homebrew Tap
     runs-on: ubuntu-latest
     needs: release
+    if: github.repository == 'Dicklesworthstone/coding_agent_session_search'
     timeout-minutes: 5
     env:
       HAS_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN != '' }}
@@ -611,7 +647,7 @@ jobs:
         id: checksums
         shell: bash
         run: |
-          BASE_URL="https://github.com/Dicklesworthstone/coding_agent_session_search/releases/download/v${{ needs.release.outputs.version }}"
+          BASE_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/v${{ needs.release.outputs.version }}"
 
           resolve_checksum() {
             local asset="$1"
@@ -792,6 +828,7 @@ jobs:
     name: Notify Scoop Bucket
     runs-on: ubuntu-latest
     needs: release
+    if: github.repository == 'Dicklesworthstone/coding_agent_session_search'
     timeout-minutes: 5
     # Don't fail the release if notification fails (token may not be configured)
     continue-on-error: true
@@ -825,7 +862,7 @@ jobs:
         id: checksums
         shell: bash
         run: |
-          BASE_URL="https://github.com/Dicklesworthstone/coding_agent_session_search/releases/download/v${{ needs.release.outputs.version }}"
+          BASE_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/v${{ needs.release.outputs.version }}"
           windows_amd64="$(curl -fsSL "${BASE_URL}/cass-windows-amd64.zip.sha256" | awk '{print $1}')"
           if [[ ! "${windows_amd64}" =~ ^[0-9a-f]{64}$ ]]; then
             echo "::error::Invalid checksum for windows_amd64: ${windows_amd64}"
@@ -844,7 +881,7 @@ jobs:
             {
               "tool": "cass",
               "version": "${{ needs.release.outputs.version }}",
-              "url": "https://github.com/Dicklesworthstone/coding_agent_session_search/releases/download/v${{ needs.release.outputs.version }}/cass-windows-amd64.zip",
+              "url": "https://github.com/${GITHUB_REPOSITORY}/releases/download/v${{ needs.release.outputs.version }}/cass-windows-amd64.zip",
               "hash": "${{ steps.checksums.outputs.windows_amd64 }}",
               "asset_name": "cass-windows-amd64.zip"
             }
