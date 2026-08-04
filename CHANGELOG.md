@@ -15,6 +15,23 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_session_search>
 
 ---
 
+## [v0.6.27] -- 2026-08-04
+
+Bounded semantic throughput release.
+
+### Added
+
+- **Optional two-worker native MiniLM embedding.** Set
+  `CASS_SEMANTIC_EMBED_WORKERS=2` for large batches. The workers preserve
+  input order and exact vectors while keeping the pool bounded; the default
+  remains one model to avoid imposing the extra memory cost on ordinary users.
+
+### Verified
+
+- On the local Apple Silicon model bundle, two workers measured 1.97× the
+  throughput of one worker for matched 128-document batches at 465 MiB peak
+  RSS, with an exact-vector determinism regression passing.
+
 ## [v0.6.26] -- 2026-08-04
 
 Semantic backfill guardrail follow-up release.

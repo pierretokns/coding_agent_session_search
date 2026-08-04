@@ -29,7 +29,9 @@ use crate::model::conversation_packet::{ConversationPacket, ConversationPacketPr
 use crate::model::types::{Conversation, Message};
 use crate::search::canonicalize::{canonicalize_for_embedding, content_hash};
 use crate::search::embedder::Embedder;
-use crate::search::fastembed_embedder::{FastEmbedder, MINILM_VECTOR_SPACE_REVISION};
+use crate::search::fastembed_embedder::{
+    FastEmbedder, MINILM_VECTOR_SPACE_REVISION, ParallelFastEmbedder,
+};
 use crate::search::hash_embedder::HashEmbedder;
 use crate::search::policy::{CHUNKING_STRATEGY_VERSION, SEMANTIC_SCHEMA_VERSION, SemanticPolicy};
 use crate::search::semantic_manifest::{
@@ -71,6 +73,10 @@ const DEFAULT_SEMANTIC_MAX_BYTES_PER_CHECKPOINT: u64 = 8 * 1024 * 1024;
 /// canonicalization. Set `CASS_SEMANTIC_MAX_RAW_MESSAGE_BYTES=0` only when an
 /// operator has explicitly accepted unbounded pathological-input risk.
 const DEFAULT_SEMANTIC_MAX_RAW_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+/// Maximum number of independently loaded native MiniLM workers. Set
+/// `CASS_SEMANTIC_EMBED_WORKERS=2` for large batches after accepting the extra
+/// model RSS; one worker remains the low-memory default.
+const DEFAULT_SEMANTIC_EMBED_WORKERS: usize = 1;
 const DEFAULT_SEMANTIC_RECONCILIATION_SCAN_CONVERSATIONS: usize = 64;
 const SEMANTIC_PREP_MEMO_ALGORITHM: &str = "semantic_prepare_window";
 const SEMANTIC_PREP_MEMO_VERSION: &str = "canonicalize_for_embedding:v2:stable-content-hash";
@@ -129,6 +135,14 @@ fn resolved_semantic_max_raw_message_bytes() -> usize {
         "CASS_SEMANTIC_MAX_RAW_MESSAGE_BYTES",
         DEFAULT_SEMANTIC_MAX_RAW_MESSAGE_BYTES,
     )
+}
+
+fn resolved_semantic_embed_workers() -> usize {
+    resolved_env_usize(
+        "CASS_SEMANTIC_EMBED_WORKERS",
+        DEFAULT_SEMANTIC_EMBED_WORKERS,
+    )
+    .clamp(1, 2)
 }
 
 fn resolved_semantic_embed_batch_warn_after_ms() -> u64 {
@@ -2066,10 +2080,22 @@ impl SemanticIndexer {
                 } else {
                     embedder_type
                 };
-                Box::new(
-                    FastEmbedder::load_by_name(dir, embedder_name)
-                        .map_err(|e| anyhow::anyhow!("fastembed unavailable: {e}"))?,
-                )
+                let worker_count = resolved_semantic_embed_workers();
+                if worker_count > 1 {
+                    let model_dir = FastEmbedder::runtime_model_dir_for(dir, embedder_name)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("unknown fastembed model: {embedder_name}")
+                        })?;
+                    Box::new(
+                        ParallelFastEmbedder::load_from_dir(&model_dir, worker_count)
+                            .map_err(|e| anyhow::anyhow!("fastembed unavailable: {e}"))?,
+                    )
+                } else {
+                    Box::new(
+                        FastEmbedder::load_by_name(dir, embedder_name)
+                            .map_err(|e| anyhow::anyhow!("fastembed unavailable: {e}"))?,
+                    )
+                }
             }
             "hash" => Box::new(HashEmbedder::default()),
             other => bail!("unknown embedder: {other}"),
