@@ -333,25 +333,6 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
-      - name: Clone sibling dependencies
-        shell: bash
-        run: |
-          # Keep the asupersync sibling checkout aligned with the crates.io
-          # version pinned in Cargo.toml.
-          # Windows runners: enable long-path support. frankensqlite's default branch carries
-          # perf test-artifact paths that exceed the 260-char MAX_PATH limit and break the clone
-          # checkout ("Filename too long"). core.longpaths is Windows-only; a harmless no-op elsewhere.
-          git config --global core.longpaths true
-          git clone https://github.com/Dicklesworthstone/asupersync.git ../asupersync
-          # -f: asupersync has two docs/analysis paths that collide on case-insensitive
-          # filesystems (Windows/macOS runners), so the full-clone checkout leaves one looking
-          # "locally modified" and a plain `checkout <sha>` aborts. The colliding file is
-          # docs-only and irrelevant to the build; Linux (case-sensitive) is unaffected.
-          git -C ../asupersync checkout --quiet -f v0.3.4
-          git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite.git ../frankensqlite
-          git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection.git ../franken_agent_detection
-          git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch.git ../frankensearch
-
       - name: Download all artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -380,7 +361,15 @@ jobs:
       - name: Validate tag matches Cargo.toml version
         shell: bash
         run: |
-          CARGO_VERSION="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          CARGO_VERSION="$(awk '
+            /^\[package\]$/ { in_package=1; next }
+            /^\[/ { if (in_package) exit }
+            in_package && $1 == "version" {
+              gsub(/"/, "", $3)
+              print $3
+              exit
+            }
+          ' Cargo.toml)"
           if [[ "${CARGO_VERSION}" != "${{ steps.version.outputs.version }}" ]]; then
             echo "Tag version (${{ steps.version.outputs.version }}) does not match Cargo.toml (${CARGO_VERSION})."
             exit 1

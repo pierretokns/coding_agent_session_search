@@ -15,6 +15,10 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_session_search>
 
 ---
 
+## [Unreleased]
+
+- Speed up fork release assembly by validating the root package version without recloning sibling repositories.
+
 ## [v0.6.28] -- 2026-08-04
 
 Lexical-generation reuse release.
