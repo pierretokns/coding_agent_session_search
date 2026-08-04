@@ -26467,6 +26467,41 @@ pub mod persist {
     where
         F: FnOnce(&FrankenStorage) -> Result<T>,
     {
+        with_ephemeral_writer_mode(
+            storage,
+            defer_checkpoints,
+            context,
+            ephemeral_writer_reuse_enabled(),
+            f,
+        )
+    }
+
+    /// Reuse the short-lived writer for the incremental one-conversation path.
+    /// The storage layer rotates the cached connection at a bounded cadence,
+    /// preserving the setup win without retaining unbounded frankensqlite
+    /// page/MVCC state during long-running watch sessions.
+    pub(super) fn with_reusable_ephemeral_writer<T, F>(
+        storage: &FrankenStorage,
+        defer_checkpoints: bool,
+        context: &str,
+        f: F,
+    ) -> Result<T>
+    where
+        F: FnOnce(&FrankenStorage) -> Result<T>,
+    {
+        with_ephemeral_writer_mode(storage, defer_checkpoints, context, true, f)
+    }
+
+    fn with_ephemeral_writer_mode<T, F>(
+        storage: &FrankenStorage,
+        defer_checkpoints: bool,
+        context: &str,
+        reuse_writer: bool,
+        f: F,
+    ) -> Result<T>
+    where
+        F: FnOnce(&FrankenStorage) -> Result<T>,
+    {
         let db_path = storage
             .database_path()
             .with_context(|| format!("resolving database path for {context}"))?;
@@ -26474,13 +26509,6 @@ pub mod persist {
         // with the short-lived writer so watch-mode observability and follow-up
         // policy transitions still reflect the active ingestion mode.
         apply_index_writer_checkpoint_policy(storage, defer_checkpoints);
-        // Reusing a writer across ingest batches also reuses its frankensqlite
-        // page/MVCC state. On a long corpus that state grows even though each
-        // batch commits, eventually turning an overnight scan into a multi-GB
-        // process. Keep the safe, genuinely short-lived behavior as the default;
-        // the old reuse behavior remains available for workloads that explicitly
-        // accept its memory trade-off (and for the temp-table reuse test).
-        let reuse_writer = ephemeral_writer_reuse_enabled();
         let (writer, reusable) = if reuse_writer {
             storage.acquire_cached_ephemeral_writer()
         } else {
@@ -27201,7 +27229,7 @@ pub mod persist {
             conversation_id,
             conversation_inserted: _conversation_inserted,
             inserted_indices,
-        } = with_ephemeral_writer(storage, false, "persist_conversation", |writer| {
+        } = with_reusable_ephemeral_writer(storage, false, "persist_conversation", |writer| {
             let agent = Agent {
                 id: None,
                 slug: conv.agent_slug.clone(),
@@ -27253,7 +27281,7 @@ pub mod persist {
             conversation_id,
             conversation_inserted: _conversation_inserted,
             inserted_indices,
-        } = with_ephemeral_writer(storage, false, "persist_conversation", |writer| {
+        } = with_reusable_ephemeral_writer(storage, false, "persist_conversation", |writer| {
             let agent = Agent {
                 id: None,
                 slug: conv.agent_slug.clone(),
@@ -28015,6 +28043,55 @@ pub mod persist {
                 .unwrap();
 
             assert_eq!(count, 1, "temp table should persist on the reused writer");
+        }
+
+        #[test]
+        fn reusable_ephemeral_writer_rotates_at_bounded_lifetime() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let db_path = dir.path().join("bounded-ephemeral-writer-reuse.db");
+            let storage = create_franken_db(&db_path);
+
+            with_reusable_ephemeral_writer(
+                &storage,
+                false,
+                "bounded-ephemeral-writer-reuse",
+                |writer| {
+                    writer.raw().execute(
+                        "CREATE TEMP TABLE bounded_writer_reuse(marker INTEGER NOT NULL);",
+                    )?;
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+            // The cache must not retain one frankensqlite connection forever.
+            // After the rotation boundary a fresh connection has no temp table.
+            for _ in 1..128 {
+                with_reusable_ephemeral_writer(
+                    &storage,
+                    false,
+                    "bounded-ephemeral-writer-reuse",
+                    |_writer| Ok(()),
+                )
+                .unwrap();
+            }
+
+            let result = with_reusable_ephemeral_writer(
+                &storage,
+                false,
+                "bounded-ephemeral-writer-reuse",
+                |writer| {
+                    Ok(writer.raw().query_row_map(
+                        "SELECT COUNT(*) FROM bounded_writer_reuse;",
+                        &[],
+                        |row| row.get_typed::<i64>(0),
+                    )?)
+                },
+            );
+            assert!(
+                result.is_err(),
+                "rotated writer must not retain connection-local temp tables"
+            );
         }
 
         #[test]

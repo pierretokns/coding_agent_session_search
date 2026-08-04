@@ -3911,6 +3911,7 @@ pub struct FrankenStorage {
     index_writer_checkpoint_pages: AtomicI64,
     index_writer_busy_timeout_ms: AtomicU64,
     cached_ephemeral_writer: parking_lot::Mutex<CachedEphemeralWriter>,
+    cached_ephemeral_writer_reuse_count: AtomicU64,
     ensured_agents: Arc<parking_lot::Mutex<HashMap<EnsuredAgentKey, i64>>>,
     ensured_workspaces: Arc<parking_lot::Mutex<HashMap<EnsuredWorkspaceKey, i64>>>,
     ensured_conversation_sources: Arc<parking_lot::Mutex<HashSet<EnsuredConversationSourceKey>>>,
@@ -3922,6 +3923,10 @@ pub struct FrankenStorage {
 /// while still bounding WAL growth. Bulk index paths may override this through
 /// their explicit checkpoint policy.
 const DEFAULT_WAL_AUTOCHECKPOINT_PAGES: i64 = 4096;
+// A reused frankensqlite writer retains page/MVCC state across commits. Rotate
+// the cached connection periodically so incremental ingest gets the connection
+// setup win without allowing that state to grow for the lifetime of a watcher.
+const MAX_CACHED_EPHEMERAL_WRITER_REUSES: u64 = 128;
 const UNSET_INDEX_WRITER_CHECKPOINT_PAGES: i64 = i64::MIN;
 const UNSET_INDEX_WRITER_BUSY_TIMEOUT_MS: u64 = 0;
 const FTS_MESSAGES_PRESENT_UNKNOWN: i8 = 0;
@@ -4080,6 +4085,7 @@ impl FrankenStorage {
             index_writer_checkpoint_pages: AtomicI64::new(UNSET_INDEX_WRITER_CHECKPOINT_PAGES),
             index_writer_busy_timeout_ms: AtomicU64::new(UNSET_INDEX_WRITER_BUSY_TIMEOUT_MS),
             cached_ephemeral_writer: parking_lot::Mutex::new(CachedEphemeralWriter::Uninitialized),
+            cached_ephemeral_writer_reuse_count: AtomicU64::new(0),
             ensured_agents,
             ensured_workspaces,
             ensured_conversation_sources,
@@ -4271,19 +4277,35 @@ impl FrankenStorage {
     pub(crate) fn release_cached_ephemeral_writer(&self, writer: Self) {
         let checkpoint_pages = writer.index_writer_checkpoint_pages.load(Ordering::Relaxed);
         let busy_timeout_ms = writer.index_writer_busy_timeout_ms.load(Ordering::Relaxed);
+        let reuse_count = self
+            .cached_ephemeral_writer_reuse_count
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
         let conn = writer.into_raw();
         let mut cached = self.cached_ephemeral_writer.lock();
         debug_assert!(
             matches!(&*cached, CachedEphemeralWriter::InUse),
             "cached ephemeral writer state should be in-use when releasing"
         );
-        *cached = CachedEphemeralWriter::Cached(Box::new(
-            SendFrankenConnection::new_with_index_writer_state(
-                conn,
-                checkpoint_pages,
-                busy_timeout_ms,
-            ),
-        ));
+        if reuse_count >= MAX_CACHED_EPHEMERAL_WRITER_REUSES {
+            // Drop the cached connection at a bounded cadence. The primary
+            // storage connection remains open; only the short-lived writer is
+            // rotated, keeping the next acquire on a fresh page/MVCC state.
+            *cached = CachedEphemeralWriter::Uninitialized;
+            self.cached_ephemeral_writer_reuse_count
+                .store(0, Ordering::Relaxed);
+            drop(cached);
+            let mut conn = conn;
+            conn.close_best_effort_in_place();
+        } else {
+            *cached = CachedEphemeralWriter::Cached(Box::new(
+                SendFrankenConnection::new_with_index_writer_state(
+                    conn,
+                    checkpoint_pages,
+                    busy_timeout_ms,
+                ),
+            ));
+        }
     }
 
     pub(crate) fn discard_cached_ephemeral_writer(&self, mut writer: Self) {
@@ -4291,6 +4313,8 @@ impl FrankenStorage {
         let mut cached = self.cached_ephemeral_writer.lock();
         if matches!(&*cached, CachedEphemeralWriter::InUse) {
             *cached = CachedEphemeralWriter::Uninitialized;
+            self.cached_ephemeral_writer_reuse_count
+                .store(0, Ordering::Relaxed);
         }
     }
 
