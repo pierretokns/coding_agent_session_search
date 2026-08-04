@@ -6837,7 +6837,11 @@ fn doctor_native_message_batch_rows() -> usize {
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(DOCTOR_NATIVE_MESSAGE_BATCH_ROWS)
-        .min(4096)
+        // Eight bound values are emitted per row; SQLite's default
+        // SQLITE_MAX_VARIABLE_NUMBER is 32766, so 4095 is the largest safe
+        // multi-row statement.  4096 would generate 32768 variables and fail
+        // at execution time instead of degrading safely.
+        .min(4095)
 }
 
 /// Insert recovery messages in bounded multi-row statements and return the
@@ -23937,6 +23941,12 @@ mod tests {
     }
 
     #[test]
+    fn doctor_native_message_batch_rows_respects_sqlite_variable_limit() {
+        let _rows = set_env_var("CASS_DOCTOR_NATIVE_MESSAGE_BATCH_ROWS", "4096");
+        assert_eq!(doctor_native_message_batch_rows(), 4095);
+    }
+
+    #[test]
     fn doctor_writer_applies_bounded_wal_autocheckpoint() {
         let temp = tempfile::tempdir().unwrap();
         let db_path = temp.path().join("doctor-wal.db");
@@ -23994,42 +24004,46 @@ mod tests {
         };
         let conversations = make_conversations();
 
-        let individual_path = dir.path().join("individual.db");
-        let storage = SqliteStorage::open(&individual_path).unwrap();
-        let agent_id = storage.ensure_agent(&agent).unwrap();
-        drop(storage);
-        let start = Instant::now();
-        let mut individual = DoctorSqliteWriter::open(&individual_path).unwrap();
-        for conversation in &conversations {
-            individual
-                .insert_doctor_conversation_chunk(agent_id, None, conversation)
-                .unwrap();
-        }
-        let individual_elapsed = start.elapsed();
-        drop(individual);
+        let run = |path: &PathBuf, group_size: usize| {
+            let storage = SqliteStorage::open(path).unwrap();
+            let agent_id = storage.ensure_agent(&agent).unwrap();
+            drop(storage);
+            let chunks = conversations
+                .iter()
+                .map(|conversation| (agent_id, None, conversation))
+                .collect::<Vec<_>>();
+            let start = Instant::now();
+            let mut writer = DoctorSqliteWriter::open(path).unwrap();
+            let mut outcomes = 0;
+            for group in chunks.chunks(group_size) {
+                outcomes += writer
+                    .insert_doctor_conversation_batch(group)
+                    .unwrap()
+                    .len();
+            }
+            assert_eq!(outcomes, CONVERSATIONS);
+            (start.elapsed(), outcomes)
+        };
 
-        let batch_path = dir.path().join("batch.db");
-        let storage = SqliteStorage::open(&batch_path).unwrap();
-        let agent_id = storage.ensure_agent(&agent).unwrap();
-        drop(storage);
-        let chunks = conversations
-            .iter()
-            .map(|conversation| (agent_id, None, conversation))
-            .collect::<Vec<_>>();
-        let start = Instant::now();
-        let mut batch = DoctorSqliteWriter::open(&batch_path).unwrap();
-        let outcomes = batch.insert_doctor_conversation_batch(&chunks).unwrap();
-        let batch_elapsed = start.elapsed();
-        assert_eq!(outcomes.len(), CONVERSATIONS);
-        drop(batch);
-
+        let (individual_elapsed, _) = run(&dir.path().join("individual.db"), 1);
         eprintln!(
-            "CASS_DOCTOR_BATCH_BENCH conversations={} individual_ms={} batch_ms={} speedup={:.2}x",
+            "CASS_DOCTOR_BATCH_BENCH conversations={} group_size=1 elapsed_ms={}",
             CONVERSATIONS,
-            individual_elapsed.as_secs_f64() * 1000.0,
-            batch_elapsed.as_secs_f64() * 1000.0,
-            individual_elapsed.as_secs_f64() / batch_elapsed.as_secs_f64()
+            individual_elapsed.as_secs_f64() * 1000.0
         );
+        for group_size in [4, 16, 64, 256] {
+            let (elapsed, _) = run(
+                &dir.path().join(format!("batch-{group_size}.db")),
+                group_size,
+            );
+            eprintln!(
+                "CASS_DOCTOR_BATCH_BENCH conversations={} group_size={} elapsed_ms={} speedup={:.2}x",
+                CONVERSATIONS,
+                group_size,
+                elapsed.as_secs_f64() * 1000.0,
+                individual_elapsed.as_secs_f64() / elapsed.as_secs_f64()
+            );
+        }
     }
 
     #[test]
@@ -24080,23 +24094,36 @@ mod tests {
             let agent_id = storage.ensure_agent(&agent).unwrap();
             drop(storage);
             let _rows = set_env_var("CASS_DOCTOR_NATIVE_MESSAGE_BATCH_ROWS", rows);
+            let effective_rows = doctor_native_message_batch_rows();
             let start = Instant::now();
             let mut writer = DoctorSqliteWriter::open(path).unwrap();
             let outcome = writer
                 .insert_doctor_conversation_chunk(agent_id, None, &conversation)
                 .unwrap();
             assert_eq!(outcome.inserted_indices.len(), MESSAGES);
-            start.elapsed()
+            (start.elapsed(), effective_rows)
         };
-        let scalar_elapsed = run(&dir.path().join("scalar.db"), "1");
-        let batched_elapsed = run(&dir.path().join("batched.db"), "256");
+        let (scalar_elapsed, scalar_rows) = run(&dir.path().join("scalar.db"), "1");
         eprintln!(
-            "CASS_DOCTOR_MESSAGE_BATCH_BENCH messages={} scalar_ms={} batched_ms={} speedup={:.2}x",
+            "CASS_DOCTOR_MESSAGE_BATCH_BENCH messages={} requested_rows=1 effective_rows={} elapsed_ms={}",
             MESSAGES,
-            scalar_elapsed.as_secs_f64() * 1000.0,
-            batched_elapsed.as_secs_f64() * 1000.0,
-            scalar_elapsed.as_secs_f64() / batched_elapsed.as_secs_f64()
+            scalar_rows,
+            scalar_elapsed.as_secs_f64() * 1000.0
         );
+        for rows in [64, 128, 256, 512, 1024, 2048, 4096] {
+            let (elapsed, effective_rows) = run(
+                &dir.path().join(format!("batched-{rows}.db")),
+                &rows.to_string(),
+            );
+            eprintln!(
+                "CASS_DOCTOR_MESSAGE_BATCH_BENCH messages={} requested_rows={} effective_rows={} elapsed_ms={} speedup={:.2}x",
+                MESSAGES,
+                rows,
+                effective_rows,
+                elapsed.as_secs_f64() * 1000.0,
+                scalar_elapsed.as_secs_f64() / elapsed.as_secs_f64()
+            );
+        }
     }
 
     #[test]
