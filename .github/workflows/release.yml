@@ -488,10 +488,10 @@ jobs:
           ### Quick Install (recommended)
           ```bash
           # Linux/macOS
-          curl -fsSL "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/install.sh" | bash -s -- --easy-mode --verify
+          curl -fsSL "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${TAG}/install.sh" | bash -s -- --easy-mode --verify
 
           # Windows (PowerShell)
-          & ([scriptblock]::Create((irm "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/install.ps1"))) -EasyMode -Verify
+          & ([scriptblock]::Create((irm "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${TAG}/install.ps1"))) -EasyMode -Verify
           ```
 
           Package-manager instructions are published by the upstream repository;
