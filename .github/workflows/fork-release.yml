@@ -1,0 +1,170 @@
+name: Fork Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to release (for example v0.6.24)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  validate:
+    name: Validate release metadata
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Resolve release tag
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            raw_tag="${GITHUB_REF#refs/tags/}"
+          else
+            raw_tag="${{ inputs.tag }}"
+          fi
+          if [[ ! "${raw_tag}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.+][0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Expected a SemVer tag with a leading v, got ${raw_tag}"
+            exit 1
+          fi
+          echo "tag=${raw_tag}" >> "$GITHUB_OUTPUT"
+          echo "version=${raw_tag#v}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ steps.version.outputs.tag }}
+
+      - name: Check Cargo and changelog versions
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          if [[ "${cargo_version}" != "${RELEASE_VERSION}" ]]; then
+            echo "::error::Cargo version ${cargo_version} does not match ${RELEASE_VERSION}"
+            exit 1
+          fi
+          python3 - "${RELEASE_VERSION}" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+
+          version = sys.argv[1]
+          text = Path("CHANGELOG.md").read_text(encoding="utf-8")
+          if not re.search(rf"^## \[v?{re.escape(version)}\](?:\s|$)", text, re.M):
+              raise SystemExit(f"CHANGELOG.md has no heading for v{version}")
+          PY
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: validate
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            binary: cass
+            asset: cass-linux-amd64.tar.gz
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            binary: cass
+            asset: cass-linux-arm64.tar.gz
+          - os: macos-15
+            target: aarch64-apple-darwin
+            binary: cass
+            asset: cass-darwin-arm64.tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary: cass.exe
+            asset: cass-windows-amd64.zip
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ needs.validate.outputs.tag }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db # v2
+      - name: Build release binary
+        run: cargo build --locked --release --target ${{ matrix.target }}
+      - name: Smoke-test and package Unix binary
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="target/${{ matrix.target }}/release/${{ matrix.binary }}"
+          "$binary" --version
+          mkdir -p dist
+          tar -czf "dist/${{ matrix.asset }}" -C "$(dirname "$binary")" "$(basename "$binary")"
+          shasum -a 256 "dist/${{ matrix.asset }}" > "dist/${{ matrix.asset }}.sha256"
+      - name: Smoke-test and package Windows binary
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $binary = "target/${{ matrix.target }}/release/${{ matrix.binary }}"
+          & $binary --version
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Compress-Archive -Path $binary -DestinationPath "dist/${{ matrix.asset }}"
+          $hash = (Get-FileHash -Algorithm SHA256 "dist/${{ matrix.asset }}").Hash.ToLower()
+          "$hash  ${{ matrix.asset }}" | Out-File -Encoding ASCII "dist/${{ matrix.asset }}.sha256"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
+
+  release:
+    name: Publish GitHub release
+    needs: [validate, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ needs.validate.outputs.tag }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Build canonical checksum manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd artifacts
+          : > SHA256SUMS.txt
+          for asset in *.tar.gz *.zip; do
+            [[ -f "${asset}" ]] || continue
+            sha256sum "${asset}" >> SHA256SUMS.txt
+          done
+      - name: Create and verify release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.validate.outputs.tag }}
+          VERSION: ${{ needs.validate.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release create "${TAG}" artifacts/* \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "v${VERSION}" \
+            --generate-notes \
+            --latest \
+            --verify-tag
+          gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" \
+            --json tagName,isDraft,assets \
+            --jq '{tag: .tagName, draft: .isDraft, assets: (.assets | length)}'
