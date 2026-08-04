@@ -6274,6 +6274,7 @@ pub struct DoctorSqliteWriter {
     conn: rusqlite::Connection,
     db_path: PathBuf,
     raw_mirror_tail_marker_written: bool,
+    candidate_counts_initialized: bool,
 }
 
 /// Marks a candidate whose raw-mirror reconstruction writes authoritative
@@ -6396,6 +6397,7 @@ impl DoctorSqliteWriter {
             conn,
             db_path: path.to_path_buf(),
             raw_mirror_tail_marker_written,
+            candidate_counts_initialized: false,
         })
     }
 
@@ -6456,6 +6458,7 @@ impl DoctorSqliteWriter {
             rusqlite::params![i64::from(ready)],
         )?;
         tx.commit()?;
+        self.candidate_counts_initialized = true;
         Ok(())
     }
 
@@ -6492,17 +6495,19 @@ impl DoctorSqliteWriter {
                 DOCTOR_RAW_MIRROR_TAIL_METADATA_META_VALUE,
             ],
         )?;
-        tx.execute_batch(
-            "CREATE TABLE IF NOT EXISTS cass_doctor_candidate_counts (
-                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-                conversation_count INTEGER NOT NULL,
-                message_count INTEGER NOT NULL,
-                counts_ready INTEGER NOT NULL
-            );
-            INSERT OR IGNORE INTO cass_doctor_candidate_counts
-                (singleton, conversation_count, message_count, counts_ready)
-                VALUES (1, 0, 0, 0);",
-        )?;
+        if !self.candidate_counts_initialized {
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS cass_doctor_candidate_counts (
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    conversation_count INTEGER NOT NULL,
+                    message_count INTEGER NOT NULL,
+                    counts_ready INTEGER NOT NULL
+                );
+                INSERT OR IGNORE INTO cass_doctor_candidate_counts
+                    (singleton, conversation_count, message_count, counts_ready)
+                    VALUES (1, 0, 0, 0);",
+            )?;
+        }
         doctor_native_ensure_reference_rows(&tx, chunks)?;
         let mut outcomes = Vec::with_capacity(chunks.len());
         for &(agent_id, workspace_id, raw_conv) in chunks {
@@ -6528,6 +6533,7 @@ impl DoctorSqliteWriter {
             rusqlite::params![conversation_delta, message_delta],
         )?;
         tx.commit()?;
+        self.candidate_counts_initialized = true;
         if !self.raw_mirror_tail_marker_written {
             // The database transaction is durable before this sidecar is
             // published.  A crash between the two leaves the marker absent,
