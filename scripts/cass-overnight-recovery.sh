@@ -84,7 +84,9 @@ fi
 doctor_status=0
 CASS_DOCTOR_DB_PROBE_TIMEOUT_SECS=600 \
 CASS_DOCTOR_RAW_MIRROR_FULL_VERIFY=1 \
-  "$BINARY" doctor --check --json --verbose \
+RUST_LOG=info \
+RUST_LOG_STYLE=never \
+  "$BINARY" doctor --check --json \
   --data-dir "$DATA_DIR" >"$LOG_DIR/doctor.json" 2>"$LOG_DIR/doctor.log" || doctor_status=$?
 echo "$doctor_status" > "$LOG_DIR/doctor.exit"
 
