@@ -13697,7 +13697,15 @@ fn run_semantic_native_only(
         semantic_tier.as_str(),
         semantic_indexer.embedder_id(),
     )
-    .with_progress_bump(Arc::clone(progress_bump));
+    .with_progress_bump(Arc::clone(progress_bump))
+    .with_activity_tick(Arc::new({
+        let progress = opts.progress.clone();
+        move || {
+            if let Some(progress) = progress.as_ref() {
+                progress.tick_activity();
+            }
+        }
+    }));
     let batch_conversations = semantic_first_build_batch_conversations();
 
     set_semantic_phase("semantic:replay");
@@ -15364,7 +15372,16 @@ pub fn run_index(
                 crate::indexer::semantic_progress::SemanticProgressSink::open(
                     semantic_tier.as_str(),
                     semantic_indexer.embedder_id(),
-                );
+                )
+                .with_progress_bump(Arc::clone(&progress_bump))
+                .with_activity_tick(Arc::new({
+                    let progress = opts.progress.clone();
+                    move || {
+                        if let Some(progress) = progress.as_ref() {
+                            progress.tick_activity();
+                        }
+                    }
+                }));
             let batch_conversations = semantic_first_build_batch_conversations();
 
             set_semantic_phase("semantic:replay");

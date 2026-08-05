@@ -283,6 +283,7 @@ pub struct SemanticProgressSink {
     embedder_id: String,
     started: Instant,
     progress_bump: Option<Arc<AtomicI64>>,
+    activity_tick: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 struct SinkInner {
@@ -324,6 +325,7 @@ impl SemanticProgressSink {
             embedder_id: embedder_id.to_string(),
             started: Instant::now(),
             progress_bump: None,
+            activity_tick: None,
         }
     }
 
@@ -337,6 +339,7 @@ impl SemanticProgressSink {
             embedder_id: "unknown".to_string(),
             started: Instant::now(),
             progress_bump: None,
+            activity_tick: None,
         }
     }
 
@@ -349,12 +352,23 @@ impl SemanticProgressSink {
         self
     }
 
+    /// Attach the semantic activity counter used by the stall detector. A
+    /// long valid embedding batch must count as active work even before its
+    /// conversation checkpoint is published.
+    pub fn with_activity_tick(mut self, activity_tick: Arc<dyn Fn() + Send + Sync>) -> Self {
+        self.activity_tick = Some(activity_tick);
+        self
+    }
+
     /// Cheap in-memory heartbeat used at semantic batch boundaries. The
     /// index-run heartbeat thread persists this value to the lock file; no
     /// filesystem write occurs on the embedding hot path.
     pub fn heartbeat(&self) {
         if let Some(progress_bump) = self.progress_bump.as_ref() {
             progress_bump.store(now_unix_ms(), Ordering::Relaxed);
+        }
+        if let Some(activity_tick) = self.activity_tick.as_ref() {
+            activity_tick();
         }
     }
 
