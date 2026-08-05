@@ -66,7 +66,7 @@ use crate::connectors::{
 };
 use crate::model::conversation_packet::{
     CONVERSATION_PACKET_VERSION, ConversationPacket, ConversationPacketHashes,
-    ConversationPacketProvenance, ConversationPacketSinkProjections,
+    ConversationPacketProvenance, ConversationPacketReplayText, ConversationPacketSinkProjections,
 };
 use crate::search::asset_state::{SearchMaintenanceJobKind, SearchMaintenanceMode};
 use crate::search::canonicalize::is_hard_message_noise;
@@ -4068,25 +4068,99 @@ fn lexical_rebuild_contract_from_grouped_messages(
     conversation: &crate::storage::sqlite::LexicalRebuildConversationRow,
     provenance: &LexicalRebuildPacketProvenance,
     messages: &crate::storage::sqlite::LexicalRebuildGroupedMessageRows,
-) -> ConversationPacket {
-    let canonical_messages = messages
+) -> (ConversationPacketHashes, ConversationPacketSinkProjections) {
+    let canonical = crate::model::types::Conversation {
+        id: conversation.id,
+        agent_slug: conversation.agent_slug.clone(),
+        workspace: conversation.workspace.clone(),
+        external_id: conversation.external_id.clone(),
+        title: conversation.title.clone(),
+        source_path: conversation.source_path.clone(),
+        started_at: conversation.started_at,
+        ended_at: conversation.ended_at,
+        approx_tokens: None,
+        metadata_json: serde_json::Value::Null,
+        messages: Vec::new(),
+        source_id: provenance.source_id.clone(),
+        origin_host: provenance.origin_host.clone(),
+    };
+    let replay_rows = messages
         .iter()
-        .map(|message| crate::model::types::Message {
-            id: None,
+        .map(|message| ConversationPacketReplayText {
             idx: message.idx,
             role: if message.is_tool_role {
-                crate::model::types::MessageRole::Tool
+                "tool"
             } else {
-                crate::model::types::MessageRole::Agent
+                "assistant"
             },
             author: None,
             created_at: message.created_at,
-            content: message.content.clone(),
-            extra_json: serde_json::Value::Null,
-            snippets: Vec::new(),
+            content: message.content.as_str(),
         })
         .collect::<Vec<_>>();
-    lexical_rebuild_contract_from_canonical_messages(conversation, provenance, canonical_messages)
+    ConversationPacket::canonical_replay_hashes_and_projections_from_text(
+        &canonical,
+        &lexical_rebuild_contract_provenance(provenance),
+        &serde_json::Value::Null,
+        &replay_rows,
+    )
+}
+
+fn lexical_rebuild_contract_from_replay_messages(
+    conversation: &crate::storage::sqlite::LexicalRebuildConversationRow,
+    provenance: &LexicalRebuildPacketProvenance,
+    messages: &[crate::model::types::Message],
+) -> (ConversationPacketHashes, ConversationPacketSinkProjections) {
+    let role_strings = messages
+        .iter()
+        .map(|message| match &message.role {
+            crate::model::types::MessageRole::User => "user".to_string(),
+            crate::model::types::MessageRole::Agent => "assistant".to_string(),
+            crate::model::types::MessageRole::Tool => "tool".to_string(),
+            crate::model::types::MessageRole::System => "system".to_string(),
+            crate::model::types::MessageRole::Other(other) => {
+                match other.trim().to_ascii_lowercase().as_str() {
+                    "agent" | "assistant" => "assistant".to_string(),
+                    "user" => "user".to_string(),
+                    "tool" => "tool".to_string(),
+                    "system" => "system".to_string(),
+                    other => other.to_string(),
+                }
+            }
+        })
+        .collect::<Vec<_>>();
+    let replay_rows = messages
+        .iter()
+        .zip(role_strings.iter())
+        .map(|(message, role)| ConversationPacketReplayText {
+            idx: message.idx,
+            role: role.as_str(),
+            author: message.author.as_deref(),
+            created_at: message.created_at,
+            content: message.content.as_str(),
+        })
+        .collect::<Vec<_>>();
+    let canonical = crate::model::types::Conversation {
+        id: conversation.id,
+        agent_slug: conversation.agent_slug.clone(),
+        workspace: conversation.workspace.clone(),
+        external_id: conversation.external_id.clone(),
+        title: conversation.title.clone(),
+        source_path: conversation.source_path.clone(),
+        started_at: conversation.started_at,
+        ended_at: conversation.ended_at,
+        approx_tokens: None,
+        metadata_json: serde_json::Value::Null,
+        messages: Vec::new(),
+        source_id: provenance.source_id.clone(),
+        origin_host: provenance.origin_host.clone(),
+    };
+    ConversationPacket::canonical_replay_hashes_and_projections_from_text(
+        &canonical,
+        &lexical_rebuild_contract_provenance(provenance),
+        &serde_json::Value::Null,
+        &replay_rows,
+    )
 }
 
 fn lexical_rebuild_contract_from_canonical_messages(
@@ -4124,7 +4198,7 @@ impl LexicalRebuildConversationPacket {
     ) -> Self {
         let (provenance, provenance_mode) =
             lexical_rebuild_packet_provenance_from_canonical(&conversation, source_map);
-        let contract =
+        let (contract_hashes, contract_projections) =
             lexical_rebuild_contract_from_grouped_messages(&conversation, &provenance, &messages);
         Self::from_canonical_replay_parts(
             conversation,
@@ -4132,7 +4206,8 @@ impl LexicalRebuildConversationPacket {
             last_message_id,
             provenance,
             provenance_mode,
-            contract,
+            contract_hashes,
+            contract_projections,
         )
     }
 
@@ -4143,11 +4218,8 @@ impl LexicalRebuildConversationPacket {
     ) -> Result<Self> {
         let (provenance, provenance_mode) =
             lexical_rebuild_packet_provenance_from_canonical(&conversation, source_map);
-        let contract = lexical_rebuild_contract_from_canonical_messages(
-            &conversation,
-            &provenance,
-            messages.clone(),
-        );
+        let (contract_hashes, contract_projections) =
+            lexical_rebuild_contract_from_replay_messages(&conversation, &provenance, &messages);
         let mut grouped_rows = crate::storage::sqlite::LexicalRebuildGroupedMessageRows::new();
         grouped_rows.reserve(messages.len());
         let mut last_message_id = None;
@@ -4172,7 +4244,8 @@ impl LexicalRebuildConversationPacket {
             last_message_id,
             provenance,
             provenance_mode,
-            contract,
+            contract_hashes,
+            contract_projections,
         ))
     }
 
@@ -4182,12 +4255,11 @@ impl LexicalRebuildConversationPacket {
         last_message_id: Option<i64>,
         provenance: LexicalRebuildPacketProvenance,
         provenance_mode: LexicalRebuildPacketProvenanceMode,
-        contract: ConversationPacket,
+        contract_hashes: ConversationPacketHashes,
+        contract_projections: ConversationPacketSinkProjections,
     ) -> Self {
-        let message_count = contract.payload.messages.len();
-        let message_bytes = contract.projections.lexical.total_content_bytes;
-        let contract_hashes = contract.hashes;
-        let contract_projections = contract.projections;
+        let message_count = messages.len();
+        let message_bytes = contract_projections.lexical.total_content_bytes;
         Self {
             diagnostics: LexicalRebuildPacketDiagnostics {
                 version: LEXICAL_REBUILD_PACKET_VERSION,
