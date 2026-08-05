@@ -10037,7 +10037,7 @@ impl FrankenStorage {
                 current_content_bytes = 0;
             }
 
-            let mut content: String = row.get(5)?;
+            let mut content: String = row.get(6)?;
             if current_content_bytes >= cap {
                 content.clear();
             } else {
