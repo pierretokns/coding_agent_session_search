@@ -10048,13 +10048,33 @@ impl FrankenStorage {
             }
 
             let role: String = row.get(3)?;
+            let author = match row.get_ref(4)? {
+                rusqlite::types::ValueRef::Null => None,
+                rusqlite::types::ValueRef::Text(bytes) => {
+                    Some(String::from_utf8_lossy(bytes).into_owned())
+                }
+                rusqlite::types::ValueRef::Integer(value) => Some(value.to_string()),
+                rusqlite::types::ValueRef::Real(value) => Some(value.to_string()),
+                rusqlite::types::ValueRef::Blob(bytes) => {
+                    Some(String::from_utf8_lossy(bytes).into_owned())
+                }
+            };
+            let created_at = match row.get_ref(5)? {
+                rusqlite::types::ValueRef::Null => None,
+                rusqlite::types::ValueRef::Integer(value) => Some(value),
+                rusqlite::types::ValueRef::Real(value) => Some(value as i64),
+                rusqlite::types::ValueRef::Text(bytes) => {
+                    std::str::from_utf8(bytes).ok().and_then(|value| value.parse().ok())
+                }
+                rusqlite::types::ValueRef::Blob(_) => None,
+            };
             f(LexicalRebuildMessageRow {
                 conversation_id,
                 id: row.get(0)?,
                 idx: row.get(2)?,
                 role,
-                author: row.get(4)?,
-                created_at: row.get(5)?,
+                author,
+                created_at,
                 content,
             })?;
         }
