@@ -4094,6 +4094,11 @@ impl FrankenStorage {
         }
     }
 
+    /// Return the canonical database path for bounded native read lanes.
+    pub(crate) fn db_path(&self) -> &Path {
+        &self.db_path
+    }
+
     fn apply_open_stage_busy_timeout(&self) {
         if let Err(err) = self.conn.execute("PRAGMA busy_timeout = 5000;") {
             tracing::debug!(
@@ -9973,6 +9978,87 @@ impl FrankenStorage {
             i64::MAX,
             f,
         )
+    }
+
+    /// Stream lexical rows through native SQLite for the rebuild
+    /// page-preparation hot path.  FrankenSQLite remains authoritative for
+    /// storage and indexing, but its compatibility reader currently
+    /// materializes pathological message pages before yielding rows.  This
+    /// bounded read lane keeps only one SQLite row plus the capped current
+    /// conversation in memory and never changes the canonical archive.
+    pub(crate) fn stream_messages_for_lexical_rebuild_native<F>(
+        db_path: &Path,
+        start_conversation_id: i64,
+        end_conversation_id: i64,
+        mut f: F,
+    ) -> Result<()>
+    where
+        F: FnMut(LexicalRebuildMessageRow) -> Result<()>,
+    {
+        if end_conversation_id < start_conversation_id {
+            return Ok(());
+        }
+
+        let conn = rusqlite::Connection::open_with_flags(
+            db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .with_context(|| {
+            format!(
+                "opening native SQLite lexical rebuild reader at {}",
+                db_path.display()
+            )
+        })?;
+        conn.busy_timeout(Duration::from_secs(30))?;
+        conn.execute_batch("PRAGMA query_only = ON; PRAGMA cache_size = -32768;")?;
+
+        let sql = "SELECT id, conversation_id, idx, role, author, created_at, content
+                   FROM messages
+                   WHERE conversation_id >= ?1 AND conversation_id <= ?2
+                   ORDER BY conversation_id, idx";
+        let mut statement = conn.prepare(sql).with_context(|| {
+            format!(
+                "preparing native SQLite lexical rebuild reader at {}",
+                db_path.display()
+            )
+        })?;
+        let mut rows = statement.query(rusqlite::params![
+            start_conversation_id,
+            end_conversation_id
+        ])?;
+
+        let cap = lexical_max_conversation_content_bytes();
+        let mut current_conversation_id = None;
+        let mut current_content_bytes = 0usize;
+        while let Some(row) = rows.next()? {
+            let conversation_id: i64 = row.get(1)?;
+            if current_conversation_id != Some(conversation_id) {
+                current_conversation_id = Some(conversation_id);
+                current_content_bytes = 0;
+            }
+
+            let mut content: String = row.get(5)?;
+            if current_content_bytes >= cap {
+                content.clear();
+            } else {
+                let remaining = cap - current_content_bytes;
+                let boundary = lexical_content_truncation_boundary(&content, remaining);
+                content.truncate(boundary);
+                current_content_bytes = current_content_bytes.saturating_add(boundary);
+            }
+
+            let role: String = row.get(3)?;
+            f(LexicalRebuildMessageRow {
+                conversation_id,
+                id: row.get(0)?,
+                idx: row.get(2)?,
+                role,
+                author: row.get(4)?,
+                created_at: row.get(5)?,
+                content,
+            })?;
+        }
+        Ok(())
     }
 
     /// Stream lexical rebuild message rows from a starting conversation id to
@@ -27252,6 +27338,81 @@ mod tests {
         assert_eq!(third_messages.len(), 1);
         assert_eq!(third_messages[0].content, "third-a");
         assert!(third_messages[0].extra_json.is_null());
+    }
+
+    #[test]
+    fn native_lexical_stream_preserves_order_and_roles() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let agent = Agent {
+            id: None,
+            slug: "codex".into(),
+            name: "Codex".into(),
+            version: Some("0.2.3".into()),
+            kind: AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+        let conversation = Conversation {
+            id: None,
+            agent_slug: "codex".into(),
+            workspace: Some(PathBuf::from("/tmp/workspace")),
+            external_id: Some("native-lexical-stream".into()),
+            title: Some("Native lexical stream".into()),
+            source_path: PathBuf::from("/tmp/native-lexical-stream.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_100),
+            approx_tokens: Some(42),
+            metadata_json: serde_json::Value::Null,
+            messages: vec![
+                Message {
+                    id: None,
+                    idx: 0,
+                    role: MessageRole::User,
+                    author: Some("user".into()),
+                    created_at: Some(1_700_000_000_010),
+                    content: "first".into(),
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                },
+                Message {
+                    id: None,
+                    idx: 1,
+                    role: MessageRole::Tool,
+                    author: Some("tool".into()),
+                    created_at: Some(1_700_000_000_020),
+                    content: "second".into(),
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                },
+            ],
+            source_id: LOCAL_SOURCE_ID.into(),
+            origin_host: None,
+        };
+        let conversation_id = storage
+            .insert_conversation_tree(agent_id, None, &conversation)
+            .unwrap()
+            .conversation_id;
+
+        let mut rows = Vec::new();
+        SqliteStorage::stream_messages_for_lexical_rebuild_native(
+            &db_path,
+            conversation_id,
+            conversation_id,
+            |row| {
+                rows.push(row);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].conversation_id, conversation_id);
+        assert_eq!(rows[0].idx, 0);
+        assert_eq!(rows[0].role, "user");
+        assert_eq!(rows[1].idx, 1);
+        assert_eq!(rows[1].role, "tool");
+        assert_eq!(rows[1].id, 2);
     }
 
     #[test]

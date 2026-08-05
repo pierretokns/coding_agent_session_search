@@ -17927,42 +17927,43 @@ fn prepare_lexical_rebuild_page_work(
     let mut reservation = StreamingByteReservation::new(flow_limiter, reserved_bytes);
 
     let message_fetch_started = Instant::now();
-    let grouped_messages = match storage.fetch_messages_for_lexical_rebuild_batch(
-        &conversation_ids,
-        Some(work.pipeline_budget.batch_fetch_message_limit),
-        Some(work.pipeline_budget.batch_fetch_message_bytes_limit),
-    ) {
-        Ok(grouped) => grouped,
-        Err(err) if format!("{err:#}").contains("guardrail") => {
-            tracing::warn!(
-                sequence,
-                conversations = conversation_ids.len(),
-                max_messages = work.pipeline_budget.batch_fetch_message_limit,
-                max_content_bytes = work.pipeline_budget.batch_fetch_message_bytes_limit,
-                error = %err,
-                "lexical rebuild page exceeded batch-fetch guardrail inside page-prep worker; falling back to per-conversation fetches"
-            );
-            let mut grouped = HashMap::with_capacity(conversation_ids.len());
-            for conversation_id in &conversation_ids {
-                let messages = storage
-                    .fetch_messages_for_lexical_rebuild(*conversation_id)
-                    .with_context(|| {
-                        format!(
-                            "fetching lexical rebuild messages for conversation {}",
-                            conversation_id
-                        )
-                    })?;
-                grouped.insert(*conversation_id, messages);
-            }
-            grouped
-        }
-        Err(err) => {
-            return Err(err).context(format!(
-                "fetching lexical rebuild messages for {} conversations",
-                conversation_ids.len()
-            ));
-        }
-    };
+    let mut grouped_messages = HashMap::with_capacity(conversation_ids.len());
+    let start_conversation_id = conversation_ids.first().copied().unwrap_or_default();
+    let end_conversation_id = conversation_ids.last().copied().unwrap_or_default();
+    crate::storage::sqlite::FrankenStorage::stream_messages_for_lexical_rebuild_native(
+        storage.db_path(),
+        start_conversation_id,
+        end_conversation_id,
+        |row| {
+            let role = match row.role.to_ascii_lowercase().as_str() {
+                "user" => crate::model::types::MessageRole::User,
+                "agent" | "assistant" => crate::model::types::MessageRole::Agent,
+                "tool" => crate::model::types::MessageRole::Tool,
+                "system" => crate::model::types::MessageRole::System,
+                other => crate::model::types::MessageRole::Other(other.to_string()),
+            };
+            grouped_messages
+                .entry(row.conversation_id)
+                .or_insert_with(Vec::new)
+                .push(crate::model::types::Message {
+                    id: Some(row.id),
+                    idx: row.idx,
+                    role,
+                    author: row.author,
+                    created_at: row.created_at,
+                    content: row.content,
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                });
+            Ok(())
+        },
+    )
+    .with_context(|| {
+        format!(
+            "streaming native SQLite lexical rebuild messages for {} conversations",
+            conversation_ids.len()
+        )
+    })?;
     let message_fetch_duration = message_fetch_started.elapsed();
 
     let packet_prepare_started = Instant::now();
