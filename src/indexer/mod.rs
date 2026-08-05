@@ -2762,7 +2762,6 @@ fn try_readonly_canonical_force_rebuild(
         })?;
         return Ok(false);
     }
-    let total_messages = count_total_messages_exact(&storage)?;
     storage.close_without_checkpoint().with_context(|| {
         format!(
             "closing canonical database before read-only force rebuild: {}",
@@ -2773,7 +2772,7 @@ fn try_readonly_canonical_force_rebuild(
     tracing::info!(
         db_path = %opts.db_path.display(),
         conversations = total_conversations,
-        messages = total_messages,
+        messages = "deferred_until_rebuild",
         "running force rebuild from populated canonical database without writable storage preflight"
     );
     record_lexical_population_strategy(
@@ -2802,8 +2801,11 @@ fn try_readonly_canonical_force_rebuild(
         stats.scan_ms = 0;
         stats.index_ms = rebuild_start.elapsed().as_millis() as u64;
         stats.total_conversations = total_conversations;
-        stats.total_messages = total_messages;
-        stats.total_counts_exact = true;
+        // Message totals are intentionally populated from the rebuild's
+        // observed rows below; the preflight no longer performs a blocking
+        // full-table COUNT(*) over the native-created archive.
+        stats.total_messages = 0;
+        stats.total_counts_exact = false;
     }
     if let Some(observed_messages) = rebuild.observed_messages {
         record_exact_total_counts_in_progress(

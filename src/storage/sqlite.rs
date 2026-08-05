@@ -4437,8 +4437,30 @@ impl FrankenStorage {
     pub fn open_readonly_with_doctor_lock_timeout(path: &Path, timeout: Duration) -> Result<Self> {
         let path_str = path.to_string_lossy().to_string();
         let _doctor_guard = acquire_doctor_mutation_db_open_guard(path, timeout)?;
-        let conn = open_franken_with_flags(&path_str, FrankenOpenFlags::SQLITE_OPEN_READ_ONLY)
-            .with_context(|| format!("opening frankensqlite db readonly at {}", path.display()))?;
+        let conn = match open_franken_with_flags(&path_str, FrankenOpenFlags::SQLITE_OPEN_READ_ONLY)
+        {
+            Ok(conn) => conn,
+            Err(readonly_err) => {
+                // Native SQLite recovery archives can contain valid overflow
+                // ownership/layouts that FrankenSQLite's eager read-only
+                // loader rejects before any query runs. The existing-schema
+                // lane leaves canonical rows pager-backed and is already used
+                // for the narrowly scoped FTS repair path. Retry that lane,
+                // then apply query_only below so this compatibility fallback
+                // cannot become an accidental writer.
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %readonly_err,
+                    "frankensqlite direct readonly open failed; retrying pager-backed schema-only compatibility lane"
+                );
+                FrankenConnection::open_existing_schema_only(&path_str).with_context(|| {
+                    format!(
+                        "opening frankensqlite db readonly or schema-only at {} (direct readonly error: {readonly_err})",
+                        path.display()
+                    )
+                })?
+            }
+        };
         let storage = Self::new(conn, path.to_path_buf());
         storage.apply_readonly_config()?;
         Ok(storage)
