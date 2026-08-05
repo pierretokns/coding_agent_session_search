@@ -2738,6 +2738,29 @@ fn should_try_readonly_canonical_force_rebuild(opts: &IndexOptions) -> bool {
         && opts.db_path.exists()
 }
 
+fn native_sqlite_count_conversations_for_force_rebuild(db_path: &Path) -> Result<usize> {
+    let conn = rusqlite::Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| {
+        format!(
+            "opening native SQLite readonly count connection for force rebuild: {}",
+            db_path.display()
+        )
+    })?;
+    conn.busy_timeout(Duration::from_secs(30))?;
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM conversations", [], |row| row.get(0))
+        .with_context(|| {
+            format!(
+                "counting conversations with native SQLite for force rebuild: {}",
+                db_path.display()
+            )
+        })?;
+    Ok(usize::try_from(count.max(0)).unwrap_or(usize::MAX))
+}
+
 fn try_readonly_canonical_force_rebuild(
     opts: &IndexOptions,
     progress_bump: &Arc<AtomicI64>,
@@ -2746,28 +2769,10 @@ fn try_readonly_canonical_force_rebuild(
         return Ok(false);
     }
 
-    let storage = FrankenStorage::open_readonly(&opts.db_path).with_context(|| {
-        format!(
-            "opening canonical database read-only for force rebuild: {}",
-            opts.db_path.display()
-        )
-    })?;
-    let total_conversations = count_total_conversations_exact(&storage)?;
+    let total_conversations = native_sqlite_count_conversations_for_force_rebuild(&opts.db_path)?;
     if total_conversations == 0 {
-        storage.close_without_checkpoint().with_context(|| {
-            format!(
-                "closing empty canonical database after read-only force rebuild preflight: {}",
-                opts.db_path.display()
-            )
-        })?;
         return Ok(false);
     }
-    storage.close_without_checkpoint().with_context(|| {
-        format!(
-            "closing canonical database before read-only force rebuild: {}",
-            opts.db_path.display()
-        )
-    })?;
 
     tracing::info!(
         db_path = %opts.db_path.display(),
