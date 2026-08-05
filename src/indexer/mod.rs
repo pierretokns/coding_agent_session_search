@@ -2793,7 +2793,7 @@ fn try_readonly_canonical_force_rebuild(
 
     ensure_readonly_canonical_lexical_rebuild_storage_headroom(&opts.data_dir, &opts.db_path)?;
     let rebuild_start = Instant::now();
-    let rebuild = rebuild_tantivy_from_db_deferred_startup_with_progress_bump(
+    let rebuild = rebuild_tantivy_from_db_force_rebuild_with_progress_bump(
         &opts.db_path,
         &opts.data_dir,
         total_conversations,
@@ -9378,6 +9378,7 @@ pub(crate) struct LexicalRebuildOutcome {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct LexicalRebuildStartupOptions {
     defer_initial_content_fingerprint: bool,
+    skip_expensive_shard_plan: bool,
 }
 
 fn should_evaluate_incremental_canonical_lexical_repair(
@@ -17638,6 +17639,26 @@ fn rebuild_tantivy_from_db_deferred_startup_with_progress_bump(
     )
 }
 
+fn rebuild_tantivy_from_db_force_rebuild_with_progress_bump(
+    db_path: &Path,
+    data_dir: &Path,
+    total_conversations: usize,
+    progress: Option<Arc<IndexingProgress>>,
+    progress_bump: Arc<AtomicI64>,
+) -> Result<LexicalRebuildOutcome> {
+    rebuild_tantivy_from_db_with_options(
+        db_path,
+        data_dir,
+        total_conversations,
+        progress,
+        LexicalRebuildStartupOptions {
+            defer_initial_content_fingerprint: true,
+            skip_expensive_shard_plan: true,
+        },
+        Some(progress_bump),
+    )
+}
+
 fn rebuild_tantivy_from_db_deferred_startup_with_options(
     db_path: &Path,
     data_dir: &Path,
@@ -17652,6 +17673,7 @@ fn rebuild_tantivy_from_db_deferred_startup_with_options(
         progress,
         LexicalRebuildStartupOptions {
             defer_initial_content_fingerprint: true,
+            skip_expensive_shard_plan: false,
         },
         progress_bump,
     )
@@ -20859,15 +20881,16 @@ fn rebuild_tantivy_from_db_with_options(
     // carve-out's bead-0k0sk follow-up is this fix).
     let page_size = LEXICAL_REBUILD_PAGE_SIZE;
     let pipeline_settings = lexical_rebuild_pipeline_settings_snapshot();
-    let staged_shard_plan = if restart_from_zero && total_conversations > 0 {
-        Some(plan_lexical_rebuild_shards_from_storage_with_settings(
-            &storage,
-            &pipeline_settings,
-            total_conversations,
-        )?)
-    } else {
-        None
-    };
+    let staged_shard_plan =
+        if restart_from_zero && total_conversations > 0 && !options.skip_expensive_shard_plan {
+            Some(plan_lexical_rebuild_shards_from_storage_with_settings(
+                &storage,
+                &pipeline_settings,
+                total_conversations,
+            )?)
+        } else {
+            None
+        };
     if staged_shard_plan.is_some() {
         log_prep_step("plan_lexical_shards", &mut prep_step_started);
     }
@@ -44795,6 +44818,7 @@ mod tests {
                 None,
                 LexicalRebuildStartupOptions {
                     defer_initial_content_fingerprint: true,
+                    skip_expensive_shard_plan: false,
                 },
                 None,
             )
@@ -44858,6 +44882,7 @@ mod tests {
             None,
             LexicalRebuildStartupOptions {
                 defer_initial_content_fingerprint: true,
+                skip_expensive_shard_plan: false,
             },
             None,
         )
@@ -45001,6 +45026,7 @@ mod tests {
                 None,
                 LexicalRebuildStartupOptions {
                     defer_initial_content_fingerprint: true,
+                    skip_expensive_shard_plan: false,
                 },
                 None,
             )
@@ -45116,6 +45142,7 @@ mod tests {
                 None,
                 LexicalRebuildStartupOptions {
                     defer_initial_content_fingerprint: true,
+                    skip_expensive_shard_plan: false,
                 },
                 None,
             )
@@ -45228,6 +45255,7 @@ mod tests {
                 None,
                 LexicalRebuildStartupOptions {
                     defer_initial_content_fingerprint: true,
+                    skip_expensive_shard_plan: false,
                 },
                 None,
             )
@@ -46896,6 +46924,7 @@ mod tests {
                 None,
                 LexicalRebuildStartupOptions {
                     defer_initial_content_fingerprint: true,
+                    skip_expensive_shard_plan: false,
                 },
                 None,
             )
