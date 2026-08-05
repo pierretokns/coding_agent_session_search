@@ -2662,6 +2662,10 @@ impl SemanticIndexer {
                 }
                 let batch_started = Instant::now();
                 flush_prepared_batch(batch, &mut embeddings, &pb, self.embedder.as_ref())?;
+                // Keep the index-run watchdog alive even when JSONL telemetry
+                // is disabled. Long native MiniLM batches are valid work, not
+                // evidence of a storage wedge.
+                sink.heartbeat();
                 let elapsed_ms = saturating_u64_from_millis(batch_started.elapsed().as_millis());
                 rows_processed = rows_processed.saturating_add(batch_rows);
                 on_progress(

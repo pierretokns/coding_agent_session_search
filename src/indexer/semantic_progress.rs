@@ -21,7 +21,8 @@
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
@@ -281,6 +282,7 @@ pub struct SemanticProgressSink {
     tier: String,
     embedder_id: String,
     started: Instant,
+    progress_bump: Option<Arc<AtomicI64>>,
 }
 
 struct SinkInner {
@@ -321,6 +323,7 @@ impl SemanticProgressSink {
             tier: tier.to_string(),
             embedder_id: embedder_id.to_string(),
             started: Instant::now(),
+            progress_bump: None,
         }
     }
 
@@ -333,6 +336,25 @@ impl SemanticProgressSink {
             tier: "unknown".to_string(),
             embedder_id: "unknown".to_string(),
             started: Instant::now(),
+            progress_bump: None,
+        }
+    }
+
+    /// Attach the index-run watchdog's atomic progress clock. This is kept
+    /// independent from JSONL telemetry: a production recovery run must
+    /// refresh its heartbeat even when `CASS_SEMANTIC_PROGRESS_JSONL` is not
+    /// enabled.
+    pub fn with_progress_bump(mut self, progress_bump: Arc<AtomicI64>) -> Self {
+        self.progress_bump = Some(progress_bump);
+        self
+    }
+
+    /// Cheap in-memory heartbeat used at semantic batch boundaries. The
+    /// index-run heartbeat thread persists this value to the lock file; no
+    /// filesystem write occurs on the embedding hot path.
+    pub fn heartbeat(&self) {
+        if let Some(progress_bump) = self.progress_bump.as_ref() {
+            progress_bump.store(now_unix_ms(), Ordering::Relaxed);
         }
     }
 
@@ -353,6 +375,7 @@ impl SemanticProgressSink {
     /// Emit one event. Best-effort: a write failure logs at debug and
     /// returns Ok — telemetry never bubbles errors into the backfill.
     pub fn emit(&self, event: SemanticProgressEvent, fields: SemanticProgressFields) {
+        self.heartbeat();
         let Some(mutex) = self.inner.as_ref() else {
             return;
         };
