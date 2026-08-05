@@ -17,6 +17,16 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_session_search>
 
 ## [Unreleased]
 
+## [v0.6.32] -- 2026-08-05
+
+Semantic recovery runner patch release.
+
+### Fixed
+
+- Keep the overnight semantic recovery payload guardrail bounded while
+  allowing valid large Codex messages, preventing repeated retries on a
+  16 MiB boundary payload.
+
 ## [v0.6.31] -- 2026-08-05
 
 Recovery and storage durability release.
