@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
 fn test_canonical_json_value(value: Value) -> Value {
@@ -229,6 +229,41 @@ fn seed_healthy_empty_index(test_home: &Path, data_dir: &Path) {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+fn write_matching_integrity_attestation(data_dir: &Path, verdict: &str) {
+    let db_path = data_dir.join("agent_search.db");
+    let wal_path = data_dir.join("agent_search.db-wal");
+    let mtime_ns = |path: &Path| {
+        fs::metadata(path)
+            .expect("attestation file metadata")
+            .modified()
+            .expect("attestation file mtime")
+            .duration_since(UNIX_EPOCH)
+            .expect("attestation mtime epoch")
+            .as_nanos() as i64
+    };
+    let checked_at_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("attestation clock")
+        .as_millis() as i64;
+    let wal_metadata = fs::metadata(&wal_path).ok();
+    let attestation = json!({
+        "version": 1,
+        "verdict": verdict,
+        "check_depth": "integrity_check",
+        "checked_at_ms": checked_at_ms,
+        "db_size_bytes": fs::metadata(&db_path).expect("db metadata").len(),
+        "db_mtime_ns": mtime_ns(&db_path),
+        "wal_size_bytes": wal_metadata.as_ref().map_or(0, |metadata| metadata.len()),
+        "wal_mtime_ns": wal_metadata.map_or(0, |_| mtime_ns(&wal_path)),
+        "detail": "synthetic cached attestation for doctor reuse regression"
+    });
+    fs::write(
+        data_dir.join("integrity_attestation.json"),
+        serde_json::to_vec_pretty(&attestation).expect("attestation json"),
+    )
+    .expect("write attestation");
 }
 
 fn write_test_sqlite_db(path: &Path, marker: &str) {
@@ -1959,6 +1994,48 @@ fn doctor_check_json_reports_read_only_truth_surface_without_writes() {
                     && check["safe_for_auto_repair"].as_bool() == Some(false)
             })),
         "semantic_model check should be structured as a non-archive derived-asset finding: {payload:#}"
+    );
+}
+
+#[test]
+fn doctor_check_reuses_matching_integrity_attestation_without_deep_probe() {
+    let test_home = tempfile::tempdir().expect("tempdir");
+    let data_dir = test_home.path().join("cass-data");
+    seed_healthy_empty_index(test_home.path(), &data_dir);
+    write_matching_integrity_attestation(&data_dir, "fail");
+
+    let out = cass_cmd(test_home.path())
+        .args([
+            "doctor",
+            "check",
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .env("CASS_DOCTOR_DB_PROBE_TIMEOUT_SECS", "1")
+        .output()
+        .expect("run cached doctor check");
+    assert!(
+        !out.status.success(),
+        "cached failed attestation should make doctor unhealthy"
+    );
+    let payload: Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    assert_eq!(
+        payload["storage_integrity"]["attestation_source"].as_str(),
+        Some("cached"),
+        "doctor should expose cached provenance: {payload:#}"
+    );
+    assert!(
+        payload["checks"]
+            .as_array()
+            .is_some_and(|checks| checks.iter().any(|check| {
+                check["name"].as_str() == Some("database")
+                    && check["status"].as_str() == Some("fail")
+                    && check["message"]
+                        .as_str()
+                        .is_some_and(|message| message.contains("cached integrity_check"))
+            })),
+        "doctor should report the cached failure instead of timing out: {payload:#}"
     );
 }
 
