@@ -17076,8 +17076,10 @@ fn index_startup_storage_headroom_requirement(
     full: bool,
     force_rebuild: bool,
 ) -> IndexStorageHeadroomRequirement {
-    if full || force_rebuild {
+    if full {
         IndexStorageHeadroomRequirement::AuthoritativeLexicalRebuild
+    } else if force_rebuild {
+        IndexStorageHeadroomRequirement::ReadOnlyCanonicalLexicalRebuild
     } else {
         IndexStorageHeadroomRequirement::IncrementalStartup
     }
@@ -42190,7 +42192,7 @@ mod tests {
     }
 
     #[test]
-    fn full_and_force_rebuild_startup_headroom_keep_archive_clone_requirement() {
+    fn full_rebuild_keeps_archive_clone_but_force_rebuild_uses_readonly_budget() {
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("agent_search.db");
         std::fs::File::create(&db_path)
@@ -42210,7 +42212,7 @@ mod tests {
         );
         assert_eq!(
             index_startup_storage_headroom_requirement(false, true),
-            IndexStorageHeadroomRequirement::AuthoritativeLexicalRebuild
+            IndexStorageHeadroomRequirement::ReadOnlyCanonicalLexicalRebuild
         );
         assert_eq!(
             required_index_headroom_bytes(
@@ -42219,7 +42221,16 @@ mod tests {
                 IndexStorageHeadroomRequirement::AuthoritativeLexicalRebuild,
             ),
             clone_requirement,
-            "full/force rebuilds still need enough scratch for atomic publish safety"
+            "full rebuilds still need enough scratch for atomic publish safety"
+        );
+        assert_eq!(
+            required_index_headroom_bytes(
+                tmp.path(),
+                &db_path,
+                IndexStorageHeadroomRequirement::ReadOnlyCanonicalLexicalRebuild,
+            ),
+            INDEX_MIN_FREE_SPACE_BYTES,
+            "populated force rebuilds must not reserve writable archive-clone space"
         );
     }
 
