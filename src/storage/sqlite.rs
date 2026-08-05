@@ -9619,54 +9619,66 @@ impl FrankenStorage {
                  FROM messages \
                  WHERE conversation_id = ?1 ORDER BY idx";
 
-        self.conn
-            .query_map_collect(hinted_sql, fparams![conversation_id], |row| {
-                let role: String = row.get_typed(2)?;
-                Ok(Message {
-                    id: Some(row.get_typed(0)?),
-                    idx: row.get_typed(1)?,
-                    role: match role.as_str() {
-                        "user" => MessageRole::User,
-                        "agent" | "assistant" => MessageRole::Agent,
-                        "tool" => MessageRole::Tool,
-                        "system" => MessageRole::System,
-                        other => MessageRole::Other(other.to_string()),
-                    },
-                    author: row.get_typed(3)?,
-                    created_at: row.get_typed(4)?,
-                    content: row.get_typed(5)?,
-                    extra_json: serde_json::Value::Null,
-                    snippets: Vec::new(),
+        // Keep the row stream bounded. `query_map_collect` is convenient for
+        // ordinary conversations, but its collector retains the driver's
+        // decoded row material until the whole result is complete. One
+        // pathological archive conversation can therefore turn a lexical
+        // rebuild into multi-gigabyte allocator churn even though the lexical
+        // projection only needs six scalar columns and message text.
+        let fetch_streamed = |sql: &str| -> Result<Vec<Message>> {
+            let mut messages = Vec::new();
+            let mut callback_error = None;
+            self.conn
+                .query_with_params_for_each(sql, &[SqliteValue::Integer(conversation_id)], |row| {
+                    if callback_error.is_some() {
+                        return Ok(());
+                    }
+                    let row_result: std::result::Result<(), frankensqlite::FrankenError> = (|| {
+                        let role: String = row.get_typed(2)?;
+                        messages.push(Message {
+                            id: Some(row.get_typed(0)?),
+                            idx: row.get_typed(1)?,
+                            role: match role.as_str() {
+                                "user" => MessageRole::User,
+                                "agent" | "assistant" => MessageRole::Agent,
+                                "tool" => MessageRole::Tool,
+                                "system" => MessageRole::System,
+                                other => MessageRole::Other(other.to_string()),
+                            },
+                            author: row.get_typed(3)?,
+                            created_at: row.get_typed(4)?,
+                            content: row.get_typed(5)?,
+                            extra_json: serde_json::Value::Null,
+                            snippets: Vec::new(),
+                        });
+                        Ok(())
+                    })(
+                    );
+                    if let Err(err) = row_result {
+                        callback_error = Some(err);
+                    }
+                    Ok(())
                 })
-            })
+                .with_context(|| {
+                    format!(
+                        "streaming messages for lexical rebuild of conversation {conversation_id}"
+                    )
+                })?;
+            if let Some(err) = callback_error {
+                return Err(anyhow!(
+                    "decoding messages for lexical rebuild of conversation {conversation_id}: {err}"
+                ));
+            }
+            Ok(messages)
+        };
+
+        fetch_streamed(hinted_sql)
             .or_else(|err| {
                 if err
                     .to_string()
                     .contains("no such index: sqlite_autoindex_messages_1")
                 {
-                    return self.conn.query_map_collect(
-                        fallback_sql,
-                        fparams![conversation_id],
-                        |row| {
-                            let role: String = row.get_typed(2)?;
-                            Ok(Message {
-                                id: Some(row.get_typed(0)?),
-                                idx: row.get_typed(1)?,
-                                role: match role.as_str() {
-                                    "user" => MessageRole::User,
-                                    "agent" | "assistant" => MessageRole::Agent,
-                                    "tool" => MessageRole::Tool,
-                                    "system" => MessageRole::System,
-                                    other => MessageRole::Other(other.to_string()),
-                                },
-                                author: row.get_typed(3)?,
-                                created_at: row.get_typed(4)?,
-                                content: row.get_typed(5)?,
-                                extra_json: serde_json::Value::Null,
-                                snippets: Vec::new(),
-                            })
-                        },
-                    );
+                    return fetch_streamed(fallback_sql);
                 }
                 Err(err)
             })
