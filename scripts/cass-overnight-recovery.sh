@@ -55,6 +55,7 @@ run_semantic_until_success() {
     attempt=$((attempt + 1))
     local semantic_status=0
     CASS_INDEX_STALL_ABORT_SECS=1800 \
+    CASS_SEMANTIC_EMBED_BATCH_CHAR_BUDGET=65536 \
       "$BINARY" index --semantic --build-hnsw --json --no-progress-events \
       --data-dir "$DATA_DIR" >"$LOG_DIR/semantic-$attempt.json" 2>"$LOG_DIR/semantic-$attempt.log" || semantic_status=$?
 
