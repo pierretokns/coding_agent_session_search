@@ -51,12 +51,16 @@ fi
 
 run_semantic_until_success() {
   local attempt=0
+  # The live Codex corpus contains a 16.9 MiB payload. Keep the guardrail
+  # bounded for recovery, but do not make the runner retry that valid record
+  # forever against the 16 MiB interactive default.
   while true; do
     attempt=$((attempt + 1))
     local semantic_status=0
     CASS_INDEX_STALL_ABORT_SECS=1800 \
     CASS_SEMANTIC_EMBED_WORKERS=2 \
     CASS_SEMANTIC_EMBED_BATCH_CHAR_BUDGET=131072 \
+    CASS_SEMANTIC_MAX_RAW_MESSAGE_BYTES=67108864 \
       "$BINARY" index --semantic --build-hnsw --json --no-progress-events \
       --data-dir "$DATA_DIR" >"$LOG_DIR/semantic-$attempt.json" 2>"$LOG_DIR/semantic-$attempt.log" || semantic_status=$?
 
