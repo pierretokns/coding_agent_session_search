@@ -482,19 +482,44 @@ fn acquire_doctor_mutation_db_open_guard(
     let deadline = Instant::now() + timeout;
     let mut backoff = Duration::from_millis(4);
     loop {
-        let file = fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&lock_path)
-            .with_context(|| {
-                format!(
-                    "opening doctor mutation lock {} before opening {}",
-                    lock_path.display(),
-                    db_path.display()
-                )
-            })?;
+        // A readonly database probe only needs to read metadata and acquire a
+        // shared lock. Opening an existing lock file read/write made status and
+        // semantic inspection fail under read-only data directories even when
+        // no repair was active. Only the first creation needs write access.
+        let file = match fs::OpenOptions::new().read(true).open(&lock_path) {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                match fs::OpenOptions::new()
+                    .create_new(true)
+                    .read(true)
+                    .write(true)
+                    .open(&lock_path)
+                {
+                    Ok(file) => file,
+                    Err(create_err) if create_err.kind() == std::io::ErrorKind::AlreadyExists => {
+                        continue;
+                    }
+                    Err(create_err) => {
+                        return Err(create_err).with_context(|| {
+                            format!(
+                                "creating doctor mutation lock {} before opening {}",
+                                lock_path.display(),
+                                db_path.display()
+                            )
+                        });
+                    }
+                }
+            }
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "opening doctor mutation lock {} before opening {}",
+                        lock_path.display(),
+                        db_path.display()
+                    )
+                });
+            }
+        };
 
         if doctor_lock_file_pid_is_current_process(&file) {
             return Ok(DoctorMutationDbOpenGuard(None));
@@ -1248,6 +1273,8 @@ pub fn fts_messages_integrity_error_from_message(
         || lower.contains("sqlite_corrupt")
         || lower.contains("databasecorrupt")
         || lower.contains("database corrupt")
+        || lower.contains("fts5: corrupt")
+        || lower.contains("corrupt %_data")
         || lower.contains("missing required")
         || (mentions_required_shadow_table
             && (lower.contains("table not found") || lower.contains("no such table")));
@@ -3902,6 +3929,7 @@ pub struct FrankenStorage {
     index_writer_checkpoint_pages: AtomicI64,
     index_writer_busy_timeout_ms: AtomicU64,
     cached_ephemeral_writer: parking_lot::Mutex<CachedEphemeralWriter>,
+    cached_ephemeral_writer_reuse_count: AtomicU64,
     ensured_agents: Arc<parking_lot::Mutex<HashMap<EnsuredAgentKey, i64>>>,
     ensured_workspaces: Arc<parking_lot::Mutex<HashMap<EnsuredWorkspaceKey, i64>>>,
     ensured_conversation_sources: Arc<parking_lot::Mutex<HashSet<EnsuredConversationSourceKey>>>,
@@ -3913,6 +3941,10 @@ pub struct FrankenStorage {
 /// while still bounding WAL growth. Bulk index paths may override this through
 /// their explicit checkpoint policy.
 const DEFAULT_WAL_AUTOCHECKPOINT_PAGES: i64 = 4096;
+// A reused frankensqlite writer retains page/MVCC state across commits. Rotate
+// the cached connection periodically so incremental ingest gets the connection
+// setup win without allowing that state to grow for the lifetime of a watcher.
+const MAX_CACHED_EPHEMERAL_WRITER_REUSES: u64 = 128;
 const UNSET_INDEX_WRITER_CHECKPOINT_PAGES: i64 = i64::MIN;
 const UNSET_INDEX_WRITER_BUSY_TIMEOUT_MS: u64 = 0;
 const FTS_MESSAGES_PRESENT_UNKNOWN: i8 = 0;
@@ -4071,12 +4103,18 @@ impl FrankenStorage {
             index_writer_checkpoint_pages: AtomicI64::new(UNSET_INDEX_WRITER_CHECKPOINT_PAGES),
             index_writer_busy_timeout_ms: AtomicU64::new(UNSET_INDEX_WRITER_BUSY_TIMEOUT_MS),
             cached_ephemeral_writer: parking_lot::Mutex::new(CachedEphemeralWriter::Uninitialized),
+            cached_ephemeral_writer_reuse_count: AtomicU64::new(0),
             ensured_agents,
             ensured_workspaces,
             ensured_conversation_sources,
             ensured_daily_stats_keys,
             fts_messages_present_cache: AtomicI8::new(FTS_MESSAGES_PRESENT_UNKNOWN),
         }
+    }
+
+    /// Return the canonical database path for bounded native read lanes.
+    pub(crate) fn db_path(&self) -> &Path {
+        &self.db_path
     }
 
     fn apply_open_stage_busy_timeout(&self) {
@@ -4262,19 +4300,35 @@ impl FrankenStorage {
     pub(crate) fn release_cached_ephemeral_writer(&self, writer: Self) {
         let checkpoint_pages = writer.index_writer_checkpoint_pages.load(Ordering::Relaxed);
         let busy_timeout_ms = writer.index_writer_busy_timeout_ms.load(Ordering::Relaxed);
+        let reuse_count = self
+            .cached_ephemeral_writer_reuse_count
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
         let conn = writer.into_raw();
         let mut cached = self.cached_ephemeral_writer.lock();
         debug_assert!(
             matches!(&*cached, CachedEphemeralWriter::InUse),
             "cached ephemeral writer state should be in-use when releasing"
         );
-        *cached = CachedEphemeralWriter::Cached(Box::new(
-            SendFrankenConnection::new_with_index_writer_state(
-                conn,
-                checkpoint_pages,
-                busy_timeout_ms,
-            ),
-        ));
+        if reuse_count >= MAX_CACHED_EPHEMERAL_WRITER_REUSES {
+            // Drop the cached connection at a bounded cadence. The primary
+            // storage connection remains open; only the short-lived writer is
+            // rotated, keeping the next acquire on a fresh page/MVCC state.
+            *cached = CachedEphemeralWriter::Uninitialized;
+            self.cached_ephemeral_writer_reuse_count
+                .store(0, Ordering::Relaxed);
+            drop(cached);
+            let mut conn = conn;
+            conn.close_best_effort_in_place();
+        } else {
+            *cached = CachedEphemeralWriter::Cached(Box::new(
+                SendFrankenConnection::new_with_index_writer_state(
+                    conn,
+                    checkpoint_pages,
+                    busy_timeout_ms,
+                ),
+            ));
+        }
     }
 
     pub(crate) fn discard_cached_ephemeral_writer(&self, mut writer: Self) {
@@ -4282,6 +4336,8 @@ impl FrankenStorage {
         let mut cached = self.cached_ephemeral_writer.lock();
         if matches!(&*cached, CachedEphemeralWriter::InUse) {
             *cached = CachedEphemeralWriter::Uninitialized;
+            self.cached_ephemeral_writer_reuse_count
+                .store(0, Ordering::Relaxed);
         }
     }
 
@@ -4404,8 +4460,30 @@ impl FrankenStorage {
     pub fn open_readonly_with_doctor_lock_timeout(path: &Path, timeout: Duration) -> Result<Self> {
         let path_str = path.to_string_lossy().to_string();
         let _doctor_guard = acquire_doctor_mutation_db_open_guard(path, timeout)?;
-        let conn = open_franken_with_flags(&path_str, FrankenOpenFlags::SQLITE_OPEN_READ_ONLY)
-            .with_context(|| format!("opening frankensqlite db readonly at {}", path.display()))?;
+        let conn = match open_franken_with_flags(&path_str, FrankenOpenFlags::SQLITE_OPEN_READ_ONLY)
+        {
+            Ok(conn) => conn,
+            Err(readonly_err) => {
+                // Native SQLite recovery archives can contain valid overflow
+                // ownership/layouts that FrankenSQLite's eager read-only
+                // loader rejects before any query runs. The existing-schema
+                // lane leaves canonical rows pager-backed and is already used
+                // for the narrowly scoped FTS repair path. Retry that lane,
+                // then apply query_only below so this compatibility fallback
+                // cannot become an accidental writer.
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %readonly_err,
+                    "frankensqlite direct readonly open failed; retrying pager-backed schema-only compatibility lane"
+                );
+                FrankenConnection::open_existing_schema_only(&path_str).with_context(|| {
+                    format!(
+                        "opening frankensqlite db readonly or schema-only at {} (direct readonly error: {readonly_err})",
+                        path.display()
+                    )
+                })?
+            }
+        };
         let storage = Self::new(conn, path.to_path_buf());
         storage.apply_readonly_config()?;
         Ok(storage)
@@ -6253,6 +6331,703 @@ pub struct InsertOutcome {
     pub inserted_indices: Vec<i64>,
 }
 
+/// Recovery-only writer for large candidate archives.
+///
+/// FrankenSQLite remains the canonical runtime storage engine.  The native
+/// SQLite writer exists because the recovery workload is an append-heavy bulk
+/// import into a very large file, and FrankenSQLite's multi-row page-loader
+/// currently stalls on that workload.  Both engines write the same SQLite
+/// schema; the candidate is reopened and verified through FrankenSQLite
+/// before promotion.
+pub struct DoctorSqliteWriter {
+    conn: rusqlite::Connection,
+    db_path: PathBuf,
+    raw_mirror_tail_marker_written: bool,
+    candidate_counts_initialized: bool,
+}
+
+/// Marks a candidate whose raw-mirror reconstruction writes authoritative
+/// conversation tails in the same transaction as its message rows.  The
+/// lexical planner may use those tails as sizing metadata without repeating a
+/// full `messages GROUP BY conversation_id` scan through FrankenSQLite.
+pub(crate) const DOCTOR_RAW_MIRROR_TAIL_METADATA_META_KEY: &str =
+    "cass.doctor.raw_mirror_tail_metadata";
+const DOCTOR_RAW_MIRROR_TAIL_METADATA_META_VALUE: &str = "authoritative-v1";
+const DOCTOR_WAL_AUTOCHECKPOINT_DEFAULT_PAGES: i64 = 65_536;
+
+fn doctor_wal_autocheckpoint_pages_from_value(value: Option<&str>) -> i64 {
+    value
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .filter(|pages| *pages > 0)
+        .unwrap_or(DOCTOR_WAL_AUTOCHECKPOINT_DEFAULT_PAGES)
+}
+
+fn doctor_wal_autocheckpoint_pages() -> i64 {
+    let value = dotenvy::var("CASS_DOCTOR_WAL_AUTOCHECKPOINT_PAGES").ok();
+    doctor_wal_autocheckpoint_pages_from_value(value.as_deref())
+}
+
+fn doctor_raw_mirror_tail_metadata_sidecar_path(db_path: &Path) -> PathBuf {
+    database_sidecar_path(db_path, ".cass-doctor-tail-authoritative")
+}
+
+fn doctor_raw_mirror_tail_metadata_sidecar_fingerprint(db_path: &Path) -> Option<String> {
+    let metadata = fs::metadata(db_path).ok()?;
+    #[cfg(unix)]
+    let identity = {
+        use std::os::unix::fs::MetadataExt;
+        format!("dev={}:ino={}", metadata.dev(), metadata.ino())
+    };
+    #[cfg(not(unix))]
+    let identity = format!("len={}", metadata.len());
+    Some(format!(
+        "v2|db_identity={identity}|path={}",
+        db_path.display()
+    ))
+}
+
+fn doctor_raw_mirror_tail_metadata_sidecar_is_valid(db_path: &Path) -> bool {
+    let Some(fingerprint) = doctor_raw_mirror_tail_metadata_sidecar_fingerprint(db_path) else {
+        return false;
+    };
+    fs::read_to_string(doctor_raw_mirror_tail_metadata_sidecar_path(db_path))
+        .map(|value| {
+            value.trim() == format!("{DOCTOR_RAW_MIRROR_TAIL_METADATA_META_VALUE}|{fingerprint}")
+        })
+        .unwrap_or(false)
+}
+
+fn persist_doctor_raw_mirror_tail_metadata_sidecar(db_path: &Path) -> Result<()> {
+    let marker_path = doctor_raw_mirror_tail_metadata_sidecar_path(db_path);
+    let temp_path = database_sidecar_path(
+        &marker_path,
+        &format!(
+            ".tmp.{}.{}",
+            std::process::id(),
+            FrankenStorage::now_millis()
+        ),
+    );
+    fs::write(
+        &temp_path,
+        format!(
+            "{DOCTOR_RAW_MIRROR_TAIL_METADATA_META_VALUE}|{}\n",
+            doctor_raw_mirror_tail_metadata_sidecar_fingerprint(db_path).ok_or_else(
+                || anyhow::anyhow!(
+                    "database disappeared while fingerprinting tail metadata sidecar"
+                )
+            )?
+        ),
+    )
+    .with_context(|| {
+        format!(
+            "writing raw-mirror tail metadata marker {}",
+            temp_path.display()
+        )
+    })?;
+    sync_file_if_exists(&temp_path).with_context(|| {
+        format!(
+            "syncing raw-mirror tail metadata marker {}",
+            temp_path.display()
+        )
+    })?;
+    fs::rename(&temp_path, &marker_path).with_context(|| {
+        format!(
+            "publishing raw-mirror tail metadata marker {}",
+            marker_path.display()
+        )
+    })?;
+    sync_parent_directory(marker_path.parent().unwrap_or(Path::new("."))).with_context(|| {
+        format!(
+            "syncing raw-mirror tail metadata marker parent {}",
+            marker_path.parent().unwrap_or(Path::new(".")).display()
+        )
+    })?;
+    Ok(())
+}
+
+impl DoctorSqliteWriter {
+    pub fn open(path: &Path) -> Result<Self> {
+        let conn = rusqlite::Connection::open(path)
+            .with_context(|| format!("open native recovery writer at {}", path.display()))?;
+        conn.busy_timeout(Duration::from_secs(30))?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        conn.pragma_update(None, "temp_store", "MEMORY")?;
+        conn.pragma_update(None, "cache_size", -524_288_i64)?;
+        // SQLite's default 1,000-page (~4 MiB) WAL checkpoint cadence is too
+        // small for Doctor's append-heavy 64 MiB transaction batches. A
+        // bounded 256 MiB cadence amortizes checkpoint work without making
+        // the WAL unbounded; the environment override is retained for
+        // host-specific experiments and incident recovery.
+        conn.pragma_update(
+            None,
+            "wal_autocheckpoint",
+            doctor_wal_autocheckpoint_pages(),
+        )?;
+        let mut raw_mirror_tail_marker_written =
+            doctor_raw_mirror_tail_metadata_sidecar_is_valid(path);
+        if !raw_mirror_tail_marker_written {
+            // A candidate created before the sidecar optimization may already
+            // contain the transactional authority marker. Verify that with
+            // native SQLite while the writer is open; do not route this
+            // compatibility probe through FrankenSQLite's large-archive
+            // pager path.
+            let marker_in_database = conn
+                .query_row(
+                    "SELECT value FROM meta WHERE key = ?1",
+                    rusqlite::params![DOCTOR_RAW_MIRROR_TAIL_METADATA_META_KEY],
+                    |row| row.get::<_, String>(0),
+                )
+                .map(|value| value == DOCTOR_RAW_MIRROR_TAIL_METADATA_META_VALUE)
+                .unwrap_or(false);
+            if marker_in_database && persist_doctor_raw_mirror_tail_metadata_sidecar(path).is_ok() {
+                raw_mirror_tail_marker_written = true;
+            }
+        }
+        Ok(Self {
+            conn,
+            db_path: path.to_path_buf(),
+            raw_mirror_tail_marker_written,
+            candidate_counts_initialized: false,
+        })
+    }
+
+    /// Ensure the recovery agent exists without opening a second
+    /// frankensqlite connection to the candidate database.
+    pub fn ensure_agent(&mut self, agent: &Agent) -> Result<i64> {
+        let now = FrankenStorage::now_millis();
+        let kind = agent_kind_str(agent.kind.clone());
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT INTO agents(slug, name, version, kind, created_at, updated_at)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(slug) DO UPDATE SET
+                 name = excluded.name,
+                 version = excluded.version,
+                 kind = excluded.kind,
+                 updated_at = excluded.updated_at
+             WHERE NOT (
+                 agents.name IS excluded.name
+                 AND agents.version IS excluded.version
+                 AND agents.kind IS excluded.kind
+             )",
+            rusqlite::params![
+                agent.slug.as_str(),
+                agent.name.as_str(),
+                agent.version.as_deref(),
+                kind,
+                now,
+                now
+            ],
+        )?;
+        let id = tx.query_row(
+            "SELECT id FROM agents WHERE slug = ?1 LIMIT 1",
+            rusqlite::params![agent.slug.as_str()],
+            |row| row.get::<_, i64>(0),
+        )?;
+        tx.commit()?;
+        Ok(id)
+    }
+
+    /// Initialize the exact candidate row-count ledger used by native Doctor
+    /// recovery. A fresh candidate starts ready; an older resumed candidate
+    /// starts unready and is seeded by the first full validation pass.
+    pub fn initialize_doctor_candidate_counts(&mut self, ready: bool) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS cass_doctor_candidate_counts (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                conversation_count INTEGER NOT NULL,
+                message_count INTEGER NOT NULL,
+                counts_ready INTEGER NOT NULL
+            );",
+        )?;
+        tx.execute(
+            "INSERT OR IGNORE INTO cass_doctor_candidate_counts
+             (singleton, conversation_count, message_count, counts_ready)
+             VALUES (1, 0, 0, ?1)",
+            rusqlite::params![i64::from(ready)],
+        )?;
+        tx.commit()?;
+        self.candidate_counts_initialized = true;
+        Ok(())
+    }
+
+    pub fn insert_doctor_conversation_chunk(
+        &mut self,
+        agent_id: i64,
+        workspace_id: Option<i64>,
+        raw_conv: &Conversation,
+    ) -> Result<InsertOutcome> {
+        let chunks = [(agent_id, workspace_id, raw_conv)];
+        self.insert_doctor_conversation_batch(&chunks)
+            .map(|mut outcomes| outcomes.remove(0))
+    }
+
+    /// Insert multiple recovery chunks under one SQLite transaction.
+    ///
+    /// The recovery caller already has an idempotent manifest/cursor ledger,
+    /// so committing once per conversation only adds sync and B-tree churn.
+    /// A batch commit preserves crash safety: the progress ledger advances
+    /// only after this transaction returns successfully, and a crash before
+    /// that point replays the same exact-index inserts safely.
+    pub fn insert_doctor_conversation_batch(
+        &mut self,
+        chunks: &[(i64, Option<i64>, &Conversation)],
+    ) -> Result<Vec<InsertOutcome>> {
+        if chunks.is_empty() {
+            return Ok(Vec::new());
+        }
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+            rusqlite::params![
+                DOCTOR_RAW_MIRROR_TAIL_METADATA_META_KEY,
+                DOCTOR_RAW_MIRROR_TAIL_METADATA_META_VALUE,
+            ],
+        )?;
+        if !self.candidate_counts_initialized {
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS cass_doctor_candidate_counts (
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    conversation_count INTEGER NOT NULL,
+                    message_count INTEGER NOT NULL,
+                    counts_ready INTEGER NOT NULL
+                );
+                INSERT OR IGNORE INTO cass_doctor_candidate_counts
+                    (singleton, conversation_count, message_count, counts_ready)
+                    VALUES (1, 0, 0, 0);",
+            )?;
+        }
+        doctor_native_ensure_reference_rows(&tx, chunks)?;
+        let mut outcomes = Vec::with_capacity(chunks.len());
+        for &(agent_id, workspace_id, raw_conv) in chunks {
+            outcomes.push(Self::insert_doctor_conversation_chunk_in_tx(
+                &tx,
+                agent_id,
+                workspace_id,
+                raw_conv,
+            )?);
+        }
+        let conversation_delta = outcomes
+            .iter()
+            .filter(|outcome| outcome.conversation_inserted)
+            .count() as i64;
+        let message_delta = outcomes
+            .iter()
+            .map(|outcome| outcome.inserted_indices.len() as i64)
+            .sum::<i64>();
+        tx.execute(
+            "UPDATE cass_doctor_candidate_counts
+             SET conversation_count = conversation_count + ?1,
+                 message_count = message_count + ?2",
+            rusqlite::params![conversation_delta, message_delta],
+        )?;
+        tx.commit()?;
+        self.candidate_counts_initialized = true;
+        if !self.raw_mirror_tail_marker_written {
+            // The database transaction is durable before this sidecar is
+            // published.  A crash between the two leaves the marker absent,
+            // which safely selects the slower legacy planner on resume.
+            // Publishing it after commit also avoids making the marker part
+            // of the 47k-transaction recovery hot path.
+            match persist_doctor_raw_mirror_tail_metadata_sidecar(&self.db_path) {
+                Ok(()) => self.raw_mirror_tail_marker_written = true,
+                Err(err) => {
+                    // The database transaction is already durable. The
+                    // sidecar is only a planner shortcut; do not turn a
+                    // sidecar filesystem failure into a reported recovery
+                    // failure that will replay a committed batch.
+                    tracing::warn!(
+                        path = %self.db_path.display(),
+                        error = %err,
+                        "could not publish raw-mirror tail sidecar; retaining safe database-marker fallback"
+                    );
+                }
+            }
+        }
+        Ok(outcomes)
+    }
+
+    fn insert_doctor_conversation_chunk_in_tx(
+        tx: &rusqlite::Transaction<'_>,
+        agent_id: i64,
+        workspace_id: Option<i64>,
+        raw_conv: &Conversation,
+    ) -> Result<InsertOutcome> {
+        use rusqlite::OptionalExtension;
+
+        let normalized_conv = normalized_conversation_for_storage(raw_conv);
+        let conv = normalized_conv.as_ref();
+
+        let (metadata_json, metadata_bin) = franken_metadata_insert_payload(&conv.metadata_json)?;
+        let (last_message_idx, last_message_created_at) = conversation_tail_state(conv);
+        let conversation_key = conversation_merge_key(agent_id, conv);
+
+        let existing_id: Option<i64> = match &conversation_key {
+            PendingConversationKey::External {
+                source_id,
+                agent_id,
+                external_id,
+            } => tx
+                .query_row(
+                    "SELECT id FROM conversations
+                     WHERE source_id = ?1 AND agent_id = ?2 AND external_id = ?3
+                     ORDER BY id LIMIT 1",
+                    rusqlite::params![source_id, agent_id, external_id],
+                    |row| row.get(0),
+                )
+                .optional()?,
+            PendingConversationKey::SourcePath {
+                source_id,
+                agent_id,
+                source_path,
+                started_at,
+            } => tx
+                .query_row(
+                    "SELECT id FROM conversations
+                     WHERE source_id = ?1 AND agent_id = ?2 AND source_path = ?3
+                       AND ((started_at IS NULL AND ?4 IS NULL) OR started_at = ?4)
+                     ORDER BY id LIMIT 1",
+                    rusqlite::params![source_id, agent_id, source_path, started_at],
+                    |row| row.get(0),
+                )
+                .optional()?,
+        };
+
+        let (conversation_id, conversation_inserted) = if let Some(id) = existing_id {
+            (id, false)
+        } else {
+            tx.execute(
+                "INSERT INTO conversations(
+                    agent_id, workspace_id, source_id, external_id, title, source_path,
+                    started_at, ended_at, approx_tokens, metadata_json, origin_host, metadata_bin,
+                    last_message_idx, last_message_created_at
+                 ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+                rusqlite::params![
+                    agent_id,
+                    workspace_id,
+                    conv.source_id.as_str(),
+                    conv.external_id.as_deref(),
+                    conv.title.as_deref(),
+                    path_to_string(&conv.source_path),
+                    conv.started_at,
+                    conv.ended_at,
+                    conv.approx_tokens,
+                    metadata_json.as_deref(),
+                    conv.origin_host.as_deref(),
+                    metadata_bin.as_deref(),
+                    last_message_idx,
+                    last_message_created_at,
+                ],
+            )?;
+            (tx.last_insert_rowid(), true)
+        };
+
+        let (first_idx, last_idx) = conv
+            .messages
+            .first()
+            .zip(conv.messages.last())
+            .map(|(first, last)| (first.idx.min(last.idx), first.idx.max(last.idx)))
+            .unwrap_or((0, -1));
+        let mut existing_indices = HashSet::new();
+        if !conversation_inserted && first_idx <= last_idx {
+            let mut statement = tx.prepare(
+                "SELECT idx FROM messages
+                 WHERE conversation_id = ?1 AND idx BETWEEN ?2 AND ?3",
+            )?;
+            let rows = statement.query_map(
+                rusqlite::params![conversation_id, first_idx, last_idx],
+                |row| row.get::<_, i64>(0),
+            )?;
+            for row in rows {
+                existing_indices.insert(row?);
+            }
+        }
+        let new_messages: Vec<&Message> = conv
+            .messages
+            .iter()
+            .filter(|message| !existing_indices.contains(&message.idx))
+            .collect();
+
+        // Raw-mirror reconstruction never carries snippets. Avoid collecting
+        // one RETURNING rowid per message on that hot path; IDs are needed
+        // only when snippet rows must be projected into the candidate.
+        let collect_message_ids = new_messages
+            .iter()
+            .any(|message| !message.snippets.is_empty());
+        let (inserted_indices, inserted_message_ids) = if collect_message_ids {
+            doctor_native_insert_messages_batched(&tx, conversation_id, &new_messages)?
+        } else {
+            (
+                doctor_native_insert_messages_without_ids(&tx, conversation_id, &new_messages)?,
+                Vec::new(),
+            )
+        };
+
+        if !inserted_message_ids.is_empty() {
+            let mut statement = tx.prepare(
+                "INSERT INTO snippets(
+                    message_id, file_path, start_line, end_line, language, snippet_text
+                 ) VALUES(?1,?2,?3,?4,?5,?6)",
+            )?;
+            for (message_id, message) in inserted_message_ids.iter().zip(&new_messages) {
+                for snippet in &message.snippets {
+                    statement.execute(rusqlite::params![
+                        message_id,
+                        snippet.file_path.as_ref().map(path_to_string),
+                        snippet.start_line,
+                        snippet.end_line,
+                        snippet.language.as_deref(),
+                        snippet.snippet_text.as_deref(),
+                    ])?;
+                }
+            }
+        }
+
+        let conv_last_ts = conversation_tail_ended_at_candidate(conv);
+        tx.execute(
+            "INSERT INTO conversation_tail_state(
+                conversation_id, ended_at, last_message_idx, last_message_created_at
+             ) VALUES(?1,?2,?3,?4)
+             ON CONFLICT(conversation_id) DO UPDATE SET
+                ended_at = CASE WHEN excluded.ended_at IS NULL THEN conversation_tail_state.ended_at
+                                ELSE MAX(IFNULL(conversation_tail_state.ended_at, 0), excluded.ended_at) END,
+                last_message_idx = CASE WHEN excluded.last_message_idx IS NULL THEN conversation_tail_state.last_message_idx
+                                        WHEN conversation_tail_state.last_message_idx IS NULL
+                                          OR conversation_tail_state.last_message_idx < excluded.last_message_idx
+                                        THEN excluded.last_message_idx ELSE conversation_tail_state.last_message_idx END,
+                last_message_created_at = CASE WHEN excluded.last_message_created_at IS NULL THEN conversation_tail_state.last_message_created_at
+                                               WHEN conversation_tail_state.last_message_created_at IS NULL
+                                                 OR conversation_tail_state.last_message_created_at < excluded.last_message_created_at
+                                               THEN excluded.last_message_created_at ELSE conversation_tail_state.last_message_created_at END",
+            rusqlite::params![conversation_id, conv_last_ts, last_idx_option(&new_messages), last_created_at_option(&new_messages)],
+        )?;
+        tx.execute(
+            "UPDATE conversations SET
+                ended_at = CASE WHEN ?1 IS NULL THEN ended_at ELSE MAX(IFNULL(ended_at, 0), ?1) END,
+                last_message_idx = CASE WHEN ?2 IS NULL THEN last_message_idx
+                                        WHEN last_message_idx IS NULL OR last_message_idx < ?2 THEN ?2
+                                        ELSE last_message_idx END,
+                last_message_created_at = CASE WHEN ?3 IS NULL THEN last_message_created_at
+                                               WHEN last_message_created_at IS NULL OR last_message_created_at < ?3 THEN ?3
+                                               ELSE last_message_created_at END
+             WHERE id = ?4",
+            rusqlite::params![
+                conv_last_ts,
+                last_idx_option(&new_messages),
+                last_created_at_option(&new_messages),
+                conversation_id,
+            ],
+        )?;
+        if let Some(external_id) = conv.external_id.as_deref() {
+            let lookup_key =
+                conversation_external_lookup_key(&conv.source_id, agent_id, external_id);
+            tx.execute(
+                "INSERT OR REPLACE INTO conversation_external_tail_lookup(
+                    lookup_key, conversation_id, ended_at, last_message_idx, last_message_created_at
+                 ) VALUES(?1,?2,?3,?4,?5)",
+                rusqlite::params![
+                    lookup_key,
+                    conversation_id,
+                    conv_last_ts,
+                    last_idx_option(&new_messages),
+                    last_created_at_option(&new_messages),
+                ],
+            )?;
+        }
+        Ok(InsertOutcome {
+            conversation_id,
+            conversation_inserted,
+            inserted_indices,
+        })
+    }
+}
+
+fn doctor_native_ensure_reference_rows(
+    tx: &rusqlite::Transaction<'_>,
+    chunks: &[(i64, Option<i64>, &Conversation)],
+) -> Result<()> {
+    let now = FrankenStorage::now_millis();
+    let mut agents = HashSet::new();
+    let mut workspaces = HashSet::new();
+    let mut sources = HashSet::new();
+    for &(agent_id, workspace_id, raw_conv) in chunks {
+        let normalized_conv = normalized_conversation_for_storage(raw_conv);
+        let conv = normalized_conv.as_ref();
+        if agents.insert((agent_id, conv.agent_slug.clone())) {
+            tx.execute(
+                "INSERT OR IGNORE INTO agents(id, slug, name, kind, created_at, updated_at)
+                 VALUES(?1, ?2, ?2, 'cli', ?3, ?3)",
+                rusqlite::params![agent_id, conv.agent_slug.as_str(), now],
+            )?;
+        }
+        if let Some(workspace_id) = workspace_id
+            && workspaces.insert((workspace_id, conv.workspace.clone()))
+        {
+            let workspace_path = conv
+                .workspace
+                .as_ref()
+                .map(|path| path_to_string(path))
+                .unwrap_or_default();
+            tx.execute(
+                "INSERT OR IGNORE INTO workspaces(id, path) VALUES(?1, ?2)",
+                rusqlite::params![workspace_id, workspace_path],
+            )?;
+        }
+        let source = normalized_source_for_conversation(conv);
+        let source_key = (
+            source.id.clone(),
+            source.kind.to_string(),
+            source.host_label.clone(),
+        );
+        if sources.insert(source_key) {
+            tx.execute(
+                "INSERT OR IGNORE INTO sources(id, kind, host_label, created_at, updated_at)
+                 VALUES(?1, ?2, ?3, ?4, ?4)",
+                rusqlite::params![
+                    source.id.as_str(),
+                    source.kind.to_string(),
+                    source.host_label.as_deref(),
+                    now
+                ],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+const DOCTOR_NATIVE_MESSAGE_BATCH_ROWS: usize = 256;
+
+fn doctor_native_message_batch_rows() -> usize {
+    dotenvy::var("CASS_DOCTOR_NATIVE_MESSAGE_BATCH_ROWS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DOCTOR_NATIVE_MESSAGE_BATCH_ROWS)
+        // Eight bound values are emitted per row; SQLite's default
+        // SQLITE_MAX_VARIABLE_NUMBER is 32766, so 4095 is the largest safe
+        // multi-row statement.  4096 would generate 32768 variables and fail
+        // at execution time instead of degrading safely.
+        .min(4095)
+}
+
+/// Insert recovery messages in bounded multi-row statements and return the
+/// generated rowids in input order.  The explicit RETURNING query avoids a
+/// per-message last_insert_rowid call while retaining the IDs needed for
+/// exact snippet projection.  The batch stays below SQLite's variable limit
+/// and is independent of the enclosing transaction size.
+fn doctor_native_insert_messages_batched(
+    tx: &rusqlite::Transaction<'_>,
+    conversation_id: i64,
+    new_messages: &[&Message],
+) -> Result<(Vec<i64>, Vec<i64>)> {
+    doctor_native_insert_messages_with_mode(tx, conversation_id, new_messages, true)
+}
+
+fn doctor_native_insert_messages_without_ids(
+    tx: &rusqlite::Transaction<'_>,
+    conversation_id: i64,
+    new_messages: &[&Message],
+) -> Result<Vec<i64>> {
+    let (inserted_indices, _) =
+        doctor_native_insert_messages_with_mode(tx, conversation_id, new_messages, false)?;
+    Ok(inserted_indices)
+}
+
+fn doctor_native_insert_messages_with_mode(
+    tx: &rusqlite::Transaction<'_>,
+    conversation_id: i64,
+    new_messages: &[&Message],
+    return_ids: bool,
+) -> Result<(Vec<i64>, Vec<i64>)> {
+    use rusqlite::types::Value;
+
+    let mut inserted_indices = Vec::with_capacity(new_messages.len());
+    let mut inserted_message_ids = Vec::with_capacity(new_messages.len());
+    for batch in new_messages.chunks(doctor_native_message_batch_rows()) {
+        let sql = doctor_native_message_insert_sql(batch.len(), return_ids);
+        let mut values = Vec::with_capacity(batch.len() * 8);
+        for message in batch {
+            let (extra_json, extra_bin) = franken_message_insert_payload(message)?;
+            values.extend([
+                Value::Integer(conversation_id),
+                Value::Integer(message.idx),
+                Value::Text(role_as_str(&message.role).to_string()),
+                message
+                    .author
+                    .as_ref()
+                    .map(|author| Value::Text(author.clone()))
+                    .unwrap_or(Value::Null),
+                message
+                    .created_at
+                    .map(Value::Integer)
+                    .unwrap_or(Value::Null),
+                Value::Text(message.content.clone()),
+                extra_json
+                    .map(|value| Value::Text(value.into_owned()))
+                    .unwrap_or(Value::Null),
+                extra_bin.map(Value::Blob).unwrap_or(Value::Null),
+            ]);
+        }
+
+        let mut statement = tx.prepare(sql.as_ref())?;
+        if return_ids {
+            let mut rows = statement.query(rusqlite::params_from_iter(values.iter()))?;
+            let mut returned_ids = Vec::with_capacity(batch.len());
+            while let Some(row) = rows.next()? {
+                returned_ids.push(row.get::<_, i64>(0)?);
+            }
+            if returned_ids.len() != batch.len() {
+                return Err(anyhow::anyhow!(
+                    "native recovery message batch returned {} rowids for {} inserted messages",
+                    returned_ids.len(),
+                    batch.len()
+                ));
+            }
+            inserted_message_ids.extend(returned_ids);
+        } else {
+            statement.execute(rusqlite::params_from_iter(values.iter()))?;
+        }
+        inserted_indices.extend(batch.iter().map(|message| message.idx));
+    }
+    Ok((inserted_indices, inserted_message_ids))
+}
+
+fn doctor_native_message_insert_sql(row_count: usize, return_ids: bool) -> Arc<str> {
+    static CACHE: std::sync::OnceLock<parking_lot::Mutex<HashMap<(usize, bool), Arc<str>>>> =
+        std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| parking_lot::Mutex::new(HashMap::new()));
+    if let Some(sql) = cache.lock().get(&(row_count, return_ids)).cloned() {
+        return sql;
+    }
+
+    let placeholders = (0..row_count)
+        .map(|_| "(?,?,?,?,?,?,?,?)")
+        .collect::<Vec<_>>()
+        .join(",");
+    let suffix = if return_ids { " RETURNING id" } else { "" };
+    let sql: Arc<str> = Arc::from(format!(
+        "INSERT INTO messages(conversation_id, idx, role, author, created_at, content, extra_json, extra_bin) VALUES {placeholders}{suffix}"
+    ));
+    cache
+        .lock()
+        .insert((row_count, return_ids), Arc::clone(&sql));
+    sql
+}
+
+fn last_idx_option(messages: &[&Message]) -> Option<i64> {
+    messages.iter().map(|message| message.idx).max()
+}
+
+fn last_created_at_option(messages: &[&Message]) -> Option<i64> {
+    messages
+        .iter()
+        .filter_map(|message| message.created_at)
+        .max()
+}
+
 #[cfg(test)]
 #[derive(Debug, Clone, Default)]
 struct MessageInsertSubstageProfile {
@@ -6552,14 +7327,22 @@ fn collect_new_messages_for_existing_conversation<'a>(
     let mut messages = Vec::new();
 
     for msg in &conv.messages {
-        let incoming_fingerprint = message_merge_fingerprint(msg);
+        // The merge contract treats an existing idx as canonical. Check cheap
+        // metadata before hashing content; on a repeated corpus scan this
+        // avoids re-hashing millions of already-ingested messages (including
+        // very large payloads) just to discard them.
         if let Some(existing_fingerprint) = existing_messages.get(&msg.idx) {
-            if existing_fingerprint != &incoming_fingerprint {
+            if existing_fingerprint.created_at != msg.created_at
+                || existing_fingerprint.role != msg.role
+                || existing_fingerprint.author != msg.author
+            {
                 idx_collision_count = idx_collision_count.saturating_add(1);
                 first_collision_idx.get_or_insert(msg.idx);
             }
             continue;
         }
+
+        let incoming_fingerprint = message_merge_fingerprint(msg);
 
         let incoming_replay = replay_fingerprint_from_merge(&incoming_fingerprint);
         if existing_replay_fingerprints.contains(&incoming_replay) {
@@ -8049,6 +8832,8 @@ impl FrankenStorage {
     pub fn list_conversation_footprints_for_lexical_rebuild(
         &self,
     ) -> Result<Vec<LexicalRebuildConversationFootprintRow>> {
+        let prep_profile = std::env::var_os("CASS_PREP_PROFILE").is_some();
+        let profile_started = Instant::now();
         let tail_state_rows: Vec<(i64, Option<i64>)> = match self.conn.query_map_collect(
             "SELECT conversation_id, last_message_idx
              FROM conversation_tail_state
@@ -8062,6 +8847,13 @@ impl FrankenStorage {
                 return Err(err).with_context(|| "listing lexical rebuild tail-state estimates");
             }
         };
+        if prep_profile {
+            eprintln!(
+                "CASS_PREP_PROFILE storage=footprints step=tail_state rows={} elapsed_ms={}",
+                tail_state_rows.len(),
+                profile_started.elapsed().as_secs_f64() * 1000.0
+            );
+        }
         let tail_state_by_conversation: HashMap<i64, Option<i64>> =
             tail_state_rows.into_iter().collect();
 
@@ -8090,6 +8882,13 @@ impl FrankenStorage {
                     .with_context(|| "listing lexical rebuild conversation footprint estimates");
             }
         };
+        if prep_profile {
+            eprintln!(
+                "CASS_PREP_PROFILE storage=footprints step=conversations rows={} elapsed_ms={}",
+                rows.len(),
+                profile_started.elapsed().as_secs_f64() * 1000.0
+            );
+        }
 
         let mut footprints = Vec::with_capacity(rows.len());
         let mut missing_tail_positions = HashMap::new();
@@ -8122,8 +8921,19 @@ impl FrankenStorage {
                 &missing_tail_positions,
             )?;
         }
-        if !every_footprint_was_missing_tail {
+        if !every_footprint_was_missing_tail
+            && !self.lexical_rebuild_tail_footprints_are_authoritative()?
+        {
             self.raise_lexical_rebuild_footprints_to_exact_message_counts(&mut footprints)?;
+        }
+
+        if prep_profile {
+            eprintln!(
+                "CASS_PREP_PROFILE storage=footprints step=complete footprints={} missing_tails={} elapsed_ms={}",
+                footprints.len(),
+                missing_tail_positions.len(),
+                profile_started.elapsed().as_secs_f64() * 1000.0
+            );
         }
 
         Ok(footprints)
@@ -8194,6 +9004,32 @@ impl FrankenStorage {
             total_conversations,
             covered_conversations,
         ))
+    }
+
+    pub(crate) fn lexical_rebuild_tail_footprints_are_authoritative(&self) -> Result<bool> {
+        // Native doctor reconstruction publishes this marker only after the
+        // corresponding SQLite transaction commits.  Reading the tiny
+        // sidecar avoids a FrankenSQLite point lookup whose pager path can
+        // scan/replay a multi-gigabyte candidate before returning a one-row
+        // metadata result.  Missing/corrupt sidecars deliberately fall back
+        // to the database marker for legacy candidates.
+        if doctor_raw_mirror_tail_metadata_sidecar_is_valid(&self.db_path) {
+            return Ok(true);
+        }
+        let marker: Option<String> = match self.conn.query_row_map(
+            "SELECT value FROM meta WHERE key = ?1",
+            fparams![DOCTOR_RAW_MIRROR_TAIL_METADATA_META_KEY],
+            |row| row.get_typed(0),
+        ) {
+            Ok(value) => Some(value),
+            Err(err) if error_indicates_missing_table(&err) => None,
+            Err(err) if err.to_string().to_ascii_lowercase().contains("no rows") => None,
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| "reading lexical rebuild tail metadata authority marker");
+            }
+        };
+        Ok(marker.as_deref() == Some(DOCTOR_RAW_MIRROR_TAIL_METADATA_META_VALUE))
     }
 
     fn raise_lexical_rebuild_footprints_to_exact_message_counts(
@@ -8608,22 +9444,82 @@ impl FrankenStorage {
         Ok(messages)
     }
 
-    /// Inner fetch without the per-conversation content cap. Kept separate so the
-    /// cap is applied at exactly one chokepoint (every lexical-rebuild content
-    /// load — batch and streaming — funnels through `fetch_messages_for_lexical_rebuild`).
-    fn fetch_messages_for_lexical_rebuild_uncapped(
+    /// Fetch only the post-cursor message projection needed by semantic
+    /// backfill. When `max_raw_message_bytes` is nonzero, a length-only probe
+    /// rejects an oversized body before it is materialized into a Rust String.
+    pub fn fetch_messages_for_semantic_backfill(
         &self,
         conversation_id: i64,
+        after_message_id: Option<i64>,
+        max_raw_message_bytes: usize,
     ) -> Result<Vec<Message>> {
-        let hinted_sql = "SELECT id, idx, role, author, created_at, content \
-                 FROM messages INDEXED BY sqlite_autoindex_messages_1 \
-                 WHERE conversation_id = ?1 ORDER BY idx";
-        let fallback_sql = "SELECT id, idx, role, author, created_at, content \
-                 FROM messages \
-                 WHERE conversation_id = ?1 ORDER BY idx";
+        if max_raw_message_bytes > 0 {
+            let limit = i64::try_from(max_raw_message_bytes).unwrap_or(i64::MAX);
+            let (sql, params) = if let Some(after_message_id) = after_message_id {
+                (
+                    "SELECT id, LENGTH(CAST(content AS BLOB))
+                     FROM messages
+                     WHERE conversation_id = ?1 AND id > ?2
+                       AND LENGTH(CAST(content AS BLOB)) > ?3
+                     ORDER BY idx LIMIT 1",
+                    vec![
+                        ParamValue::from(conversation_id),
+                        ParamValue::from(after_message_id),
+                        ParamValue::from(limit),
+                    ],
+                )
+            } else {
+                (
+                    "SELECT id, LENGTH(CAST(content AS BLOB))
+                     FROM messages
+                     WHERE conversation_id = ?1
+                       AND LENGTH(CAST(content AS BLOB)) > ?2
+                     ORDER BY idx LIMIT 1",
+                    vec![ParamValue::from(conversation_id), ParamValue::from(limit)],
+                )
+            };
+            let oversized: Vec<(i64, i64)> = self
+                .conn
+                .query_map_collect(sql, &params, |row| {
+                    Ok((row.get_typed(0)?, row.get_typed(1)?))
+                })
+                .with_context(|| {
+                    format!("checking semantic raw-message size for conversation {conversation_id}")
+                })?;
+            if let Some((message_id, byte_len)) = oversized.first().copied() {
+                bail!(
+                    "semantic backfill raw-message guardrail rejected conversation {conversation_id} message {message_id}: bytes={byte_len} limit={max_raw_message_bytes}"
+                );
+            }
+        }
+
+        let (hinted_sql, fallback_sql, params) = if let Some(after_message_id) = after_message_id {
+            (
+                "SELECT id, idx, role, author, created_at, content
+                 FROM messages INDEXED BY sqlite_autoindex_messages_1
+                 WHERE conversation_id = ?1 AND id > ?2 ORDER BY idx",
+                "SELECT id, idx, role, author, created_at, content
+                 FROM messages
+                 WHERE conversation_id = ?1 AND id > ?2 ORDER BY idx",
+                vec![
+                    ParamValue::from(conversation_id),
+                    ParamValue::from(after_message_id),
+                ],
+            )
+        } else {
+            (
+                "SELECT id, idx, role, author, created_at, content
+                 FROM messages INDEXED BY sqlite_autoindex_messages_1
+                 WHERE conversation_id = ?1 ORDER BY idx",
+                "SELECT id, idx, role, author, created_at, content
+                 FROM messages
+                 WHERE conversation_id = ?1 ORDER BY idx",
+                vec![ParamValue::from(conversation_id)],
+            )
+        };
 
         self.conn
-            .query_map_collect(hinted_sql, fparams![conversation_id], |row| {
+            .query_map_collect(hinted_sql, &params, |row| {
                 let role: String = row.get_typed(2)?;
                 Ok(Message {
                     id: Some(row.get_typed(0)?),
@@ -8647,29 +9543,165 @@ impl FrankenStorage {
                     .to_string()
                     .contains("no such index: sqlite_autoindex_messages_1")
                 {
-                    return self.conn.query_map_collect(
-                        fallback_sql,
-                        fparams![conversation_id],
-                        |row| {
-                            let role: String = row.get_typed(2)?;
-                            Ok(Message {
-                                id: Some(row.get_typed(0)?),
-                                idx: row.get_typed(1)?,
-                                role: match role.as_str() {
-                                    "user" => MessageRole::User,
-                                    "agent" | "assistant" => MessageRole::Agent,
-                                    "tool" => MessageRole::Tool,
-                                    "system" => MessageRole::System,
-                                    other => MessageRole::Other(other.to_string()),
-                                },
-                                author: row.get_typed(3)?,
-                                created_at: row.get_typed(4)?,
-                                content: row.get_typed(5)?,
-                                extra_json: serde_json::Value::Null,
-                                snippets: Vec::new(),
-                            })
-                        },
+                    return self.conn.query_map_collect(fallback_sql, &params, |row| {
+                        let role: String = row.get_typed(2)?;
+                        Ok(Message {
+                            id: Some(row.get_typed(0)?),
+                            idx: row.get_typed(1)?,
+                            role: match role.as_str() {
+                                "user" => MessageRole::User,
+                                "agent" | "assistant" => MessageRole::Agent,
+                                "tool" => MessageRole::Tool,
+                                "system" => MessageRole::System,
+                                other => MessageRole::Other(other.to_string()),
+                            },
+                            author: row.get_typed(3)?,
+                            created_at: row.get_typed(4)?,
+                            content: row.get_typed(5)?,
+                            extra_json: serde_json::Value::Null,
+                            snippets: Vec::new(),
+                        })
+                    });
+                }
+                Err(err)
+            })
+            .with_context(|| {
+                format!("fetching semantic backfill messages for conversation {conversation_id}")
+            })
+    }
+
+    /// Check aggregate post-cursor size before semantic backfill transfers any
+    /// message bodies into Rust. SQLite still scans the content bytes to
+    /// calculate `LENGTH`, but this avoids allocating a `Vec<Message>` for a
+    /// conversation that cannot fit inside the caller's checkpoint budget.
+    pub fn check_semantic_backfill_conversation_bounds(
+        &self,
+        conversation_id: i64,
+        after_message_id: Option<i64>,
+        max_messages: usize,
+        max_raw_bytes: u64,
+    ) -> Result<(u64, u64)> {
+        if max_messages == 0 && max_raw_bytes == 0 {
+            return Ok((0, 0));
+        }
+
+        let (sql, params) = if let Some(after_message_id) = after_message_id {
+            (
+                "SELECT COUNT(*), COALESCE(SUM(LENGTH(CAST(content AS BLOB))), 0)
+                 FROM messages
+                 WHERE conversation_id = ?1 AND id > ?2",
+                vec![
+                    ParamValue::from(conversation_id),
+                    ParamValue::from(after_message_id),
+                ],
+            )
+        } else {
+            (
+                "SELECT COUNT(*), COALESCE(SUM(LENGTH(CAST(content AS BLOB))), 0)
+                 FROM messages
+                 WHERE conversation_id = ?1",
+                vec![ParamValue::from(conversation_id)],
+            )
+        };
+        let (message_count, raw_bytes): (i64, i64) = self
+            .conn
+            .query_row_map(sql, &params, |row| {
+                Ok((row.get_typed(0)?, row.get_typed(1)?))
+            })
+            .with_context(|| {
+                format!("checking semantic conversation bounds for conversation {conversation_id}")
+            })?;
+        let message_count = u64::try_from(message_count).unwrap_or(u64::MAX);
+        let raw_bytes = u64::try_from(raw_bytes).unwrap_or(u64::MAX);
+
+        if max_messages > 0 && message_count > max_messages as u64 {
+            bail!(
+                "semantic backfill conversation message-count guardrail rejected conversation {conversation_id}: messages={message_count} limit={max_messages}"
+            );
+        }
+        if max_raw_bytes > 0 && raw_bytes > max_raw_bytes {
+            bail!(
+                "semantic backfill conversation byte guardrail rejected conversation {conversation_id}: bytes={raw_bytes} limit={max_raw_bytes}"
+            );
+        }
+
+        Ok((message_count, raw_bytes))
+    }
+
+    /// Inner fetch without the per-conversation content cap. Kept separate so the
+    /// cap is applied at exactly one chokepoint (every lexical-rebuild content
+    /// load — batch and streaming — funnels through `fetch_messages_for_lexical_rebuild`).
+    fn fetch_messages_for_lexical_rebuild_uncapped(
+        &self,
+        conversation_id: i64,
+    ) -> Result<Vec<Message>> {
+        let hinted_sql = "SELECT id, idx, role, author, created_at, content \
+                 FROM messages INDEXED BY sqlite_autoindex_messages_1 \
+                 WHERE conversation_id = ?1 ORDER BY idx";
+        let fallback_sql = "SELECT id, idx, role, author, created_at, content \
+                 FROM messages \
+                 WHERE conversation_id = ?1 ORDER BY idx";
+
+        // Keep the row stream bounded. `query_map_collect` is convenient for
+        // ordinary conversations, but its collector retains the driver's
+        // decoded row material until the whole result is complete. One
+        // pathological archive conversation can therefore turn a lexical
+        // rebuild into multi-gigabyte allocator churn even though the lexical
+        // projection only needs six scalar columns and message text.
+        let fetch_streamed = |sql: &str| -> Result<Vec<Message>> {
+            let mut messages = Vec::new();
+            let mut callback_error = None;
+            self.conn
+                .query_with_params_for_each(sql, &[SqliteValue::Integer(conversation_id)], |row| {
+                    if callback_error.is_some() {
+                        return Ok(());
+                    }
+                    let row_result: std::result::Result<(), frankensqlite::FrankenError> = (|| {
+                        let role: String = row.get_typed(2)?;
+                        messages.push(Message {
+                            id: Some(row.get_typed(0)?),
+                            idx: row.get_typed(1)?,
+                            role: match role.as_str() {
+                                "user" => MessageRole::User,
+                                "agent" | "assistant" => MessageRole::Agent,
+                                "tool" => MessageRole::Tool,
+                                "system" => MessageRole::System,
+                                other => MessageRole::Other(other.to_string()),
+                            },
+                            author: row.get_typed(3)?,
+                            created_at: row.get_typed(4)?,
+                            content: row.get_typed(5)?,
+                            extra_json: serde_json::Value::Null,
+                            snippets: Vec::new(),
+                        });
+                        Ok(())
+                    })(
                     );
+                    if let Err(err) = row_result {
+                        callback_error = Some(err);
+                    }
+                    Ok(())
+                })
+                .with_context(|| {
+                    format!(
+                        "streaming messages for lexical rebuild of conversation {conversation_id}"
+                    )
+                })?;
+            if let Some(err) = callback_error {
+                return Err(anyhow!(
+                    "decoding messages for lexical rebuild of conversation {conversation_id}: {err}"
+                ));
+            }
+            Ok(messages)
+        };
+
+        fetch_streamed(hinted_sql)
+            .or_else(|err| {
+                if err
+                    .to_string()
+                    .contains("no such index: sqlite_autoindex_messages_1")
+                {
+                    return fetch_streamed(fallback_sql);
                 }
                 Err(err)
             })
@@ -8759,6 +9791,19 @@ impl FrankenStorage {
             return Ok(());
         }
 
+        // Raw-mirror candidates have exact conversation tails and are built
+        // append-only.  Their lexical reader can use one ordered range scan
+        // instead of opening one FrankenSQLite query per conversation.  The
+        // ordinary path deliberately keeps the per-conversation probes: some
+        // legacy archives have poor plans for a broad IN/range query.
+        if self.lexical_rebuild_tail_footprints_are_authoritative()? {
+            return self.stream_authoritative_lexical_rebuild_messages(
+                start_conversation_id,
+                end_conversation_id,
+                f,
+            );
+        }
+
         let conversation_ids: Vec<i64> = self
             .conn
             .query_map_collect(
@@ -8794,6 +9839,82 @@ impl FrankenStorage {
             }
         }
 
+        Ok(())
+    }
+
+    fn stream_authoritative_lexical_rebuild_messages<F>(
+        &self,
+        start_conversation_id: i64,
+        end_conversation_id: i64,
+        mut f: F,
+    ) -> Result<()>
+    where
+        F: FnMut(LexicalRebuildMessageRow) -> Result<()>,
+    {
+        let cap = lexical_max_conversation_content_bytes();
+        let sql = "SELECT id, conversation_id, idx, role, author, created_at, content
+                   FROM messages INDEXED BY sqlite_autoindex_messages_1
+                   WHERE conversation_id >= ?1 AND conversation_id <= ?2
+                   ORDER BY conversation_id, idx";
+        let mut active_conversation_id = None;
+        let mut used_content_bytes = 0usize;
+        let params = [
+            SqliteValue::Integer(start_conversation_id),
+            SqliteValue::Integer(end_conversation_id),
+        ];
+        let mut callback_error = None;
+        self.conn
+            .query_with_params_for_each(sql, &params, |row| {
+                if callback_error.is_some() {
+                    return Ok(());
+                }
+                let row_result: std::result::Result<(), frankensqlite::FrankenError> = (|| {
+                    let conversation_id: i64 = row.get_typed(1)?;
+                    if active_conversation_id != Some(conversation_id) {
+                        active_conversation_id = Some(conversation_id);
+                        used_content_bytes = 0;
+                    }
+
+                    let mut content: String = row.get_typed(6)?;
+                    if used_content_bytes >= cap {
+                        content.clear();
+                    } else {
+                        let remaining = cap - used_content_bytes;
+                        let boundary = lexical_content_truncation_boundary(&content, remaining);
+                        content.truncate(boundary);
+                        used_content_bytes = used_content_bytes.saturating_add(boundary);
+                    }
+
+                    f(LexicalRebuildMessageRow {
+                        conversation_id,
+                        id: row.get_typed(0)?,
+                        idx: row.get_typed(2)?,
+                        role: match row.get_typed::<String>(3)?.as_str() {
+                            "user" => "user",
+                            "agent" | "assistant" => "assistant",
+                            "tool" => "tool",
+                            "system" => "system",
+                            other => other,
+                        }
+                        .to_string(),
+                        author: row.get_typed(4)?,
+                        created_at: row.get_typed(5)?,
+                        content,
+                    })
+                    .map_err(|err| frankensqlite::FrankenError::Internal(err.to_string()))
+                })(
+                );
+                if let Err(err) = row_result {
+                    callback_error = Some(err);
+                }
+                Ok(())
+            })
+            .with_context(|| "streaming authoritative raw-mirror lexical messages")?;
+        if let Some(err) = callback_error {
+            return Err(anyhow!(
+                "streaming authoritative raw-mirror lexical messages: {err}"
+            ));
+        }
         Ok(())
     }
 
@@ -8875,6 +9996,107 @@ impl FrankenStorage {
             i64::MAX,
             f,
         )
+    }
+
+    /// Stream lexical rows through native SQLite for the rebuild
+    /// page-preparation hot path.  FrankenSQLite remains authoritative for
+    /// storage and indexing, but its compatibility reader currently
+    /// materializes pathological message pages before yielding rows.  This
+    /// bounded read lane keeps only one SQLite row plus the capped current
+    /// conversation in memory and never changes the canonical archive.
+    pub(crate) fn stream_messages_for_lexical_rebuild_native<F>(
+        db_path: &Path,
+        start_conversation_id: i64,
+        end_conversation_id: i64,
+        mut f: F,
+    ) -> Result<()>
+    where
+        F: FnMut(LexicalRebuildMessageRow) -> Result<()>,
+    {
+        if end_conversation_id < start_conversation_id {
+            return Ok(());
+        }
+
+        let conn = rusqlite::Connection::open_with_flags(
+            db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .with_context(|| {
+            format!(
+                "opening native SQLite lexical rebuild reader at {}",
+                db_path.display()
+            )
+        })?;
+        conn.busy_timeout(Duration::from_secs(30))?;
+        conn.execute_batch("PRAGMA query_only = ON; PRAGMA cache_size = -32768;")?;
+
+        let sql = "SELECT id, conversation_id, idx, role, author, created_at, content
+                   FROM messages
+                   WHERE conversation_id >= ?1 AND conversation_id <= ?2
+                   ORDER BY conversation_id, idx";
+        let mut statement = conn.prepare(sql).with_context(|| {
+            format!(
+                "preparing native SQLite lexical rebuild reader at {}",
+                db_path.display()
+            )
+        })?;
+        let mut rows = statement.query(rusqlite::params![
+            start_conversation_id,
+            end_conversation_id
+        ])?;
+
+        let cap = lexical_max_conversation_content_bytes();
+        let mut current_conversation_id = None;
+        let mut current_content_bytes = 0usize;
+        while let Some(row) = rows.next()? {
+            let conversation_id: i64 = row.get(1)?;
+            if current_conversation_id != Some(conversation_id) {
+                current_conversation_id = Some(conversation_id);
+                current_content_bytes = 0;
+            }
+
+            let mut content: String = row.get(6)?;
+            if current_content_bytes >= cap {
+                content.clear();
+            } else {
+                let remaining = cap - current_content_bytes;
+                let boundary = lexical_content_truncation_boundary(&content, remaining);
+                content.truncate(boundary);
+                current_content_bytes = current_content_bytes.saturating_add(boundary);
+            }
+
+            let role: String = row.get(3)?;
+            let author = match row.get_ref(4)? {
+                rusqlite::types::ValueRef::Null => None,
+                rusqlite::types::ValueRef::Text(bytes) => {
+                    Some(String::from_utf8_lossy(bytes).into_owned())
+                }
+                rusqlite::types::ValueRef::Integer(value) => Some(value.to_string()),
+                rusqlite::types::ValueRef::Real(value) => Some(value.to_string()),
+                rusqlite::types::ValueRef::Blob(bytes) => {
+                    Some(String::from_utf8_lossy(bytes).into_owned())
+                }
+            };
+            let created_at = match row.get_ref(5)? {
+                rusqlite::types::ValueRef::Null => None,
+                rusqlite::types::ValueRef::Integer(value) => Some(value),
+                rusqlite::types::ValueRef::Real(value) => Some(value as i64),
+                rusqlite::types::ValueRef::Text(bytes) => {
+                    std::str::from_utf8(bytes).ok().and_then(|value| value.parse().ok())
+                }
+                rusqlite::types::ValueRef::Blob(_) => None,
+            };
+            f(LexicalRebuildMessageRow {
+                conversation_id,
+                id: row.get(0)?,
+                idx: row.get(2)?,
+                role,
+                author,
+                created_at,
+                content,
+            })?;
+        }
+        Ok(())
     }
 
     /// Stream lexical rebuild message rows from a starting conversation id to
@@ -11290,9 +12512,24 @@ impl FrankenStorage {
                 })
             }
             FtsShadowParityStatus::Partial => {
-                let inserted_rows = self
-                    .stream_fts_rows_via_frankensqlite(true)
-                    .with_context(|| "resuming missing FTS rows via frankensqlite")?;
+                let inserted_rows = match self.stream_fts_rows_via_frankensqlite(true) {
+                    Ok(inserted_rows) => inserted_rows,
+                    Err(err)
+                        if fts_messages_integrity_error_from_message(format!("{err:#}"))
+                            .is_some() =>
+                    {
+                        tracing::warn!(
+                            error = %err,
+                            "partial FTS shadow is corrupt; falling back to failure-atomic recreation"
+                        );
+                        let inserted_rows = self.rebuild_corrupt_fts_shadow()?;
+                        return Ok(FtsConsistencyRepair::Rebuilt { inserted_rows });
+                    }
+                    Err(err) => {
+                        return Err(err)
+                            .with_context(|| "resuming missing FTS rows via frankensqlite");
+                    }
+                };
                 let after = self.require_healthy_fts_parity("resumable FTS catch-up")?;
                 self.record_fts_franken_rebuild_generation()?;
                 self.set_fts_messages_present_cache(true);
@@ -11319,6 +12556,44 @@ impl FrankenStorage {
                 before.indexable_messages
             ),
         }
+    }
+
+    /// Recreate a queryable-but-corrupt FTS shadow through a derived-only
+    /// two-phase recovery.
+    ///
+    /// Incremental insertion is preferable for a healthy partial shadow, but
+    /// FTS5 can retain malformed segment pages that reject the next insert.
+    /// FrankenSQLite cannot drop and recreate the same live virtual table in
+    /// one transaction. Commit the derived-only drop first, then let the
+    /// normal absent-shadow path create and populate it in a fresh transaction.
+    /// The canonical archive is authoritative; an interruption between phases
+    /// leaves only an absent, recoverable derived shadow.
+    fn rebuild_corrupt_fts_shadow(&self) -> Result<usize> {
+        self.invalidate_fts_messages_present_cache();
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE TRANSACTION;")
+            .with_context(|| "starting derived-only corrupt FTS removal")?;
+        if let Err(err) = self
+            .conn
+            .execute_batch("DROP TABLE IF EXISTS fts_messages;")
+            .with_context(|| "dropping corrupt derived FTS shadow")
+        {
+            self.invalidate_fts_messages_present_cache();
+            let _ = self.conn.execute_batch("ROLLBACK;");
+            return Err(err.context("corrupt FTS removal rolled back"));
+        }
+        if let Err(err) = self
+            .conn
+            .execute_batch("COMMIT;")
+            .with_context(|| "publishing derived-only corrupt FTS removal")
+        {
+            self.invalidate_fts_messages_present_cache();
+            let _ = self.conn.execute_batch("ROLLBACK;");
+            return Err(err.context("corrupt FTS removal commit failed"));
+        }
+
+        self.invalidate_fts_messages_present_cache();
+        self.rebuild_fts_via_frankensqlite()
     }
 
     pub(crate) fn rebuild_fts_via_frankensqlite(&self) -> Result<usize> {
@@ -11463,7 +12738,7 @@ impl FrankenStorage {
                     .unwrap_or_default();
                 pending_chars = pending_chars.saturating_add(row.content.len());
                 entries.push(FtsEntry {
-                    content: row.content,
+                    content: fts_content_projection(&row.content),
                     title: conversation.title.clone(),
                     agent,
                     workspace,
@@ -12737,6 +14012,167 @@ impl FrankenStorage {
 
         Ok(outcomes)
     }
+
+    /// Insert one recovery chunk using the raw archive's exact positional
+    /// identity. Doctor reconstruction must not apply replay-fingerprint
+    /// dedupe: two identical raw JSONL lines at different idx values are
+    /// distinct source messages. The bounded range probe also avoids the
+    /// normal missing-timestamp merge scan across the full conversation.
+    pub fn insert_doctor_conversation_chunk(
+        &self,
+        agent_id: i64,
+        workspace_id: Option<i64>,
+        conv: &Conversation,
+    ) -> Result<InsertOutcome> {
+        let normalized_conv = normalized_conversation_for_storage(conv);
+        let conv = normalized_conv.as_ref();
+        self.ensure_source_for_conversation(conv)?;
+        let defer_lexical_updates = defer_storage_lexical_updates_enabled();
+        let defer_analytics_updates = defer_analytics_updates_enabled();
+        let conversation_key = conversation_merge_key(agent_id, conv);
+        let mut tx = self.conn.transaction()?;
+
+        ensure_agents_in_tx(&tx, &[(agent_id, workspace_id, conv)])?;
+        ensure_workspaces_in_tx(&tx, &[(agent_id, workspace_id, conv)])?;
+        ensure_sources_in_tx(&tx, &[(agent_id, workspace_id, conv)])?;
+
+        let (conversation_id, conversation_inserted) =
+            match franken_find_existing_conversation_by_key(&tx, &conversation_key, Some(conv))? {
+                Some(existing_id) => (existing_id, false),
+                None => match franken_insert_conversation_or_get_existing(
+                    &tx,
+                    agent_id,
+                    workspace_id,
+                    conv,
+                )? {
+                    ConversationInsertStatus::Inserted(new_id) => (new_id, true),
+                    ConversationInsertStatus::Existing(existing_id) => (existing_id, false),
+                },
+            };
+
+        let (first_idx, last_idx) = conv
+            .messages
+            .first()
+            .zip(conv.messages.last())
+            .map(|(first, last)| (first.idx.min(last.idx), first.idx.max(last.idx)))
+            .unwrap_or((0, -1));
+        let existing_indices: HashSet<i64> = if first_idx <= last_idx {
+            tx.query_map_collect(
+                "SELECT idx FROM messages WHERE conversation_id = ?1 AND idx BETWEEN ?2 AND ?3",
+                fparams![conversation_id, first_idx, last_idx],
+                |row| row.get_typed(0),
+            )?
+            .into_iter()
+            .collect()
+        } else {
+            HashSet::new()
+        };
+        let new_messages: Vec<&Message> = conv
+            .messages
+            .iter()
+            .filter(|message| !existing_indices.contains(&message.idx))
+            .collect();
+        // The single-row fallback remains available because it was the safe
+        // recovery mode while the candidate database was page-cache bound.
+        // The bulk mode uses the existing bounded multi-row insert helper and
+        // is recovery-only: the caller can disable it without changing normal
+        // ingest semantics if a large-database regression is observed.
+        let inserted_message_ids = if env_flag_enabled("CASS_DOCTOR_BULK_MESSAGE_INSERTS") {
+            let batch_size = dotenvy::var("CASS_DOCTOR_MESSAGE_BATCH_ROWS")
+                .ok()
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .filter(|value| *value > 1)
+                .unwrap_or(32)
+                .min(MESSAGE_INSERT_BATCH_SIZE);
+            franken_batch_insert_new_messages_with_batch_size(
+                &tx,
+                conversation_id,
+                &new_messages,
+                batch_size,
+            )?
+        } else {
+            let mut ids = Vec::with_capacity(new_messages.len());
+            for message in &new_messages {
+                ids.push(franken_insert_new_message(&tx, conversation_id, message)?);
+            }
+            ids
+        };
+        let mut inserted_indices = Vec::with_capacity(new_messages.len());
+        let mut inserted_chars = 0i64;
+        let mut fts_entries = Vec::new();
+        let mut fts_pending_chars = 0usize;
+        let mut fts_inserted_total = 0usize;
+        for (message_id, message) in inserted_message_ids.into_iter().zip(new_messages.iter()) {
+            franken_insert_snippets(&tx, message_id, &message.snippets)?;
+            if !defer_lexical_updates {
+                fts_entries.push(FtsEntry::from_message(message_id, message, conv));
+                fts_pending_chars = fts_pending_chars.saturating_add(message.content.len());
+                if fts_entries.len() >= FTS_ENTRY_BATCH_MAX_DOCS
+                    || fts_pending_chars >= FTS_ENTRY_BATCH_MAX_CHARS
+                {
+                    flush_pending_fts_entries(
+                        self,
+                        &tx,
+                        &mut fts_entries,
+                        &mut fts_pending_chars,
+                        &mut fts_inserted_total,
+                    )?;
+                }
+            }
+            inserted_indices.push(message.idx);
+            inserted_chars = inserted_chars.saturating_add(message.content.len() as i64);
+        }
+        if !defer_lexical_updates {
+            flush_pending_fts_entries(
+                self,
+                &tx,
+                &mut fts_entries,
+                &mut fts_pending_chars,
+                &mut fts_inserted_total,
+            )?;
+        }
+
+        let (inserted_last_idx, inserted_last_created_at) =
+            borrowed_messages_tail_state(&new_messages);
+        let conv_last_ts = conversation_tail_ended_at_candidate(conv);
+        franken_update_conversation_tail_state(
+            &tx,
+            conversation_id,
+            conv_last_ts,
+            inserted_last_idx,
+            inserted_last_created_at,
+        )?;
+        if let Some(lookup_key) = conversation_external_lookup_key_for_conv(agent_id, conv) {
+            franken_update_external_conversation_tail_lookup_key(
+                &tx,
+                &lookup_key,
+                conv_last_ts,
+                inserted_last_idx,
+                inserted_last_created_at,
+            )?;
+        }
+        if !defer_analytics_updates && !inserted_indices.is_empty() {
+            franken_update_daily_stats_in_tx(
+                self,
+                &tx,
+                &conv.agent_slug,
+                &conv.source_id,
+                conversation_effective_started_at(conv),
+                StatsDelta {
+                    session_count_delta: i64::from(conversation_inserted),
+                    message_count_delta: inserted_indices.len() as i64,
+                    total_chars_delta: inserted_chars,
+                },
+            )?;
+        }
+
+        tx.commit()?;
+        Ok(InsertOutcome {
+            conversation_id,
+            conversation_inserted,
+            inserted_indices,
+        })
+    }
 }
 
 fn normalized_storage_source_parts(
@@ -13571,34 +15007,6 @@ fn franken_insert_new_message(
     franken_last_rowid(tx)
 }
 
-fn franken_insert_new_message_ignore_duplicate(
-    tx: &FrankenTransaction<'_>,
-    conversation_id: i64,
-    msg: &Message,
-) -> Result<Option<i64>> {
-    let (extra_json_str, extra_bin) = franken_message_insert_payload(msg)?;
-    let extra_bin_bytes = extra_bin.as_deref();
-
-    let changed = tx.execute_compat(
-        "INSERT OR IGNORE INTO messages(conversation_id, idx, role, author, created_at, content, extra_json, extra_bin)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
-            fparams![
-                conversation_id,
-                msg.idx,
-                role_as_str(&msg.role),
-                msg.author.as_deref(),
-                msg.created_at,
-                msg.content.as_str(),
-                extra_json_str.as_deref(),
-                extra_bin_bytes
-        ],
-    )?;
-    if changed == 0 {
-        return Ok(None);
-    }
-    franken_last_rowid(tx).map(Some)
-}
-
 type MessageInsertPayload<'a> = (Option<Cow<'a, str>>, Option<Vec<u8>>);
 
 fn franken_message_insert_payload(msg: &Message) -> Result<MessageInsertPayload<'_>> {
@@ -13621,53 +15029,49 @@ fn franken_message_insert_payload(msg: &Message) -> Result<MessageInsertPayload<
 
 /// Batch size for proven-new message inserts.
 ///
-/// Each row binds 8 values, so 100 rows stays well under SQLite's default
-/// `SQLITE_MAX_VARIABLE_NUMBER` limit of 999 while still amortizing parse cost.
-const MESSAGE_INSERT_BATCH_SIZE: usize = 100;
+/// FrankenSQLite permits 32,766 bound variables. Eight columns per message
+/// therefore allow 4,095 rows per statement; the caller still bounds total
+/// retained payload bytes so a huge conversation cannot cause unbounded growth.
+const MESSAGE_INSERT_BATCH_SIZE: usize = 4095;
 
 /// Append workloads profile fastest with larger chunks on current frankensqlite.
 ///
 /// After the tail-state hot table removed conversation-row rewrites from the
 /// append path, 50-row chunks beat the old 20-row setting on the append-merge
 /// profile. 100-row chunks slightly regress the 20-message workload.
-const APPEND_MESSAGE_INSERT_BATCH_SIZE: usize = 50;
+const APPEND_MESSAGE_INSERT_BATCH_SIZE: usize = 4095;
 
-fn message_insert_batch_sql(row_count: usize) -> &'static str {
-    static MESSAGE_INSERT_BATCH_SQL: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+fn message_insert_batch_sql(row_count: usize) -> Arc<str> {
+    static MESSAGE_INSERT_BATCH_SQL: std::sync::OnceLock<
+        parking_lot::Mutex<HashMap<usize, Arc<str>>>,
+    > = std::sync::OnceLock::new();
+    let cache = MESSAGE_INSERT_BATCH_SQL.get_or_init(|| parking_lot::Mutex::new(HashMap::new()));
+    if let Some(sql) = cache.lock().get(&row_count).cloned() {
+        return sql;
+    }
 
-    let max_batch_size = MESSAGE_INSERT_BATCH_SIZE.max(APPEND_MESSAGE_INSERT_BATCH_SIZE);
-    let cached_sql = MESSAGE_INSERT_BATCH_SQL.get_or_init(|| {
-        let mut sql_by_row_count = Vec::with_capacity(max_batch_size + 1);
-        sql_by_row_count.push(String::new());
-        for row_count in 1..=max_batch_size {
-            let placeholders = (0..row_count)
-                .map(|idx| {
-                    let base = idx * 8;
-                    format!(
-                        "(?{},?{},?{},?{},?{},?{},?{},?{})",
-                        base + 1,
-                        base + 2,
-                        base + 3,
-                        base + 4,
-                        base + 5,
-                        base + 6,
-                        base + 7,
-                        base + 8
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(",");
-            sql_by_row_count.push(format!(
-                "INSERT INTO messages(conversation_id, idx, role, author, created_at, content, extra_json, extra_bin) VALUES {placeholders}"
-            ));
-        }
-        sql_by_row_count
-    });
-
-    cached_sql
-        .get(row_count)
-        .map(String::as_str)
-        .expect("message insert batch size must be covered by the cached SQL table")
+    let placeholders = (0..row_count)
+        .map(|idx| {
+            let base = idx * 8;
+            format!(
+                "(?{},?{},?{},?{},?{},?{},?{},?{})",
+                base + 1,
+                base + 2,
+                base + 3,
+                base + 4,
+                base + 5,
+                base + 6,
+                base + 7,
+                base + 8
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql: Arc<str> = Arc::from(format!(
+        "INSERT INTO messages(conversation_id, idx, role, author, created_at, content, extra_json, extra_bin) VALUES {placeholders}"
+    ));
+    cache.lock().insert(row_count, Arc::clone(&sql));
+    sql
 }
 
 fn franken_batch_insert_new_messages(
@@ -13688,15 +15092,22 @@ fn franken_append_insert_new_messages<'a>(
     conversation_id: i64,
     messages: &[&'a Message],
 ) -> Result<Vec<(i64, &'a Message)>> {
-    let mut inserted = Vec::with_capacity(messages.len());
-    for msg in messages {
-        if let Some(message_id) =
-            franken_insert_new_message_ignore_duplicate(tx, conversation_id, msg)?
-        {
-            inserted.push((message_id, *msg));
-        }
-    }
-    Ok(inserted)
+    // `collect_append_only_tail_messages` and
+    // `collect_new_messages_for_existing_conversation` have already removed
+    // same-index and replay-equivalent duplicates before this function is
+    // called. The active transaction also serializes the writer, so these are
+    // proven-new rows: use the same bounded batch insert as the profiled path
+    // instead of one INSERT + last_insert_rowid round trip per message.
+    let inserted_ids = franken_batch_insert_new_messages_with_batch_size(
+        tx,
+        conversation_id,
+        messages,
+        APPEND_MESSAGE_INSERT_BATCH_SIZE,
+    )?;
+    Ok(inserted_ids
+        .into_iter()
+        .zip(messages.iter().copied())
+        .collect())
 }
 
 fn franken_batch_insert_new_messages_with_batch_size(
@@ -13727,7 +15138,7 @@ fn franken_batch_insert_new_messages_with_batch_size(
             param_values.push(SqliteValue::from(extra_bin.as_deref()));
         }
 
-        tx.execute_with_params(sql, &param_values)?;
+        tx.execute_with_params_skip_statement_savepoint(&sql, &param_values)?;
 
         let last_id = franken_last_rowid(tx)?;
         let first_id = last_id
@@ -13861,7 +15272,7 @@ fn franken_batch_insert_new_messages_with_profile_batch_size(
         }
 
         let execute_start = Instant::now();
-        tx.execute_with_params(sql, &param_values)?;
+        tx.execute_with_params_skip_statement_savepoint(&sql, &param_values)?;
         profile.execute_duration += execute_start.elapsed();
 
         let rowid_start = Instant::now();
@@ -14008,7 +15419,7 @@ fn franken_existing_message_lookup(
         .max()
         .unwrap_or(min_idx);
     let idx_rows = tx.query_params(
-        "SELECT idx
+        "SELECT idx, role, author, created_at
          FROM messages INDEXED BY sqlite_autoindex_messages_1
          WHERE conversation_id = ?1
            AND idx >= ?2
@@ -14017,20 +15428,30 @@ fn franken_existing_message_lookup(
     )?;
     record_message_lookup_bounded_queries(1, idx_rows.len());
 
-    let mut existing_indices = HashSet::with_capacity(idx_rows.len());
+    let mut existing_indices = HashMap::with_capacity(idx_rows.len());
     for row in idx_rows {
         let idx: i64 = row.get_typed(0)?;
-        existing_indices.insert(idx);
+        let role: String = row.get_typed(1)?;
+        existing_indices.insert(
+            idx,
+            MessageMergeFingerprint {
+                idx,
+                created_at: row.get_typed(3)?,
+                role: role_from_str(&role),
+                author: row.get_typed(2)?,
+                content_hash: [0; 32],
+            },
+        );
     }
 
     let mut by_idx = HashMap::with_capacity(incoming_messages.len().min(existing_indices.len()));
     let mut missing_messages = Vec::new();
     for msg in incoming_messages {
-        if existing_indices.contains(&msg.idx) {
-            // Same-idx messages are skipped by merge policy even when content has
-            // diverged. Use the incoming fingerprint as a lightweight presence
-            // marker so normal reprocessing does not need to read stored content.
-            by_idx.insert(msg.idx, message_merge_fingerprint(msg));
+        if let Some(existing_fingerprint) = existing_indices.get(&msg.idx) {
+            // Same-idx messages are skipped by merge policy even when content
+            // has diverged. Use a payload-free presence marker so normal
+            // reprocessing does not need to hash stored or incoming content.
+            by_idx.insert(msg.idx, existing_fingerprint.clone());
         } else {
             missing_messages.push(msg);
         }
@@ -14343,48 +15764,72 @@ fn franken_batch_insert_fts_on_connection(
     let mut inserted = 0;
 
     for chunk in entries.chunks(FTS5_BATCH_SIZE) {
-        let placeholders: String = chunk
-            .iter()
-            .enumerate()
-            .map(|(i, _)| {
-                let base = i * 7 + 1;
-                format!(
-                    "(?{},?{},?{},?{},?{},?{},?{})",
-                    base,
-                    base + 1,
-                    base + 2,
-                    base + 3,
-                    base + 4,
-                    base + 5,
-                    base + 6
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(",");
+        let mut pending_chunks: Vec<&[FtsEntry]> = vec![chunk];
+        while let Some(chunk) = pending_chunks.pop() {
+            let placeholders: String = chunk
+                .iter()
+                .enumerate()
+                .map(|(i, _)| {
+                    let base = i * 7 + 1;
+                    format!(
+                        "(?{},?{},?{},?{},?{},?{},?{})",
+                        base,
+                        base + 1,
+                        base + 2,
+                        base + 3,
+                        base + 4,
+                        base + 5,
+                        base + 6
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
 
-        let sql = format!(
-            "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at) VALUES {placeholders}"
-        );
+            let sql = format!(
+                "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at) VALUES {placeholders}"
+            );
 
-        let mut param_values: Vec<SqliteValue> = Vec::with_capacity(chunk.len() * 7);
-        for entry in chunk {
-            param_values.push(SqliteValue::from(entry.message_id));
-            param_values.push(SqliteValue::from(entry.content.as_str()));
-            param_values.push(SqliteValue::from(entry.title.as_str()));
-            param_values.push(SqliteValue::from(entry.agent.as_str()));
-            param_values.push(SqliteValue::from(entry.workspace.as_str()));
-            param_values.push(SqliteValue::from(entry.source_path.as_str()));
-            param_values.push(SqliteValue::from(entry.created_at));
+            let mut param_values: Vec<SqliteValue> = Vec::with_capacity(chunk.len() * 7);
+            for entry in chunk {
+                param_values.push(SqliteValue::from(entry.message_id));
+                param_values.push(SqliteValue::from(entry.content.as_str()));
+                param_values.push(SqliteValue::from(entry.title.as_str()));
+                param_values.push(SqliteValue::from(entry.agent.as_str()));
+                param_values.push(SqliteValue::from(entry.workspace.as_str()));
+                param_values.push(SqliteValue::from(entry.source_path.as_str()));
+                param_values.push(SqliteValue::from(entry.created_at));
+            }
+
+            match conn.execute_with_params(&sql, &param_values) {
+                Ok(_) => {
+                    inserted += chunk.len();
+                }
+                Err(err)
+                    if chunk.len() > 1
+                        && fts_messages_integrity_error_from_message(format!(
+                            "inserting into fts_messages: {err:#}"
+                        ))
+                        .is_some() =>
+                {
+                    // A malformed FTS5 segment can be caused by the combined
+                    // term-position payload of an otherwise valid batch. SQL
+                    // statement failure is atomic, so retry the same entries
+                    // at smaller boundaries before declaring the shadow bad.
+                    let midpoint = chunk.len() / 2;
+                    let (left, right) = chunk.split_at(midpoint);
+                    pending_chunks.push(right);
+                    pending_chunks.push(left);
+                }
+                Err(err) => {
+                    return Err(err).with_context(|| {
+                        format!(
+                            "inserting {} rows into fts_messages during streaming FTS maintenance",
+                            chunk.len()
+                        )
+                    });
+                }
+            }
         }
-
-        conn.execute_with_params(&sql, &param_values)
-            .with_context(|| {
-                format!(
-                    "inserting {} rows into fts_messages during streaming FTS maintenance",
-                    chunk.len()
-                )
-            })?;
-        inserted += chunk.len();
     }
 
     Ok(inserted)
@@ -16996,7 +18441,8 @@ pub struct DailyStatsHealth {
 /// Rows per FTS5 INSERT statement during db-resident `fts_messages`
 /// maintenance/rebuild. Each row binds 7 columns (rowid + 6 cols), and
 /// frankensqlite's `MAX_VARIABLE_NUMBER` is 32766, so the hard ceiling is
-/// 32766 / 7 = 4680 rows per statement; 4096 leaves margin (28672 params).
+/// 32766 / 7 = 4680 rows per statement. Keep the operational batch below the
+/// observed FTS5 segment limit as well.
 ///
 /// This value is performance-critical, NOT just a memory knob
 /// (`coding_agent_session_search-nhqw0` / gh #301): `fts_messages` is a
@@ -17010,8 +18456,10 @@ pub struct DailyStatsHealth {
 /// wedged `cass index --full` above ~15-30 MB of content. Issuing one large
 /// param-safe statement per flush collapses that to a handful of re-encodes.
 /// The asymptotic fix (incremental contentless persistence) is tracked in
-/// frankensqlite bd-sf8dx.
-const FTS5_BATCH_SIZE: usize = 4096;
+/// frankensqlite bd-sf8dx. 4096-row statements can fail with `corrupt %_data`
+/// after roughly 3k documents even when the canonical messages are valid, so
+/// the fork uses a conservative 512-row statement.
+const FTS5_BATCH_SIZE: usize = 512;
 
 #[derive(Debug, Clone)]
 struct FtsRebuildMessageRow {
@@ -17061,7 +18509,7 @@ impl FtsEntry {
     /// Create an FTS entry from a message and conversation.
     pub fn from_message(message_id: i64, msg: &Message, conv: &Conversation) -> Self {
         FtsEntry {
-            content: msg.content.clone(),
+            content: fts_content_projection(&msg.content),
             title: conv.title.clone().unwrap_or_default(),
             agent: conv.agent_slug.clone(),
             workspace: conv
@@ -17089,6 +18537,47 @@ impl FtsEntry {
 // Unicode scalar count, and bounds message-body buffer memory.
 const FTS_ENTRY_BATCH_MAX_DOCS: usize = 4000;
 const FTS_ENTRY_BATCH_MAX_CHARS: usize = 32 * 1024 * 1024;
+
+// The canonical message and raw mirror retain the complete body. The
+// database-resident FTS shadow gets a bounded projection because SQLite FTS5
+// cannot encode pathological multi-megabyte tokens (for example a DOM blob
+// with no whitespace) and may fail with a corrupt %_data segment error.
+const FTS_MAX_MESSAGE_CONTENT_BYTES: usize = 1024 * 1024;
+const FTS_MAX_UNBROKEN_TOKEN_BYTES: usize = 16 * 1024;
+const FTS_TRUNCATION_MARKER: &str = "\n[fts projection truncated]";
+
+fn fts_content_projection(content: &str) -> String {
+    let mut projected = String::with_capacity(content.len().min(FTS_MAX_MESSAGE_CONTENT_BYTES));
+    let mut unbroken_bytes = 0usize;
+    let mut truncated = false;
+
+    for ch in content.chars() {
+        let ch_bytes = ch.len_utf8();
+        if projected.len().saturating_add(ch_bytes) > FTS_MAX_MESSAGE_CONTENT_BYTES {
+            truncated = true;
+            break;
+        }
+        if ch.is_whitespace() {
+            unbroken_bytes = 0;
+        } else if unbroken_bytes.saturating_add(ch_bytes) > FTS_MAX_UNBROKEN_TOKEN_BYTES {
+            if projected.len().saturating_add(1).saturating_add(ch_bytes)
+                > FTS_MAX_MESSAGE_CONTENT_BYTES
+            {
+                truncated = true;
+                break;
+            }
+            projected.push(' ');
+            unbroken_bytes = 0;
+        }
+        projected.push(ch);
+        unbroken_bytes = unbroken_bytes.saturating_add(ch_bytes);
+    }
+
+    if truncated || projected.len() < content.len() {
+        projected.push_str(FTS_TRUNCATION_MARKER);
+    }
+    projected
+}
 
 /// Default batch size for the FTS rebuild INSERT (Bug #168).  When
 /// `fts_messages` is empty but `messages` has 100K+ rows, a single unbounded
@@ -18717,6 +20206,35 @@ mod tests {
         );
 
         fs2::FileExt::unlock(&lock_file).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn doctor_storage_readonly_probe_does_not_require_lock_write_access() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("agent_search.db");
+        {
+            let storage = FrankenStorage::open(&db_path).unwrap();
+            storage.close().unwrap();
+        }
+
+        let lock_path = doctor_mutation_lock_path_for_db_open(&db_path).unwrap();
+        let lock_file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        drop(lock_file);
+        fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o444)).unwrap();
+
+        let conn =
+            open_franken_raw_readonly_connection_with_timeout(&db_path, Duration::from_millis(25))
+                .expect("readonly DB probe should open a readable lock file");
+        drop(conn);
     }
 
     #[test]
@@ -21147,6 +22665,36 @@ mod tests {
         assert_eq!(fts_count, conv.messages.len() as i64);
     }
 
+    #[test]
+    fn insert_conversations_batched_handles_frankensqlite_variable_limit_batch() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("large-message-batch.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let agent = Agent {
+            id: None,
+            slug: "codex-large-batch".into(),
+            name: "Codex large batch".into(),
+            version: Some("bulk-test".into()),
+            kind: AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+        let conversation = make_profiled_storage_remote_conversation(91, 4095);
+
+        let outcomes = storage
+            .insert_conversations_batched(&[(agent_id, None, &conversation)])
+            .unwrap();
+
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].inserted_indices.len(), 4095);
+        let message_count: i64 = storage
+            .conn
+            .query_row_map("SELECT COUNT(*) FROM messages", fparams![], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        assert_eq!(message_count, 4095);
+    }
+
     fn make_profiled_storage_remote_conversation(
         external_id: i64,
         msg_count: usize,
@@ -22583,6 +24131,487 @@ mod tests {
             })
             .unwrap();
         assert_eq!(stored_indices, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn doctor_chunk_insert_preserves_identical_payloads_by_exact_idx() {
+        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+        use std::path::PathBuf;
+
+        let _bulk = set_env_var("CASS_DOCTOR_BULK_MESSAGE_INSERTS", "1");
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("doctor-chunk.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let agent_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "codex".into(),
+                name: "Codex".into(),
+                version: Some("doctor-reconstruct".into()),
+                kind: AgentKind::Cli,
+            })
+            .unwrap();
+        let message = |idx: i64| Message {
+            id: None,
+            idx,
+            role: if idx == 0 {
+                MessageRole::User
+            } else {
+                MessageRole::Agent
+            },
+            author: None,
+            created_at: None,
+            content: "identical raw payload".into(),
+            extra_json: serde_json::json!({"cass":{"doctor_reconstruct":{"line":idx+1}}}),
+            snippets: Vec::new(),
+        };
+        let conversation = |messages: Vec<Message>| Conversation {
+            id: None,
+            agent_slug: "codex".into(),
+            workspace: None,
+            external_id: Some("doctor-exact-index-session".into()),
+            title: Some("Doctor exact index session".into()),
+            source_path: PathBuf::from("/tmp/doctor-exact-index.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: None,
+            approx_tokens: None,
+            metadata_json: serde_json::json!({"cass":{"doctor_reconstruct":true}}),
+            messages,
+            source_id: "local".into(),
+            origin_host: None,
+        };
+
+        let first = conversation(vec![message(0), message(1)]);
+        let second = conversation(vec![message(2)]);
+        let first_outcome = storage
+            .insert_doctor_conversation_chunk(agent_id, None, &first)
+            .unwrap();
+        let second_outcome = storage
+            .insert_doctor_conversation_chunk(agent_id, None, &second)
+            .unwrap();
+        let replay_outcome = storage
+            .insert_doctor_conversation_chunk(agent_id, None, &second)
+            .unwrap();
+
+        assert!(first_outcome.conversation_inserted);
+        assert_eq!(first_outcome.inserted_indices, vec![0, 1]);
+        assert!(!second_outcome.conversation_inserted);
+        assert_eq!(second_outcome.inserted_indices, vec![2]);
+        assert!(replay_outcome.inserted_indices.is_empty());
+
+        let stored: Vec<(i64, String)> = storage
+            .conn
+            .query_map_collect(
+                "SELECT idx, content FROM messages ORDER BY idx",
+                fparams![],
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stored.len(), 3);
+        assert_eq!(
+            stored.iter().map(|(idx, _)| *idx).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert!(
+            stored
+                .iter()
+                .all(|(_, content)| content == "identical raw payload")
+        );
+    }
+
+    #[test]
+    fn native_doctor_writer_preserves_exact_indices_and_reopens_with_franken() {
+        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole, Snippet};
+        use std::path::PathBuf;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("doctor-native.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let agent_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "codex".into(),
+                name: "Codex".into(),
+                version: Some("doctor-reconstruct".into()),
+                kind: AgentKind::Cli,
+            })
+            .unwrap();
+        drop(storage);
+
+        let message = |idx: i64| Message {
+            id: None,
+            idx,
+            role: MessageRole::Agent,
+            author: None,
+            created_at: None,
+            content: "native recovery payload".into(),
+            extra_json: serde_json::json!({"idx": idx}),
+            snippets: if idx == 0 {
+                vec![Snippet {
+                    id: None,
+                    file_path: Some(PathBuf::from("src/lib.rs")),
+                    start_line: Some(1),
+                    end_line: Some(2),
+                    language: Some("rust".into()),
+                    snippet_text: Some("fn main()".into()),
+                }]
+            } else {
+                Vec::new()
+            },
+        };
+        let conversation = |messages: Vec<Message>| Conversation {
+            id: None,
+            agent_slug: "codex".into(),
+            workspace: None,
+            external_id: Some("native-doctor-session".into()),
+            title: Some("Native doctor session".into()),
+            source_path: PathBuf::from("/tmp/native-doctor.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: None,
+            approx_tokens: None,
+            metadata_json: serde_json::json!({"native": true}),
+            messages,
+            source_id: "local".into(),
+            origin_host: None,
+        };
+
+        let mut writer = DoctorSqliteWriter::open(&db_path).unwrap();
+        let first = writer
+            .insert_doctor_conversation_chunk(
+                agent_id,
+                None,
+                &conversation(vec![message(0), message(1)]),
+            )
+            .unwrap();
+        let second = writer
+            .insert_doctor_conversation_chunk(agent_id, None, &conversation(vec![message(2)]))
+            .unwrap();
+        assert!(first.conversation_inserted);
+        assert_eq!(first.inserted_indices, vec![0, 1]);
+        assert_eq!(second.inserted_indices, vec![2]);
+        drop(writer);
+
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let stored: Vec<i64> = storage
+            .conn
+            .query_map_collect("SELECT idx FROM messages ORDER BY idx", fparams![], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        assert_eq!(stored, vec![0, 1, 2]);
+        let snippet_count: i64 = storage
+            .conn
+            .query_row("SELECT COUNT(*) FROM snippets")
+            .unwrap()
+            .get_typed(0)
+            .unwrap();
+        assert_eq!(snippet_count, 1);
+    }
+
+    #[test]
+    fn native_doctor_writer_batches_conversations_in_one_transaction() {
+        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+        use std::path::PathBuf;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("doctor-native-batch.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let agent_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "codex".into(),
+                name: "Codex".into(),
+                version: Some("doctor-reconstruct".into()),
+                kind: AgentKind::Cli,
+            })
+            .unwrap();
+        drop(storage);
+
+        let conversation = |external_id: &str, idx: i64| Conversation {
+            id: None,
+            agent_slug: "codex".into(),
+            workspace: None,
+            external_id: Some(external_id.into()),
+            title: Some(external_id.into()),
+            source_path: PathBuf::from(format!("/tmp/{external_id}.jsonl")),
+            started_at: Some(1_700_000_000_000 + idx),
+            ended_at: None,
+            approx_tokens: None,
+            metadata_json: serde_json::json!({"batch": true}),
+            messages: vec![Message {
+                id: None,
+                idx,
+                role: MessageRole::Agent,
+                author: None,
+                created_at: Some(1_700_000_000_000 + idx),
+                content: format!("payload-{external_id}"),
+                extra_json: serde_json::json!({"idx": idx}),
+                snippets: Vec::new(),
+            }],
+            source_id: "local".into(),
+            origin_host: None,
+        };
+        let first = conversation("native-batch-one", 0);
+        let second = conversation("native-batch-two", 1);
+        let chunks = vec![(agent_id, None, &first), (agent_id, None, &second)];
+
+        let mut writer = DoctorSqliteWriter::open(&db_path).unwrap();
+        let outcomes = writer.insert_doctor_conversation_batch(&chunks).unwrap();
+        assert_eq!(outcomes.len(), 2);
+        assert!(outcomes.iter().all(|outcome| outcome.conversation_inserted));
+        assert_eq!(outcomes[0].inserted_indices, vec![0]);
+        assert_eq!(outcomes[1].inserted_indices, vec![1]);
+        let replay = writer.insert_doctor_conversation_batch(&chunks).unwrap();
+        assert!(
+            replay
+                .iter()
+                .all(|outcome| outcome.inserted_indices.is_empty())
+        );
+        drop(writer);
+        assert!(doctor_raw_mirror_tail_metadata_sidecar_is_valid(&db_path));
+
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let row = storage
+            .conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM conversations), (SELECT COUNT(*) FROM messages)",
+            )
+            .unwrap();
+        let counts = (
+            row.get_typed::<i64>(0).unwrap(),
+            row.get_typed::<i64>(1).unwrap(),
+        );
+        assert_eq!(counts, (2, 2));
+        let ledger = storage
+            .conn
+            .query_row(
+                "SELECT conversation_count, message_count, counts_ready
+                 FROM cass_doctor_candidate_counts WHERE singleton = 1",
+            )
+            .unwrap();
+        assert_eq!(ledger.get_typed::<i64>(0).unwrap(), 2);
+        assert_eq!(ledger.get_typed::<i64>(1).unwrap(), 2);
+        assert_eq!(ledger.get_typed::<i64>(2).unwrap(), 0);
+    }
+
+    #[test]
+    fn doctor_tail_sidecar_is_bound_to_database_file_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("candidate.db");
+        std::fs::write(&db_path, b"database-a").unwrap();
+        persist_doctor_raw_mirror_tail_metadata_sidecar(&db_path).unwrap();
+        assert!(doctor_raw_mirror_tail_metadata_sidecar_is_valid(&db_path));
+
+        let replacement = temp.path().join("candidate.db.replacement");
+        std::fs::write(&replacement, b"database-b").unwrap();
+        std::fs::rename(&replacement, &db_path).unwrap();
+        assert!(
+            !doctor_raw_mirror_tail_metadata_sidecar_is_valid(&db_path),
+            "a sidecar from a replaced candidate database must never authorize the fast path"
+        );
+    }
+
+    #[test]
+    fn doctor_wal_autocheckpoint_defaults_to_bounded_bulk_import_cadence() {
+        assert_eq!(doctor_wal_autocheckpoint_pages_from_value(None), 65_536);
+        assert_eq!(
+            doctor_wal_autocheckpoint_pages_from_value(Some("65536")),
+            65_536
+        );
+        assert_eq!(
+            doctor_wal_autocheckpoint_pages_from_value(Some("0")),
+            65_536
+        );
+        assert_eq!(
+            doctor_wal_autocheckpoint_pages_from_value(Some("not-a-number")),
+            65_536
+        );
+    }
+
+    #[test]
+    fn doctor_native_message_batch_rows_respects_sqlite_variable_limit() {
+        let _rows = set_env_var("CASS_DOCTOR_NATIVE_MESSAGE_BATCH_ROWS", "4096");
+        assert_eq!(doctor_native_message_batch_rows(), 4095);
+    }
+
+    #[test]
+    fn doctor_writer_applies_bounded_wal_autocheckpoint() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("doctor-wal.db");
+        let writer = DoctorSqliteWriter::open(&db_path).unwrap();
+        let pages: i64 = writer
+            .conn
+            .query_row("PRAGMA wal_autocheckpoint", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(pages, 65_536);
+    }
+
+    #[test]
+    #[ignore = "explicit recovery-writer benchmark"]
+    fn native_doctor_writer_batch_commit_benchmark() {
+        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+        use std::path::PathBuf;
+        use std::time::Instant;
+
+        const CONVERSATIONS: usize = 256;
+        let dir = TempDir::new().unwrap();
+        let agent = Agent {
+            id: None,
+            slug: "codex".into(),
+            name: "Codex".into(),
+            version: Some("doctor-reconstruct".into()),
+            kind: AgentKind::Cli,
+        };
+        let make_conversations = || {
+            (0..CONVERSATIONS)
+                .map(|index| Conversation {
+                    id: None,
+                    agent_slug: "codex".into(),
+                    workspace: None,
+                    external_id: Some(format!("benchmark-{index}")),
+                    title: Some(format!("benchmark-{index}")),
+                    source_path: PathBuf::from(format!("/tmp/benchmark-{index}.jsonl")),
+                    started_at: Some(1_700_000_000_000 + index as i64),
+                    ended_at: None,
+                    approx_tokens: None,
+                    metadata_json: serde_json::json!({"benchmark": true}),
+                    messages: vec![Message {
+                        id: None,
+                        idx: 0,
+                        role: MessageRole::Agent,
+                        author: None,
+                        created_at: Some(1_700_000_000_000 + index as i64),
+                        content: "recovery benchmark payload".into(),
+                        extra_json: serde_json::Value::Null,
+                        snippets: Vec::new(),
+                    }],
+                    source_id: "local".into(),
+                    origin_host: None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let conversations = make_conversations();
+
+        let run = |path: &PathBuf, group_size: usize| {
+            let storage = SqliteStorage::open(path).unwrap();
+            let agent_id = storage.ensure_agent(&agent).unwrap();
+            drop(storage);
+            let chunks = conversations
+                .iter()
+                .map(|conversation| (agent_id, None, conversation))
+                .collect::<Vec<_>>();
+            let start = Instant::now();
+            let mut writer = DoctorSqliteWriter::open(path).unwrap();
+            let mut outcomes = 0;
+            for group in chunks.chunks(group_size) {
+                outcomes += writer
+                    .insert_doctor_conversation_batch(group)
+                    .unwrap()
+                    .len();
+            }
+            assert_eq!(outcomes, CONVERSATIONS);
+            (start.elapsed(), outcomes)
+        };
+
+        let (individual_elapsed, _) = run(&dir.path().join("individual.db"), 1);
+        eprintln!(
+            "CASS_DOCTOR_BATCH_BENCH conversations={} group_size=1 elapsed_ms={}",
+            CONVERSATIONS,
+            individual_elapsed.as_secs_f64() * 1000.0
+        );
+        for group_size in [4, 16, 64, 256] {
+            let (elapsed, _) = run(
+                &dir.path().join(format!("batch-{group_size}.db")),
+                group_size,
+            );
+            eprintln!(
+                "CASS_DOCTOR_BATCH_BENCH conversations={} group_size={} elapsed_ms={} speedup={:.2}x",
+                CONVERSATIONS,
+                group_size,
+                elapsed.as_secs_f64() * 1000.0,
+                individual_elapsed.as_secs_f64() / elapsed.as_secs_f64()
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "explicit recovery-writer benchmark"]
+    fn native_doctor_writer_message_batch_benchmark() {
+        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+        use std::path::PathBuf;
+        use std::time::Instant;
+
+        const MESSAGES: usize = 4096;
+        let dir = TempDir::new().unwrap();
+        let agent = Agent {
+            id: None,
+            slug: "codex".into(),
+            name: "Codex".into(),
+            version: Some("doctor-reconstruct".into()),
+            kind: AgentKind::Cli,
+        };
+        let conversation = Conversation {
+            id: None,
+            agent_slug: "codex".into(),
+            workspace: None,
+            external_id: Some("message-batch-benchmark".into()),
+            title: Some("message-batch-benchmark".into()),
+            source_path: PathBuf::from("/tmp/message-batch-benchmark.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: None,
+            approx_tokens: None,
+            metadata_json: serde_json::json!({"benchmark": true}),
+            messages: (0..MESSAGES)
+                .map(|idx| Message {
+                    id: None,
+                    idx: idx as i64,
+                    role: MessageRole::Agent,
+                    author: None,
+                    created_at: Some(1_700_000_000_000 + idx as i64),
+                    content: "message batch benchmark payload".into(),
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                })
+                .collect(),
+            source_id: "local".into(),
+            origin_host: None,
+        };
+
+        let run = |path: &PathBuf, rows: &str| {
+            let storage = SqliteStorage::open(path).unwrap();
+            let agent_id = storage.ensure_agent(&agent).unwrap();
+            drop(storage);
+            let _rows = set_env_var("CASS_DOCTOR_NATIVE_MESSAGE_BATCH_ROWS", rows);
+            let effective_rows = doctor_native_message_batch_rows();
+            let start = Instant::now();
+            let mut writer = DoctorSqliteWriter::open(path).unwrap();
+            let outcome = writer
+                .insert_doctor_conversation_chunk(agent_id, None, &conversation)
+                .unwrap();
+            assert_eq!(outcome.inserted_indices.len(), MESSAGES);
+            (start.elapsed(), effective_rows)
+        };
+        let (scalar_elapsed, scalar_rows) = run(&dir.path().join("scalar.db"), "1");
+        eprintln!(
+            "CASS_DOCTOR_MESSAGE_BATCH_BENCH messages={} requested_rows=1 effective_rows={} elapsed_ms={}",
+            MESSAGES,
+            scalar_rows,
+            scalar_elapsed.as_secs_f64() * 1000.0
+        );
+        for rows in [64, 128, 256, 512, 1024, 2048, 4096] {
+            let (elapsed, effective_rows) = run(
+                &dir.path().join(format!("batched-{rows}.db")),
+                &rows.to_string(),
+            );
+            eprintln!(
+                "CASS_DOCTOR_MESSAGE_BATCH_BENCH messages={} requested_rows={} effective_rows={} elapsed_ms={} speedup={:.2}x",
+                MESSAGES,
+                rows,
+                effective_rows,
+                elapsed.as_secs_f64() * 1000.0,
+                scalar_elapsed.as_secs_f64() / elapsed.as_secs_f64()
+            );
+        }
     }
 
     #[test]
@@ -25472,6 +27501,81 @@ mod tests {
     }
 
     #[test]
+    fn native_lexical_stream_preserves_order_and_roles() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let agent = Agent {
+            id: None,
+            slug: "codex".into(),
+            name: "Codex".into(),
+            version: Some("0.2.3".into()),
+            kind: AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+        let conversation = Conversation {
+            id: None,
+            agent_slug: "codex".into(),
+            workspace: Some(PathBuf::from("/tmp/workspace")),
+            external_id: Some("native-lexical-stream".into()),
+            title: Some("Native lexical stream".into()),
+            source_path: PathBuf::from("/tmp/native-lexical-stream.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_100),
+            approx_tokens: Some(42),
+            metadata_json: serde_json::Value::Null,
+            messages: vec![
+                Message {
+                    id: None,
+                    idx: 0,
+                    role: MessageRole::User,
+                    author: Some("user".into()),
+                    created_at: Some(1_700_000_000_010),
+                    content: "first".into(),
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                },
+                Message {
+                    id: None,
+                    idx: 1,
+                    role: MessageRole::Tool,
+                    author: Some("tool".into()),
+                    created_at: Some(1_700_000_000_020),
+                    content: "second".into(),
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                },
+            ],
+            source_id: LOCAL_SOURCE_ID.into(),
+            origin_host: None,
+        };
+        let conversation_id = storage
+            .insert_conversation_tree(agent_id, None, &conversation)
+            .unwrap()
+            .conversation_id;
+
+        let mut rows = Vec::new();
+        SqliteStorage::stream_messages_for_lexical_rebuild_native(
+            &db_path,
+            conversation_id,
+            conversation_id,
+            |row| {
+                rows.push(row);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].conversation_id, conversation_id);
+        assert_eq!(rows[0].idx, 0);
+        assert_eq!(rows[0].role, "user");
+        assert_eq!(rows[1].idx, 1);
+        assert_eq!(rows[1].role, "tool");
+        assert_eq!(rows[1].id, 2);
+    }
+
+    #[test]
     fn fetch_messages_for_lexical_rebuild_batch_enforces_content_byte_guardrail() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("test.db");
@@ -25537,6 +27641,209 @@ mod tests {
             message.contains("content-byte guardrail"),
             "expected guardrail reason in error, got {message}"
         );
+    }
+
+    #[test]
+    fn semantic_backfill_message_guardrail_rejects_before_body_materialization() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("semantic-guard.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let agent_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "codex".into(),
+                name: "Codex".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            })
+            .unwrap();
+        let conversation_id = storage
+            .insert_conversation_tree(
+                agent_id,
+                None,
+                &Conversation {
+                    id: None,
+                    agent_slug: "codex".into(),
+                    workspace: None,
+                    external_id: Some("semantic-guard".into()),
+                    title: None,
+                    source_path: PathBuf::from("/tmp/semantic-guard.jsonl"),
+                    started_at: None,
+                    ended_at: None,
+                    approx_tokens: None,
+                    metadata_json: serde_json::Value::Null,
+                    messages: vec![Message {
+                        id: None,
+                        idx: 0,
+                        role: MessageRole::User,
+                        author: None,
+                        created_at: None,
+                        content: "x".repeat(64),
+                        extra_json: serde_json::Value::Null,
+                        snippets: Vec::new(),
+                    }],
+                    source_id: LOCAL_SOURCE_ID.into(),
+                    origin_host: None,
+                },
+            )
+            .unwrap()
+            .conversation_id;
+
+        let error = storage
+            .fetch_messages_for_semantic_backfill(conversation_id, None, 32)
+            .expect_err("semantic raw-message guardrail should reject before loading content");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("semantic backfill raw-message guardrail"),
+            "expected semantic guardrail reason in error, got {message}"
+        );
+
+        let messages = storage
+            .fetch_messages_for_semantic_backfill(conversation_id, None, 0)
+            .unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content.len(), 64);
+    }
+
+    #[test]
+    fn semantic_backfill_message_guardrail_only_checks_post_cursor_rows() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("semantic-guard-cursor.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let agent_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "codex".into(),
+                name: "Codex".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            })
+            .unwrap();
+        let conversation_id = storage
+            .insert_conversation_tree(
+                agent_id,
+                None,
+                &Conversation {
+                    id: None,
+                    agent_slug: "codex".into(),
+                    workspace: None,
+                    external_id: Some("semantic-guard-cursor".into()),
+                    title: None,
+                    source_path: PathBuf::from("/tmp/semantic-guard-cursor.jsonl"),
+                    started_at: None,
+                    ended_at: None,
+                    approx_tokens: None,
+                    metadata_json: serde_json::Value::Null,
+                    messages: vec![
+                        Message {
+                            id: None,
+                            idx: 0,
+                            role: MessageRole::User,
+                            author: None,
+                            created_at: None,
+                            content: "x".repeat(64),
+                            extra_json: serde_json::Value::Null,
+                            snippets: Vec::new(),
+                        },
+                        Message {
+                            id: None,
+                            idx: 1,
+                            role: MessageRole::Agent,
+                            author: None,
+                            created_at: None,
+                            content: "ok".into(),
+                            extra_json: serde_json::Value::Null,
+                            snippets: Vec::new(),
+                        },
+                    ],
+                    source_id: LOCAL_SOURCE_ID.into(),
+                    origin_host: None,
+                },
+            )
+            .unwrap()
+            .conversation_id;
+
+        let all_messages = storage
+            .fetch_messages_for_semantic_backfill(conversation_id, None, 0)
+            .unwrap();
+        let first_message_id = all_messages[0].id.unwrap();
+        let messages = storage
+            .fetch_messages_for_semantic_backfill(conversation_id, Some(first_message_id), 32)
+            .unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content, "ok");
+    }
+
+    #[test]
+    fn semantic_backfill_conversation_bounds_reject_large_conversation_before_fetch() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("semantic-guard-bounds.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let agent_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "codex".into(),
+                name: "Codex".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            })
+            .unwrap();
+        let conversation_id = storage
+            .insert_conversation_tree(
+                agent_id,
+                None,
+                &Conversation {
+                    id: None,
+                    agent_slug: "codex".into(),
+                    workspace: None,
+                    external_id: Some("semantic-guard-bounds".into()),
+                    title: None,
+                    source_path: PathBuf::from("/tmp/semantic-guard-bounds.jsonl"),
+                    started_at: None,
+                    ended_at: None,
+                    approx_tokens: None,
+                    metadata_json: serde_json::Value::Null,
+                    messages: vec![
+                        Message {
+                            id: None,
+                            idx: 0,
+                            role: MessageRole::User,
+                            author: None,
+                            created_at: None,
+                            content: "first".into(),
+                            extra_json: serde_json::Value::Null,
+                            snippets: Vec::new(),
+                        },
+                        Message {
+                            id: None,
+                            idx: 1,
+                            role: MessageRole::Agent,
+                            author: None,
+                            created_at: None,
+                            content: "second".into(),
+                            extra_json: serde_json::Value::Null,
+                            snippets: Vec::new(),
+                        },
+                    ],
+                    source_id: LOCAL_SOURCE_ID.into(),
+                    origin_host: None,
+                },
+            )
+            .unwrap()
+            .conversation_id;
+
+        let error = storage
+            .check_semantic_backfill_conversation_bounds(conversation_id, None, 1, 0)
+            .expect_err("aggregate message guardrail should reject before fetch");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("conversation message-count guardrail"),
+            "expected aggregate guardrail reason in error, got {message}"
+        );
+        let (messages, bytes) = storage
+            .check_semantic_backfill_conversation_bounds(conversation_id, Some(1), 1, 0)
+            .unwrap();
+        assert_eq!((messages, bytes), (1, 6));
     }
 
     #[test]
@@ -29194,6 +31501,25 @@ mod tests {
     }
 
     #[test]
+    fn fts_content_projection_bounds_pathological_message_bodies() {
+        let content = format!(
+            "searchable-prefix {}",
+            "x".repeat(2 * FTS_MAX_MESSAGE_CONTENT_BYTES)
+        );
+        let projected = fts_content_projection(&content);
+
+        assert!(projected.len() <= FTS_MAX_MESSAGE_CONTENT_BYTES + FTS_TRUNCATION_MARKER.len());
+        assert!(projected.contains("searchable-prefix"));
+        assert!(projected.ends_with(FTS_TRUNCATION_MARKER));
+        assert!(
+            projected
+                .split_whitespace()
+                .all(|token| token.len() <= FTS_MAX_UNBROKEN_TOKEN_BYTES),
+            "the FTS projection must split long unbroken tokens"
+        );
+    }
+
+    #[test]
     fn fts_messages_integrity_reports_missing_shadow_tables() {
         let direct_missing_shadow = fts_messages_integrity_error_from_message(
             "inserting 10000 rows into fallback FTS: table not found: fts_messages_data",
@@ -29202,6 +31528,13 @@ mod tests {
         assert_eq!(
             direct_missing_shadow.missing_shadow_tables(),
             &["fts_messages_data"]
+        );
+        assert!(
+            fts_messages_integrity_error_from_message(
+                "inserting rows into fts_messages: fts5: corrupt %_data record: segment leaf term offset exceeds u16"
+            )
+            .is_some(),
+            "malformed FTS5 segment pages must trigger derived-shadow recovery"
         );
 
         let dir = TempDir::new().unwrap();

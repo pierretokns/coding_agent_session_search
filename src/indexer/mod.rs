@@ -35,7 +35,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, never, select};
-use frankensearch::index::VectorIndex as FsVectorIndex;
+use frankensearch::index::{
+    HNSW_DEFAULT_EF_SEARCH as FS_HNSW_DEFAULT_EF_SEARCH, VectorIndex as FsVectorIndex,
+};
 use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
 #[cfg(test)]
 use frankensqlite::compat::{
@@ -64,7 +66,7 @@ use crate::connectors::{
 };
 use crate::model::conversation_packet::{
     CONVERSATION_PACKET_VERSION, ConversationPacket, ConversationPacketHashes,
-    ConversationPacketProvenance, ConversationPacketSinkProjections,
+    ConversationPacketProvenance, ConversationPacketReplayText, ConversationPacketSinkProjections,
 };
 use crate::search::asset_state::{SearchMaintenanceJobKind, SearchMaintenanceMode};
 use crate::search::canonicalize::is_hard_message_noise;
@@ -86,14 +88,14 @@ use crate::storage::sqlite::{
     seed_canonical_from_best_historical_bundle,
 };
 use semantic::{
-    EmbeddingInput, SemanticIndexer, packet_embedding_inputs_from_storage_since,
-    packet_embedding_inputs_from_storage_with_progress, semantic_doc_id_for_input,
+    EmbeddingInput, SemanticBackfillStoragePlan, SemanticIndexer,
+    packet_embedding_inputs_from_storage_since, semantic_doc_id_for_input,
     visit_packet_embedding_inputs_from_storage,
 };
 
 use crate::search::policy::{CHUNKING_STRATEGY_VERSION, SEMANTIC_SCHEMA_VERSION};
 use crate::search::semantic_manifest::{
-    ArtifactRecord, SemanticManifest, TierKind as SemanticTierKind,
+    ArtifactRecord, HnswRecord, SemanticManifest, TierKind as SemanticTierKind,
 };
 
 #[cfg(test)]
@@ -105,6 +107,7 @@ type BatchClassificationMap =
 
 const LEXICAL_REBUILD_PACKET_VERSION: u32 = CONVERSATION_PACKET_VERSION;
 const CODEX_INDEXER_EXTRA_COMPACT_THRESHOLD_BYTES: u64 = 16 * 1024 * 1024;
+const DEFAULT_SEMANTIC_FIRST_BUILD_BATCH_CONVERSATIONS: usize = 64;
 const PREPARSE_PRIMARY_SOURCE_CAPTURE_LIMIT: usize = 256;
 const WATCH_INGEST_DEFAULT_CHUNK_SIZE: usize = 32;
 const WATCH_INGEST_CHUNK_SIZE_MAX: usize = 512;
@@ -2510,13 +2513,90 @@ fn matching_lexical_rebuild_state_status_if_present(
     index_path: &Path,
     load_current_db_state: impl FnOnce() -> Result<LexicalRebuildDbState>,
 ) -> Result<MatchingLexicalRebuildStateStatus> {
-    let Some(state) = load_lexical_rebuild_state(index_path)? else {
-        return Ok(MatchingLexicalRebuildStateStatus::default());
-    };
     let db_state = load_current_db_state()?;
+    let Some(state) = load_lexical_rebuild_state(index_path)? else {
+        // The generation manifest is published atomically after the Tantivy
+        // commit, but older materialization/recovery paths could lose the
+        // checkpoint sidecar while leaving the validated live generation
+        // intact. Treat that manifest as a conservative identity anchor so a
+        // missing sidecar does not trigger a full rebuild loop.
+        return Ok(matching_published_lexical_generation_status(
+            index_path, &db_state,
+        ));
+    };
     Ok(matching_lexical_rebuild_state_status_for_loaded_state(
         state, &db_state,
     ))
+}
+
+fn published_lexical_generation_matches_db_state(
+    manifest: &lexical_generation::LexicalGenerationManifest,
+    db_state: &LexicalRebuildDbState,
+    observed_tantivy_docs: usize,
+) -> bool {
+    manifest.is_serveable()
+        && manifest.source_db_fingerprint == db_state.storage_fingerprint
+        && manifest.conversation_count
+            == u64::try_from(db_state.total_conversations).unwrap_or(u64::MAX)
+        && manifest.indexed_doc_count == u64::try_from(observed_tantivy_docs).unwrap_or(u64::MAX)
+        && manifest.message_count >= manifest.indexed_doc_count
+}
+
+fn matching_published_lexical_generation_status(
+    index_path: &Path,
+    db_state: &LexicalRebuildDbState,
+) -> MatchingLexicalRebuildStateStatus {
+    let manifest = match lexical_generation::load_manifest(index_path) {
+        Ok(Some(manifest)) => manifest,
+        Ok(None) => return MatchingLexicalRebuildStateStatus::default(),
+        Err(err) => {
+            tracing::debug!(
+                error = %err,
+                "could not load lexical generation manifest while recovering missing rebuild checkpoint"
+            );
+            return MatchingLexicalRebuildStateStatus::default();
+        }
+    };
+    let observed_tantivy_docs = match crate::search::tantivy::validate_searchable_index_contract(
+        index_path,
+    )
+    .and_then(|()| live_tantivy_doc_count(index_path))
+    {
+        Ok(Some(docs)) => docs,
+        Ok(None) => return MatchingLexicalRebuildStateStatus::default(),
+        Err(err) => {
+            tracing::debug!(
+                error = %err,
+                "could not validate lexical generation while recovering missing rebuild checkpoint"
+            );
+            return MatchingLexicalRebuildStateStatus::default();
+        }
+    };
+    if !published_lexical_generation_matches_db_state(&manifest, db_state, observed_tantivy_docs) {
+        tracing::debug!(
+            generation_id = %manifest.generation_id,
+            source_fingerprint_matches = manifest.source_db_fingerprint == db_state.storage_fingerprint,
+            manifest_conversations = manifest.conversation_count,
+            db_conversations = db_state.total_conversations,
+            manifest_indexed_docs = manifest.indexed_doc_count,
+            observed_tantivy_docs,
+            "published lexical generation is not reusable for the current canonical DB"
+        );
+        return MatchingLexicalRebuildStateStatus::default();
+    }
+
+    tracing::info!(
+        generation_id = %manifest.generation_id,
+        indexed_docs = observed_tantivy_docs,
+        "reusing validated lexical generation after rebuild checkpoint sidecar went missing"
+    );
+    MatchingLexicalRebuildStateStatus {
+        has_pending_resume: false,
+        has_completed_checkpoint: true,
+        completed_indexed_docs: Some(observed_tantivy_docs),
+        completed_exact_totals: Some((db_state.total_conversations, observed_tantivy_docs)),
+        completed_storage_fingerprint: Some(db_state.storage_fingerprint.clone()),
+    }
 }
 
 fn matching_completed_lexical_rebuild_state_status_without_fingerprint(
@@ -2658,6 +2738,29 @@ fn should_try_readonly_canonical_force_rebuild(opts: &IndexOptions) -> bool {
         && opts.db_path.exists()
 }
 
+fn native_sqlite_count_conversations_for_force_rebuild(db_path: &Path) -> Result<usize> {
+    let conn = rusqlite::Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| {
+        format!(
+            "opening native SQLite readonly count connection for force rebuild: {}",
+            db_path.display()
+        )
+    })?;
+    conn.busy_timeout(Duration::from_secs(30))?;
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM conversations", [], |row| row.get(0))
+        .with_context(|| {
+            format!(
+                "counting conversations with native SQLite for force rebuild: {}",
+                db_path.display()
+            )
+        })?;
+    Ok(usize::try_from(count.max(0)).unwrap_or(usize::MAX))
+}
+
 fn try_readonly_canonical_force_rebuild(
     opts: &IndexOptions,
     progress_bump: &Arc<AtomicI64>,
@@ -2666,34 +2769,15 @@ fn try_readonly_canonical_force_rebuild(
         return Ok(false);
     }
 
-    let storage = FrankenStorage::open_readonly(&opts.db_path).with_context(|| {
-        format!(
-            "opening canonical database read-only for force rebuild: {}",
-            opts.db_path.display()
-        )
-    })?;
-    let total_conversations = count_total_conversations_exact(&storage)?;
+    let total_conversations = native_sqlite_count_conversations_for_force_rebuild(&opts.db_path)?;
     if total_conversations == 0 {
-        storage.close_without_checkpoint().with_context(|| {
-            format!(
-                "closing empty canonical database after read-only force rebuild preflight: {}",
-                opts.db_path.display()
-            )
-        })?;
         return Ok(false);
     }
-    let total_messages = count_total_messages_exact(&storage)?;
-    storage.close_without_checkpoint().with_context(|| {
-        format!(
-            "closing canonical database before read-only force rebuild: {}",
-            opts.db_path.display()
-        )
-    })?;
 
     tracing::info!(
         db_path = %opts.db_path.display(),
         conversations = total_conversations,
-        messages = total_messages,
+        messages = "deferred_until_rebuild",
         "running force rebuild from populated canonical database without writable storage preflight"
     );
     record_lexical_population_strategy(
@@ -2707,9 +2791,9 @@ fn try_readonly_canonical_force_rebuild(
         "selected_lexical_population_strategy"
     );
 
-    ensure_authoritative_lexical_rebuild_storage_headroom(&opts.data_dir, &opts.db_path)?;
+    ensure_readonly_canonical_lexical_rebuild_storage_headroom(&opts.data_dir, &opts.db_path)?;
     let rebuild_start = Instant::now();
-    let rebuild = rebuild_tantivy_from_db_deferred_startup_with_progress_bump(
+    let rebuild = rebuild_tantivy_from_db_force_rebuild_with_progress_bump(
         &opts.db_path,
         &opts.data_dir,
         total_conversations,
@@ -2722,8 +2806,11 @@ fn try_readonly_canonical_force_rebuild(
         stats.scan_ms = 0;
         stats.index_ms = rebuild_start.elapsed().as_millis() as u64;
         stats.total_conversations = total_conversations;
-        stats.total_messages = total_messages;
-        stats.total_counts_exact = true;
+        // Message totals are intentionally populated from the rebuild's
+        // observed rows below; the preflight no longer performs a blocking
+        // full-table COUNT(*) over the native-created archive.
+        stats.total_messages = 0;
+        stats.total_counts_exact = false;
     }
     if let Some(observed_messages) = rebuild.observed_messages {
         record_exact_total_counts_in_progress(
@@ -3981,25 +4068,99 @@ fn lexical_rebuild_contract_from_grouped_messages(
     conversation: &crate::storage::sqlite::LexicalRebuildConversationRow,
     provenance: &LexicalRebuildPacketProvenance,
     messages: &crate::storage::sqlite::LexicalRebuildGroupedMessageRows,
-) -> ConversationPacket {
-    let canonical_messages = messages
+) -> (ConversationPacketHashes, ConversationPacketSinkProjections) {
+    let canonical = crate::model::types::Conversation {
+        id: conversation.id,
+        agent_slug: conversation.agent_slug.clone(),
+        workspace: conversation.workspace.clone(),
+        external_id: conversation.external_id.clone(),
+        title: conversation.title.clone(),
+        source_path: conversation.source_path.clone(),
+        started_at: conversation.started_at,
+        ended_at: conversation.ended_at,
+        approx_tokens: None,
+        metadata_json: serde_json::Value::Null,
+        messages: Vec::new(),
+        source_id: provenance.source_id.clone(),
+        origin_host: provenance.origin_host.clone(),
+    };
+    let replay_rows = messages
         .iter()
-        .map(|message| crate::model::types::Message {
-            id: None,
+        .map(|message| ConversationPacketReplayText {
             idx: message.idx,
             role: if message.is_tool_role {
-                crate::model::types::MessageRole::Tool
+                "tool"
             } else {
-                crate::model::types::MessageRole::Agent
+                "assistant"
             },
             author: None,
             created_at: message.created_at,
-            content: message.content.clone(),
-            extra_json: serde_json::Value::Null,
-            snippets: Vec::new(),
+            content: message.content.as_str(),
         })
         .collect::<Vec<_>>();
-    lexical_rebuild_contract_from_canonical_messages(conversation, provenance, canonical_messages)
+    ConversationPacket::canonical_replay_hashes_and_projections_from_text(
+        &canonical,
+        &lexical_rebuild_contract_provenance(provenance),
+        &serde_json::Value::Null,
+        &replay_rows,
+    )
+}
+
+fn lexical_rebuild_contract_from_replay_messages(
+    conversation: &crate::storage::sqlite::LexicalRebuildConversationRow,
+    provenance: &LexicalRebuildPacketProvenance,
+    messages: &[crate::model::types::Message],
+) -> (ConversationPacketHashes, ConversationPacketSinkProjections) {
+    let role_strings = messages
+        .iter()
+        .map(|message| match &message.role {
+            crate::model::types::MessageRole::User => "user".to_string(),
+            crate::model::types::MessageRole::Agent => "assistant".to_string(),
+            crate::model::types::MessageRole::Tool => "tool".to_string(),
+            crate::model::types::MessageRole::System => "system".to_string(),
+            crate::model::types::MessageRole::Other(other) => {
+                match other.trim().to_ascii_lowercase().as_str() {
+                    "agent" | "assistant" => "assistant".to_string(),
+                    "user" => "user".to_string(),
+                    "tool" => "tool".to_string(),
+                    "system" => "system".to_string(),
+                    other => other.to_string(),
+                }
+            }
+        })
+        .collect::<Vec<_>>();
+    let replay_rows = messages
+        .iter()
+        .zip(role_strings.iter())
+        .map(|(message, role)| ConversationPacketReplayText {
+            idx: message.idx,
+            role: role.as_str(),
+            author: message.author.as_deref(),
+            created_at: message.created_at,
+            content: message.content.as_str(),
+        })
+        .collect::<Vec<_>>();
+    let canonical = crate::model::types::Conversation {
+        id: conversation.id,
+        agent_slug: conversation.agent_slug.clone(),
+        workspace: conversation.workspace.clone(),
+        external_id: conversation.external_id.clone(),
+        title: conversation.title.clone(),
+        source_path: conversation.source_path.clone(),
+        started_at: conversation.started_at,
+        ended_at: conversation.ended_at,
+        approx_tokens: None,
+        metadata_json: serde_json::Value::Null,
+        messages: Vec::new(),
+        source_id: provenance.source_id.clone(),
+        origin_host: provenance.origin_host.clone(),
+    };
+    ConversationPacket::canonical_replay_hashes_and_projections_from_text(
+        &canonical,
+        &lexical_rebuild_contract_provenance(provenance),
+        &serde_json::Value::Null,
+        &replay_rows,
+    )
 }
 
 fn lexical_rebuild_contract_from_canonical_messages(
@@ -4037,7 +4198,7 @@ impl LexicalRebuildConversationPacket {
     ) -> Self {
         let (provenance, provenance_mode) =
             lexical_rebuild_packet_provenance_from_canonical(&conversation, source_map);
-        let contract =
+        let (contract_hashes, contract_projections) =
             lexical_rebuild_contract_from_grouped_messages(&conversation, &provenance, &messages);
         Self::from_canonical_replay_parts(
             conversation,
@@ -4045,7 +4206,8 @@ impl LexicalRebuildConversationPacket {
             last_message_id,
             provenance,
             provenance_mode,
-            contract,
+            contract_hashes,
+            contract_projections,
         )
     }
 
@@ -4056,11 +4218,8 @@ impl LexicalRebuildConversationPacket {
     ) -> Result<Self> {
         let (provenance, provenance_mode) =
             lexical_rebuild_packet_provenance_from_canonical(&conversation, source_map);
-        let contract = lexical_rebuild_contract_from_canonical_messages(
-            &conversation,
-            &provenance,
-            messages.clone(),
-        );
+        let (contract_hashes, contract_projections) =
+            lexical_rebuild_contract_from_replay_messages(&conversation, &provenance, &messages);
         let mut grouped_rows = crate::storage::sqlite::LexicalRebuildGroupedMessageRows::new();
         grouped_rows.reserve(messages.len());
         let mut last_message_id = None;
@@ -4085,7 +4244,8 @@ impl LexicalRebuildConversationPacket {
             last_message_id,
             provenance,
             provenance_mode,
-            contract,
+            contract_hashes,
+            contract_projections,
         ))
     }
 
@@ -4095,12 +4255,11 @@ impl LexicalRebuildConversationPacket {
         last_message_id: Option<i64>,
         provenance: LexicalRebuildPacketProvenance,
         provenance_mode: LexicalRebuildPacketProvenanceMode,
-        contract: ConversationPacket,
+        contract_hashes: ConversationPacketHashes,
+        contract_projections: ConversationPacketSinkProjections,
     ) -> Self {
-        let message_count = contract.payload.messages.len();
-        let message_bytes = contract.projections.lexical.total_content_bytes;
-        let contract_hashes = contract.hashes;
-        let contract_projections = contract.projections;
+        let message_count = messages.len();
+        let message_bytes = contract_projections.lexical.total_content_bytes;
         Self {
             diagnostics: LexicalRebuildPacketDiagnostics {
                 version: LEXICAL_REBUILD_PACKET_VERSION,
@@ -4284,12 +4443,27 @@ pub(crate) struct LexicalRebuildEquivalenceGoldenHit {
 const LEXICAL_REBUILD_EQUIVALENCE_DEFAULT_PROBES: &[&str] =
     &["error", "TODO", "function", "import", "test"];
 
+// BLAKE3's own documentation puts the crossover for its Rayon-backed update
+// above roughly 128 KiB on x86_64. Keep short messages on the cheaper serial
+// path; use the exact same byte stream and only change the internal join
+// strategy for pathological/large documents.
+const LEXICAL_REBUILD_EQUIVALENCE_RAYON_MIN_BYTES: usize = 128 * 1024;
+const LEXICAL_REBUILD_EQUIVALENCE_PARALLEL_CHUNK_BYTES: usize = 8 * 1024 * 1024;
+
 struct LexicalRebuildEquivalenceAccumulator {
     document_count: u64,
     manifest_hasher: blake3::Hasher,
     probes: Vec<String>,
     probe_hashers: Vec<blake3::Hasher>,
     probe_counts: Vec<u64>,
+    materialize_duration: Duration,
+    probe_duration: Duration,
+    ordered_hash_duration: Duration,
+}
+
+enum LexicalRebuildEquivalenceProbeHits {
+    Compact(Vec<u64>),
+    Wide(Vec<smallvec::SmallVec<[u64; 1]>>),
 }
 
 impl LexicalRebuildEquivalenceAccumulator {
@@ -4314,114 +4488,230 @@ impl LexicalRebuildEquivalenceAccumulator {
             probes,
             probe_hashers,
             probe_counts,
+            materialize_duration: Duration::ZERO,
+            probe_duration: Duration::ZERO,
+            ordered_hash_duration: Duration::ZERO,
         }
     }
 
-    fn absorb_packet(&mut self, packet: &LexicalRebuildConversationPacket) {
-        let fingerprint = packet.fingerprint_input();
-        // Packet header: version, identity, provenance, counters. Length-prefixed
-        // length-prefixed strings avoid ambiguity across field boundaries.
-        self.manifest_hasher.update(b"pkt");
-        self.manifest_hasher
-            .update(&fingerprint.version.to_le_bytes());
-        lexical_rebuild_equivalence_update_opt_str(
-            &mut self.manifest_hasher,
-            Some(fingerprint.agent),
-        );
-        lexical_rebuild_equivalence_update_opt_str(
-            &mut self.manifest_hasher,
-            fingerprint.external_id,
-        );
-        lexical_rebuild_equivalence_update_opt_str(
-            &mut self.manifest_hasher,
-            fingerprint.workspace,
-        );
-        lexical_rebuild_equivalence_update_opt_str(
-            &mut self.manifest_hasher,
-            Some(fingerprint.source_path),
-        );
-        lexical_rebuild_equivalence_update_opt_str(&mut self.manifest_hasher, fingerprint.title);
-        self.manifest_hasher
-            .update(&fingerprint.started_at.unwrap_or(i64::MIN).to_le_bytes());
-        self.manifest_hasher
-            .update(&fingerprint.ended_at.unwrap_or(i64::MIN).to_le_bytes());
-        lexical_rebuild_equivalence_update_opt_str(
-            &mut self.manifest_hasher,
-            Some(fingerprint.source_id),
-        );
-        lexical_rebuild_equivalence_update_opt_str(
-            &mut self.manifest_hasher,
-            Some(fingerprint.origin_kind),
-        );
-        lexical_rebuild_equivalence_update_opt_str(
-            &mut self.manifest_hasher,
-            fingerprint.origin_host,
-        );
-        self.manifest_hasher
-            .update(&(fingerprint.lexical_projected_content_bytes as u64).to_le_bytes());
-        self.manifest_hasher
-            .update(&(fingerprint.message_count as u64).to_le_bytes());
-        self.manifest_hasher
-            .update(&(fingerprint.message_bytes as u64).to_le_bytes());
-
-        let docs = packet.prebuilt_docs();
-        self.document_count = self.document_count.saturating_add(docs.len() as u64);
-        for doc in &docs {
-            self.manifest_hasher.update(b"doc");
-            lexical_rebuild_equivalence_update_opt_str(&mut self.manifest_hasher, Some(doc.agent));
-            lexical_rebuild_equivalence_update_opt_str(&mut self.manifest_hasher, doc.workspace);
-            lexical_rebuild_equivalence_update_opt_str(
-                &mut self.manifest_hasher,
-                Some(doc.source_path),
-            );
-            self.manifest_hasher.update(&doc.msg_idx.to_le_bytes());
-            self.manifest_hasher
-                .update(&doc.created_at.unwrap_or(i64::MIN).to_le_bytes());
-            lexical_rebuild_equivalence_update_opt_str(&mut self.manifest_hasher, doc.title);
-            self.manifest_hasher
-                .update(&(doc.content.len() as u64).to_le_bytes());
-            self.manifest_hasher.update(doc.content.as_bytes());
-            lexical_rebuild_equivalence_update_opt_str(
-                &mut self.manifest_hasher,
-                Some(doc.source_id),
-            );
-            lexical_rebuild_equivalence_update_opt_str(
-                &mut self.manifest_hasher,
-                Some(doc.origin_kind),
-            );
-            lexical_rebuild_equivalence_update_opt_str(&mut self.manifest_hasher, doc.origin_host);
-
-            for ((probe, hasher), count) in self
-                .probes
-                .iter()
-                .zip(self.probe_hashers.iter_mut())
-                .zip(self.probe_counts.iter_mut())
+    fn probe_hit_mask_for_doc(
+        &self,
+        doc: &frankensearch::lexical_tantivy::CassDocumentRef<'_>,
+    ) -> u64 {
+        let mut hits = 0_u64;
+        for (probe_idx, probe) in self.probes.iter().enumerate() {
+            if doc.content.contains(probe)
+                || doc.title.is_some_and(|title| title.contains(probe))
+                || doc
+                    .workspace
+                    .is_some_and(|workspace| workspace.contains(probe))
+                || doc.source_path.contains(probe)
             {
-                let probe_str = probe.as_str();
-                let hit = doc.content.contains(probe_str)
-                    || doc
-                        .title
-                        .map(|value| value.contains(probe_str))
-                        .unwrap_or(false)
-                    || doc
-                        .workspace
-                        .map(|value| value.contains(probe_str))
-                        .unwrap_or(false)
-                    || doc.source_path.contains(probe_str);
-                if hit {
-                    *count = count.saturating_add(1);
-                    hasher.update(b"hit");
-                    lexical_rebuild_equivalence_update_opt_str(hasher, Some(doc.source_path));
-                    hasher.update(&doc.msg_idx.to_le_bytes());
-                    hasher.update(&doc.created_at.unwrap_or(i64::MIN).to_le_bytes());
-                    hasher.update(&(doc.content.len() as u64).to_le_bytes());
-                    hasher.update(doc.content.as_bytes());
+                hits |= 1_u64 << probe_idx;
+            }
+        }
+        hits
+    }
+
+    fn probe_hit_words_for_doc(
+        &self,
+        doc: &frankensearch::lexical_tantivy::CassDocumentRef<'_>,
+    ) -> smallvec::SmallVec<[u64; 1]> {
+        let word_count = self.probes.len().div_ceil(64);
+        let mut hits = smallvec::SmallVec::<[u64; 1]>::from_elem(0, word_count);
+        for (probe_idx, probe) in self.probes.iter().enumerate() {
+            if doc.content.contains(probe)
+                || doc.title.is_some_and(|title| title.contains(probe))
+                || doc
+                    .workspace
+                    .is_some_and(|workspace| workspace.contains(probe))
+                || doc.source_path.contains(probe)
+            {
+                hits[probe_idx / 64] |= 1_u64 << (probe_idx % 64);
+            }
+        }
+        hits
+    }
+
+    fn collect_probe_hits(
+        &self,
+        docs: &[frankensearch::lexical_tantivy::CassDocumentRef<'_>],
+        worker_pool: Option<&rayon::ThreadPool>,
+    ) -> LexicalRebuildEquivalenceProbeHits {
+        if self.probes.len() <= 64 {
+            let collect = || {
+                docs.par_iter()
+                    .map(|doc| self.probe_hit_mask_for_doc(doc))
+                    .collect::<Vec<_>>()
+            };
+            return LexicalRebuildEquivalenceProbeHits::Compact(match worker_pool {
+                Some(pool) => pool.install(collect),
+                None => docs
+                    .iter()
+                    .map(|doc| self.probe_hit_mask_for_doc(doc))
+                    .collect(),
+            });
+        }
+
+        let collect = || {
+            docs.par_iter()
+                .map(|doc| self.probe_hit_words_for_doc(doc))
+                .collect::<Vec<_>>()
+        };
+        LexicalRebuildEquivalenceProbeHits::Wide(match worker_pool {
+            Some(pool) => pool.install(collect),
+            None => docs
+                .iter()
+                .map(|doc| self.probe_hit_words_for_doc(doc))
+                .collect(),
+        })
+    }
+
+    #[cfg(test)]
+    fn absorb_packet(&mut self, packet: &LexicalRebuildConversationPacket) {
+        self.absorb_packet_with_pool(packet, None);
+    }
+
+    fn absorb_packet_with_pool(
+        &mut self,
+        packet: &LexicalRebuildConversationPacket,
+        worker_pool: Option<&rayon::ThreadPool>,
+    ) {
+        self.absorb_packets_with_pool(std::slice::from_ref(packet), worker_pool);
+    }
+
+    fn absorb_packets_with_pool(
+        &mut self,
+        packets: &[LexicalRebuildConversationPacket],
+        worker_pool: Option<&rayon::ThreadPool>,
+    ) {
+        if packets.is_empty() {
+            return;
+        }
+
+        let materialize_started = Instant::now();
+        let mut docs = Vec::new();
+        let mut packet_doc_ranges = Vec::with_capacity(packets.len() + 1);
+        packet_doc_ranges.push(0);
+        for packet in packets {
+            let packet_docs = packet.prebuilt_docs();
+            docs.extend(packet_docs);
+            packet_doc_ranges.push(docs.len());
+        }
+        self.materialize_duration += materialize_started.elapsed();
+
+        // The proof's manifest and golden-query hashers are intentionally
+        // consumed below in packet/doc order. Only the independent substring
+        // probes are batched, so Rayon cannot change duplicate or ordering
+        // semantics while this performs one pool dispatch for the whole page.
+        let probe_started = Instant::now();
+        let probe_hits = self.collect_probe_hits(&docs, worker_pool);
+        self.probe_duration += probe_started.elapsed();
+        let ordered_hash_started = Instant::now();
+        let mut manifest_chunk = Vec::with_capacity(
+            LEXICAL_REBUILD_EQUIVALENCE_PARALLEL_CHUNK_BYTES.min(
+                packets
+                    .iter()
+                    .map(|packet| packet.message_bytes)
+                    .sum::<usize>()
+                    .saturating_add(packets.len().saturating_mul(256)),
+            ),
+        );
+        match probe_hits {
+            LexicalRebuildEquivalenceProbeHits::Compact(probe_hits) => {
+                for (packet_idx, packet) in packets.iter().enumerate() {
+                    lexical_rebuild_equivalence_append_packet_header(
+                        &mut manifest_chunk,
+                        packet.fingerprint_input(),
+                    );
+                    let start = packet_doc_ranges[packet_idx];
+                    let end = packet_doc_ranges[packet_idx + 1];
+                    self.document_count = self.document_count.saturating_add((end - start) as u64);
+                    for (doc, probe_hit_mask) in
+                        docs[start..end].iter().zip(&probe_hits[start..end])
+                    {
+                        lexical_rebuild_equivalence_append_doc(&mut manifest_chunk, doc);
+                        self.flush_manifest_chunk_if_ready(&mut manifest_chunk);
+                        self.absorb_doc(doc, |probe_idx| {
+                            probe_hit_mask & (1_u64 << probe_idx) != 0
+                        });
+                    }
                 }
+            }
+            LexicalRebuildEquivalenceProbeHits::Wide(probe_hits) => {
+                for (packet_idx, packet) in packets.iter().enumerate() {
+                    lexical_rebuild_equivalence_append_packet_header(
+                        &mut manifest_chunk,
+                        packet.fingerprint_input(),
+                    );
+                    let start = packet_doc_ranges[packet_idx];
+                    let end = packet_doc_ranges[packet_idx + 1];
+                    self.document_count = self.document_count.saturating_add((end - start) as u64);
+                    for (doc, probe_hit_words) in
+                        docs[start..end].iter().zip(&probe_hits[start..end])
+                    {
+                        lexical_rebuild_equivalence_append_doc(&mut manifest_chunk, doc);
+                        self.flush_manifest_chunk_if_ready(&mut manifest_chunk);
+                        self.absorb_doc(doc, |probe_idx| {
+                            probe_hit_words[probe_idx / 64] & (1_u64 << (probe_idx % 64)) != 0
+                        });
+                    }
+                }
+            }
+        }
+        self.flush_manifest_chunk(&mut manifest_chunk);
+        self.ordered_hash_duration += ordered_hash_started.elapsed();
+    }
+
+    fn flush_manifest_chunk_if_ready(&mut self, chunk: &mut Vec<u8>) {
+        if chunk.len() >= LEXICAL_REBUILD_EQUIVALENCE_PARALLEL_CHUNK_BYTES {
+            self.flush_manifest_chunk(chunk);
+        }
+    }
+
+    fn flush_manifest_chunk(&mut self, chunk: &mut Vec<u8>) {
+        if chunk.is_empty() {
+            return;
+        }
+        lexical_rebuild_equivalence_update_content(&mut self.manifest_hasher, chunk);
+        chunk.clear();
+    }
+
+    fn absorb_doc(
+        &mut self,
+        doc: &frankensearch::lexical_tantivy::CassDocumentRef<'_>,
+        probe_hit: impl Fn(usize) -> bool,
+    ) {
+        for (probe_idx, ((_probe, hasher), count)) in self
+            .probes
+            .iter()
+            .zip(self.probe_hashers.iter_mut())
+            .zip(self.probe_counts.iter_mut())
+            .enumerate()
+        {
+            if probe_hit(probe_idx) {
+                *count = count.saturating_add(1);
+                let mut hit_prefix = smallvec::SmallVec::<[u8; 128]>::new();
+                hit_prefix.extend_from_slice(b"hit");
+                lexical_rebuild_equivalence_append_opt_str(&mut hit_prefix, Some(doc.source_path));
+                hit_prefix.extend_from_slice(&doc.msg_idx.to_le_bytes());
+                hit_prefix.extend_from_slice(&doc.created_at.unwrap_or(i64::MIN).to_le_bytes());
+                hit_prefix.extend_from_slice(&(doc.content.len() as u64).to_le_bytes());
+                hasher.update(&hit_prefix);
+                lexical_rebuild_equivalence_update_content(hasher, doc.content.as_bytes());
             }
         }
     }
 
     fn finalize(self) -> LexicalRebuildEquivalenceEvidence {
+        if std::env::var_os("CASS_TANTIVY_REBUILD_PROFILE").is_some() {
+            eprintln!(
+                "CASS_EQUIVALENCE_PROFILE materialize_ms={:.3} probe_ms={:.3} ordered_hash_ms={:.3}",
+                self.materialize_duration.as_secs_f64() * 1000.0,
+                self.probe_duration.as_secs_f64() * 1000.0,
+                self.ordered_hash_duration.as_secs_f64() * 1000.0,
+            );
+        }
         let manifest_fingerprint = self.manifest_hasher.finalize().to_hex().to_string();
         let mut combined = blake3::Hasher::new();
         let mut golden_query_hit_counts = Vec::with_capacity(self.probes.len());
@@ -4450,16 +4740,75 @@ impl LexicalRebuildEquivalenceAccumulator {
     }
 }
 
-fn lexical_rebuild_equivalence_update_opt_str(hasher: &mut blake3::Hasher, value: Option<&str>) {
+fn lexical_rebuild_equivalence_update_content(hasher: &mut blake3::Hasher, content: &[u8]) {
+    if content.len() >= LEXICAL_REBUILD_EQUIVALENCE_RAYON_MIN_BYTES {
+        hasher.update_rayon(content);
+    } else {
+        hasher.update(content);
+    }
+}
+
+fn lexical_rebuild_equivalence_append_packet_header(
+    output: &mut Vec<u8>,
+    fingerprint: LexicalRebuildPacketFingerprintInput<'_>,
+) {
+    output.extend_from_slice(b"pkt");
+    output.extend_from_slice(&fingerprint.version.to_le_bytes());
+    lexical_rebuild_equivalence_append_opt_str_vec(output, Some(fingerprint.agent));
+    lexical_rebuild_equivalence_append_opt_str_vec(output, fingerprint.external_id);
+    lexical_rebuild_equivalence_append_opt_str_vec(output, fingerprint.workspace);
+    lexical_rebuild_equivalence_append_opt_str_vec(output, Some(fingerprint.source_path));
+    lexical_rebuild_equivalence_append_opt_str_vec(output, fingerprint.title);
+    output.extend_from_slice(&fingerprint.started_at.unwrap_or(i64::MIN).to_le_bytes());
+    output.extend_from_slice(&fingerprint.ended_at.unwrap_or(i64::MIN).to_le_bytes());
+    lexical_rebuild_equivalence_append_opt_str_vec(output, Some(fingerprint.source_id));
+    lexical_rebuild_equivalence_append_opt_str_vec(output, Some(fingerprint.origin_kind));
+    lexical_rebuild_equivalence_append_opt_str_vec(output, fingerprint.origin_host);
+    output.extend_from_slice(&(fingerprint.lexical_projected_content_bytes as u64).to_le_bytes());
+    output.extend_from_slice(&(fingerprint.message_count as u64).to_le_bytes());
+    output.extend_from_slice(&(fingerprint.message_bytes as u64).to_le_bytes());
+}
+
+fn lexical_rebuild_equivalence_append_doc(
+    output: &mut Vec<u8>,
+    doc: &frankensearch::lexical_tantivy::CassDocumentRef<'_>,
+) {
+    output.extend_from_slice(b"doc");
+    lexical_rebuild_equivalence_append_opt_str_vec(output, Some(doc.agent));
+    lexical_rebuild_equivalence_append_opt_str_vec(output, doc.workspace);
+    lexical_rebuild_equivalence_append_opt_str_vec(output, Some(doc.source_path));
+    output.extend_from_slice(&doc.msg_idx.to_le_bytes());
+    output.extend_from_slice(&doc.created_at.unwrap_or(i64::MIN).to_le_bytes());
+    lexical_rebuild_equivalence_append_opt_str_vec(output, doc.title);
+    output.extend_from_slice(&(doc.content.len() as u64).to_le_bytes());
+    output.extend_from_slice(doc.content.as_bytes());
+    lexical_rebuild_equivalence_append_opt_str_vec(output, Some(doc.source_id));
+    lexical_rebuild_equivalence_append_opt_str_vec(output, Some(doc.origin_kind));
+    lexical_rebuild_equivalence_append_opt_str_vec(output, doc.origin_host);
+}
+
+fn lexical_rebuild_equivalence_append_opt_str_vec(output: &mut Vec<u8>, value: Option<&str>) {
     match value {
         Some(s) => {
-            hasher.update(&[0x01_u8]);
-            hasher.update(&(s.len() as u64).to_le_bytes());
-            hasher.update(s.as_bytes());
+            output.push(0x01_u8);
+            output.extend_from_slice(&(s.len() as u64).to_le_bytes());
+            output.extend_from_slice(s.as_bytes());
         }
-        None => {
-            hasher.update(&[0x00_u8]);
+        None => output.push(0x00_u8),
+    }
+}
+
+fn lexical_rebuild_equivalence_append_opt_str<const N: usize>(
+    output: &mut smallvec::SmallVec<[u8; N]>,
+    value: Option<&str>,
+) {
+    match value {
+        Some(s) => {
+            output.push(0x01_u8);
+            output.extend_from_slice(&(s.len() as u64).to_le_bytes());
+            output.extend_from_slice(s.as_bytes());
         }
+        None => output.push(0x00_u8),
     }
 }
 
@@ -4976,6 +5325,18 @@ fn spawn_lexical_rebuild_shard_builder_workers(
                             index_size_bytes,
                             shard_message_bytes,
                         );
+                        if std::env::var_os("CASS_TANTIVY_REBUILD_PROFILE").is_some() {
+                            eprintln!(
+                                "CASS_STAGED_PROFILE stage=shard_build worker={} shard={} writer_parallelism={} duration_ms={} message_bytes={} index_bytes={} amplification_milli={:?}",
+                                worker_idx,
+                                work.shard.shard_index,
+                                work.writer_parallelism,
+                                build_duration_ms,
+                                shard_message_bytes,
+                                index_size_bytes,
+                                amplification_milli,
+                            );
+                        }
                         flow_limiter.release(flow_reservation_bytes);
                         match result {
                             Ok(summary) => {
@@ -5053,6 +5414,7 @@ fn spawn_lexical_rebuild_shard_merge_workers(
                             .iter()
                             .map(|artifact| artifact.index_path.clone())
                             .collect::<Vec<_>>();
+                        let merge_started = Instant::now();
                         // #282: a panicking shard-merge worker used to unwind
                         // silently, leaving the result channel open and parking
                         // the final-frontier reducer forever on
@@ -5062,7 +5424,7 @@ fn spawn_lexical_rebuild_shard_merge_workers(
                             || {
                                 #[cfg(test)]
                                 lexical_rebuild_shard_merge_injected_panic_hook();
-                                crate::search::tantivy::TantivyIndex::merge_compatible_index_directories(
+                                crate::search::tantivy::TantivyIndex::assemble_compatible_index_directories(
                                     &work.output_path,
                                     &input_paths,
                                 )
@@ -5076,6 +5438,17 @@ fn spawn_lexical_rebuild_shard_merge_workers(
                         };
                         match result {
                             Ok(merged_index) => {
+                                if std::env::var_os("CASS_TANTIVY_REBUILD_PROFILE").is_some() {
+                                    eprintln!(
+                                        "CASS_STAGED_PROFILE stage=shard_merge worker={} level={} first_shard={} last_shard={} inputs={} duration_ms={}",
+                                        worker_idx,
+                                        work.output_level,
+                                        first_shard_index,
+                                        last_shard_index,
+                                        input_paths.len(),
+                                        merge_started.elapsed().as_secs_f64() * 1000.0,
+                                    );
+                                }
                                 let docs = work
                                     .input_artifacts
                                     .iter()
@@ -5562,6 +5935,7 @@ impl LexicalRebuildStagedMergeController {
 #[derive(Debug)]
 struct LexicalRebuildStagedShardBuildController {
     max_workers: usize,
+    writer_threads_per_builder: usize,
     loadavg_high_watermark_1m_milli: Option<u32>,
     memory_reserve_bytes: usize,
     emergency_memory_reserve_bytes: usize,
@@ -5569,11 +5943,12 @@ struct LexicalRebuildStagedShardBuildController {
 
 impl LexicalRebuildStagedShardBuildController {
     fn new(max_workers: usize, loadavg_high_watermark_1m_milli: Option<u32>) -> Self {
-        Self::new_with_memory_reserves(
+        Self::new_with_memory_reserves_and_writer_threads(
             max_workers,
             loadavg_high_watermark_1m_milli,
             lexical_rebuild_staged_shard_build_memory_reserve_bytes(),
             lexical_rebuild_staged_shard_build_emergency_memory_reserve_bytes(),
+            1,
         )
     }
 
@@ -5583,9 +5958,26 @@ impl LexicalRebuildStagedShardBuildController {
         memory_reserve_bytes: usize,
         emergency_memory_reserve_bytes: usize,
     ) -> Self {
+        Self::new_with_memory_reserves_and_writer_threads(
+            max_workers,
+            loadavg_high_watermark_1m_milli,
+            memory_reserve_bytes,
+            emergency_memory_reserve_bytes,
+            1,
+        )
+    }
+
+    fn new_with_memory_reserves_and_writer_threads(
+        max_workers: usize,
+        loadavg_high_watermark_1m_milli: Option<u32>,
+        memory_reserve_bytes: usize,
+        emergency_memory_reserve_bytes: usize,
+        writer_threads_per_builder: usize,
+    ) -> Self {
         let memory_reserve_bytes = memory_reserve_bytes.max(1);
         Self {
             max_workers: max_workers.max(1),
+            writer_threads_per_builder: writer_threads_per_builder.max(1),
             loadavg_high_watermark_1m_milli,
             memory_reserve_bytes,
             emergency_memory_reserve_bytes: emergency_memory_reserve_bytes
@@ -5765,11 +6157,15 @@ impl LexicalRebuildStagedShardBuildController {
                 usize::try_from(scaled).unwrap_or(usize::MAX)
             })
             .unwrap_or(0);
-        amplified_message_bytes
+        let estimated_indexing_bytes = amplified_message_bytes
             .max(usize_from_u64_saturating(
                 LEXICAL_REBUILD_STAGED_SHARD_BUILD_MIN_ESTIMATED_BYTES,
             ))
-            .max(1)
+            .max(1);
+        let writer_heap_bytes = (self.writer_threads_per_builder as u64)
+            .saturating_mul(LEXICAL_REBUILD_STAGED_SHARD_BUILD_WRITER_HEAP_PER_THREAD_BYTES)
+            .max(LEXICAL_REBUILD_STAGED_SHARD_BUILD_MIN_WRITER_HEAP_BYTES);
+        estimated_indexing_bytes.saturating_add(usize_from_u64_saturating(writer_heap_bytes))
     }
 }
 
@@ -6023,6 +6419,7 @@ struct LexicalRebuildPerfProfile {
     conversation_list_duration: Duration,
     message_stream_duration: Duration,
     finish_conversation_duration: Duration,
+    equivalence_duration: Duration,
     prepare_duration: Duration,
     add_duration: Duration,
     commit_duration: Duration,
@@ -6047,6 +6444,7 @@ impl LexicalRebuildPerfProfile {
         let heartbeat_persists = self.heartbeat_persist_count.max(1) as f64;
         let accounted_duration = self.conversation_list_duration
             + self.message_stream_duration
+            + self.equivalence_duration
             + self.prepare_duration
             + self.add_duration
             + self.commit_duration
@@ -6062,6 +6460,7 @@ impl LexicalRebuildPerfProfile {
                 "batch_conversations={} batch_messages={} batch_message_bytes={} ",
                 "total_ms={:.3} conversation_list_ms={:.3} message_stream_ms={:.3} ",
                 "finish_conversation_ms={:.3} residual_ms={:.3} ",
+                "equivalence_ms={:.3} ",
                 "prepare_ms={:.3} add_ms={:.3} commit_ms={:.3} ",
                 "pending_progress_ms={:.3} heartbeat_progress_ms={:.3} ",
                 "checkpoint_persist_ms={:.3} meta_fingerprint_ms={:.3} ",
@@ -6080,6 +6479,7 @@ impl LexicalRebuildPerfProfile {
             Self::millis(self.message_stream_duration),
             Self::millis(self.finish_conversation_duration),
             Self::millis(residual_duration),
+            Self::millis(self.equivalence_duration),
             Self::millis(self.prepare_duration),
             Self::millis(self.add_duration),
             Self::millis(self.commit_duration),
@@ -7148,6 +7548,30 @@ fn lexical_rebuild_responsiveness_policy() -> LexicalRebuildResponsivenessPolicy
         LexicalRebuildResponsivenessPolicy::Steady
     } else {
         LexicalRebuildResponsivenessPolicy::Auto
+    }
+}
+
+fn lexical_rebuild_db_path_is_doctor_candidate(db_path: &Path) -> bool {
+    db_path.file_name().and_then(|name| name.to_str()) == Some("candidate.db")
+        && db_path
+            .components()
+            .any(|component| component.as_os_str() == "candidates")
+}
+
+fn lexical_rebuild_responsiveness_policy_for_db(
+    db_path: &Path,
+) -> LexicalRebuildResponsivenessPolicy {
+    // A raw-mirror candidate is an offline, disposable rebuild input.  It has
+    // no interactive search workload to protect, so begin at the steady
+    // budget and avoid paying the conservative-startup ramp on every large
+    // recovery. Explicit operator policy still wins.
+    if dotenvy::var("CASS_TANTIVY_REBUILD_CONTROLLER_MODE").is_err()
+        && !responsiveness::disabled_via_env()
+        && lexical_rebuild_db_path_is_doctor_candidate(db_path)
+    {
+        LexicalRebuildResponsivenessPolicy::Steady
+    } else {
+        lexical_rebuild_responsiveness_policy()
     }
 }
 
@@ -8833,16 +9257,38 @@ fn lexical_rebuild_content_fingerprint(
 }
 
 fn lexical_rebuild_storage_fingerprint(db_path: &Path) -> Result<String> {
-    let mut storage = FrankenStorage::open_readonly(db_path).with_context(|| {
+    // Fingerprinting is a read-only metadata operation. Opening the promoted
+    // archive through FrankenSQLite here forced its eager pager/schema path
+    // before semantic indexing could even start; on the 60 GB archive that
+    // looked like a semantic wedge. Native SQLite answers the three scalar
+    // queries without materializing the archive and matches the fingerprint
+    // contract used by the lexical checkpoint.
+    let conn = rusqlite::Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| {
         format!(
-            "opening readonly storage to compute lexical fingerprint for {}",
+            "opening native SQLite readonly connection to compute lexical fingerprint for {}",
             db_path.display()
         )
     })?;
-    let total_conversations = count_total_conversations_exact(&storage)?;
-    let fingerprint = lexical_rebuild_content_fingerprint(&storage, total_conversations)?;
-    storage.close_best_effort_in_place();
-    Ok(fingerprint)
+    conn.busy_timeout(Duration::from_secs(30))?;
+    conn.execute_batch("PRAGMA query_only = 1;")?;
+    let total_conversations: i64 = conn
+        .query_row("SELECT COUNT(*) FROM conversations", [], |row| row.get(0))
+        .context("counting conversations for lexical fingerprint")?;
+    let max_conversation_id: i64 = conn
+        .query_row("SELECT COALESCE(MAX(id), 0) FROM conversations", [], |row| row.get(0))
+        .context("computing lexical rebuild conversation fingerprint")?;
+    let max_message_id: i64 = conn
+        .query_row("SELECT COALESCE(MAX(id), 0) FROM messages", [], |row| row.get(0))
+        .context("computing lexical rebuild message fingerprint")?;
+    Ok(lexical_rebuild_content_fingerprint_value(
+        usize::try_from(total_conversations.max(0)).unwrap_or(usize::MAX),
+        max_conversation_id,
+        max_message_id,
+    ))
 }
 
 fn count_total_conversations_exact(storage: &FrankenStorage) -> Result<usize> {
@@ -8887,88 +9333,19 @@ fn semantic_model_revision_for_embedder_id(embedder_id: &str) -> String {
     }
 }
 
-/// Republish the semantic manifest after a direct `cass index --semantic`
-/// pass so `cass status` reflects the freshly-built vector index.
+/// Return the bounded conversation window used by the initial semantic build.
 ///
-/// The manifest-backed `cass models backfill` path already does this via
-/// `manifest.publish_artifact(...)` inside `run_backfill_batch`. The
-/// direct path at the call-site below previously skipped the manifest
-/// update entirely, leaving status pointed at stale artifact metadata
-/// even after a successful republish — see issue #203.
-#[allow(clippy::too_many_arguments)]
-fn publish_direct_semantic_artifact(
-    storage: &FrankenStorage,
-    data_dir: &Path,
-    index_path: &Path,
-    embedder_id: &str,
-    embedder_dimension: usize,
-    embedded_doc_count: u64,
-    build_started_at_ms: i64,
-) -> Result<()> {
-    let Some(tier) = semantic_tier_for_embedder_id(embedder_id) else {
-        tracing::debug!(
-            embedder = embedder_id,
-            "skipping direct semantic manifest publish: unknown embedder tier"
-        );
-        return Ok(());
-    };
-
-    // Compute conversation count and fingerprint from the SAME storage
-    // handle so the manifest's `conversation_count` and the count
-    // embedded in `db_fingerprint` (the `content-v1:N:M:K` string) can
-    // never disagree by one. Also avoids re-opening the DB in
-    // `lexical_storage_fingerprint_for_db`, which is a no-op cost on
-    // SQLite but still pointless work.
-    let total_conversations_raw = count_total_conversations_exact(storage)?;
-    let db_fingerprint = lexical_rebuild_content_fingerprint(storage, total_conversations_raw)?;
-    let total_conversations = u64::try_from(total_conversations_raw).unwrap_or(u64::MAX);
-    let size_bytes = fs::metadata(index_path)
-        .with_context(|| {
-            format!(
-                "stat published semantic index {} for direct manifest publish",
-                index_path.display()
-            )
-        })?
-        .len();
-    let relative_index_path = index_path
-        .strip_prefix(data_dir)
-        .unwrap_or(index_path)
-        .to_string_lossy()
-        .into_owned();
-    let model_revision = semantic_model_revision_for_embedder_id(embedder_id);
-
-    let mut manifest = SemanticManifest::load_or_default(data_dir).map_err(|err| {
-        anyhow::anyhow!("loading semantic manifest for direct artifact publish: {err}")
-    })?;
-    let now = semantic_indexing_now_ms();
-    manifest.publish_artifact(ArtifactRecord {
-        tier,
-        embedder_id: embedder_id.to_string(),
-        model_revision,
-        schema_version: SEMANTIC_SCHEMA_VERSION,
-        chunking_version: CHUNKING_STRATEGY_VERSION,
-        dimension: embedder_dimension,
-        doc_count: embedded_doc_count,
-        conversation_count: total_conversations,
-        db_fingerprint: db_fingerprint.clone(),
-        index_path: relative_index_path,
-        size_bytes,
-        started_at_ms: build_started_at_ms,
-        completed_at_ms: now,
-        ready: true,
-    });
-    manifest.refresh_backlog(total_conversations, &db_fingerprint);
-    manifest
-        .save(data_dir)
-        .map_err(|err| anyhow::anyhow!("saving semantic manifest after direct publish: {err}"))?;
-    tracing::info!(
-        embedder = embedder_id,
-        tier = tier.as_str(),
-        doc_count = embedded_doc_count,
-        conversation_count = total_conversations,
-        "published direct semantic artifact to manifest"
-    );
-    Ok(())
+/// The old direct `cass index --semantic` path replayed the entire canonical
+/// archive into one in-memory vector before writing anything. That made the
+/// first build neither restartable nor safe for large CPU-only machines. Keep
+/// the default conservative, while allowing operators to tune the amount of
+/// work between durable checkpoints without changing the storage format.
+fn semantic_first_build_batch_conversations() -> usize {
+    dotenvy::var("CASS_SEMANTIC_FIRST_BUILD_BATCH_CONVERSATIONS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_SEMANTIC_FIRST_BUILD_BATCH_CONVERSATIONS)
 }
 
 fn count_total_messages_exact(storage: &FrankenStorage) -> Result<usize> {
@@ -9095,6 +9472,7 @@ pub(crate) struct LexicalRebuildOutcome {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct LexicalRebuildStartupOptions {
     defer_initial_content_fingerprint: bool,
+    skip_expensive_shard_plan: bool,
 }
 
 fn should_evaluate_incremental_canonical_lexical_repair(
@@ -9990,8 +10368,14 @@ fn lexical_rebuild_default_shard_budget(
 
 const LEXICAL_REBUILD_STAGED_SHARD_MESSAGE_BYTES_FLOOR: usize = 16 * 1024 * 1024;
 const LEXICAL_REBUILD_STAGED_SHARD_MESSAGE_BYTES_DEFAULT: usize = 64 * 1024 * 1024;
-const LEXICAL_REBUILD_STAGED_SHARD_MESSAGE_BYTES_CEILING: usize = 128 * 1024 * 1024;
-const LEXICAL_REBUILD_STAGED_SHARD_MESSAGE_BYTES_MEMORY_FRACTION: u64 = 2_048;
+const LEXICAL_REBUILD_STAGED_SHARD_MESSAGE_BYTES_CEILING: usize = 384 * 1024 * 1024;
+// The staged-shard byte cap is a per-builder working-set guard, not a host
+// allocation target.  A 4,096 divisor made a 64 GiB Mac choose the 16 MiB
+// floor, creating hundreds of avoidably small Tantivy shards on large
+// rebuilds.  Scale to a few hundred MiB on a large Mac, keep a hard ceiling,
+// and leave actual concurrency decisions to the live memory-admission
+// controller.
+const LEXICAL_REBUILD_STAGED_SHARD_MESSAGE_BYTES_MEMORY_FRACTION: u64 = 128;
 
 fn lexical_rebuild_default_staged_shard_max_message_bytes_for_available_memory(
     available_memory_bytes: Option<u64>,
@@ -10190,7 +10574,28 @@ fn plan_lexical_rebuild_shards_from_storage_with_settings(
     settings: &LexicalRebuildPipelineSettingsSnapshot,
     total_conversations: usize,
 ) -> Result<LexicalShardPlan> {
-    if !storage.lexical_rebuild_has_tail_footprint_metadata()? {
+    let prep_profile = std::env::var_os("CASS_PREP_PROFILE").is_some();
+    let profile_started = Instant::now();
+    // Raw-mirror candidates write exact tail indexes in the same transaction
+    // as their messages.  Avoid the expensive FrankenSQLite coverage/count
+    // probes for that explicitly marked path; ordinary databases retain the
+    // conservative metadata-coverage check below.
+    let authoritative_tail_metadata =
+        storage.lexical_rebuild_tail_footprints_are_authoritative()?;
+    if prep_profile {
+        eprintln!(
+            "CASS_PREP_PROFILE storage=footprints step=authority_marker authoritative={} elapsed_ms={}",
+            authoritative_tail_metadata,
+            profile_started.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+    if !authoritative_tail_metadata && !storage.lexical_rebuild_has_tail_footprint_metadata()? {
+        if prep_profile {
+            eprintln!(
+                "CASS_PREP_PROFILE storage=footprints step=tail_coverage_missing elapsed_ms={}",
+                profile_started.elapsed().as_secs_f64() * 1000.0
+            );
+        }
         let total_messages = count_total_messages_exact(storage)?;
         return plan_lexical_rebuild_shards_from_conversation_ids_with_settings(
             storage,
@@ -10201,6 +10606,13 @@ fn plan_lexical_rebuild_shards_from_storage_with_settings(
     }
 
     let conversations = lexical_rebuild_shard_planner_conversations_from_storage(storage)?;
+    if prep_profile {
+        eprintln!(
+            "CASS_PREP_PROFILE storage=footprints step=planner_rows rows={} elapsed_ms={}",
+            conversations.len(),
+            profile_started.elapsed().as_secs_f64() * 1000.0
+        );
+    }
     let total_conversations = conversations.len();
     let total_messages = conversations
         .iter()
@@ -10288,10 +10700,14 @@ impl LexicalRebuildPlannedShardCursor {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct LexicalRebuildShardBuilderSettings {
     max_builders: usize,
-    writer_parallelism_budget: usize,
+    writer_threads_per_builder: usize,
 }
 
-const LEXICAL_REBUILD_STAGED_SHARD_BUILDER_MEMORY_SLOT_BYTES: u64 = 32 * 1024 * 1024 * 1024;
+// This is only an initial builder-farm ceiling.  Actual admission uses the
+// observed shard amplification and live reclaimable memory in
+// LexicalRebuildStagedShardBuildController.  Treating each builder as a
+// 32 GiB reservation serialized recovery on ordinary 64 GiB Macs.
+const LEXICAL_REBUILD_STAGED_SHARD_BUILDER_MEMORY_SLOT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const LEXICAL_REBUILD_STAGED_SHARD_BUILDER_MEMORY_BUDGET_NUMERATOR: u64 = 2;
 const LEXICAL_REBUILD_STAGED_SHARD_BUILDER_MEMORY_BUDGET_DENOMINATOR: u64 = 3;
 const LEXICAL_REBUILD_STAGED_SHARD_BUILD_RESERVE_FRACTION: u64 = 8;
@@ -10305,12 +10721,18 @@ const LEXICAL_REBUILD_STAGED_SHARD_BUILD_EMERGENCY_CEILING_BYTES: u64 = 8 * 1024
 const LEXICAL_REBUILD_STAGED_SHARD_BUILD_AMPLIFICATION_FLOOR_MILLI: u64 = 8_000;
 const LEXICAL_REBUILD_STAGED_SHARD_BUILD_AMPLIFICATION_HEADROOM_MILLI: u64 = 1_500;
 const LEXICAL_REBUILD_STAGED_SHARD_BUILD_MIN_ESTIMATED_BYTES: u64 = 512 * 1024 * 1024;
+const LEXICAL_REBUILD_STAGED_SHARD_BUILD_WRITER_HEAP_PER_THREAD_BYTES: u64 = 128 * 1024 * 1024;
+const LEXICAL_REBUILD_STAGED_SHARD_BUILD_MIN_WRITER_HEAP_BYTES: u64 = 256 * 1024 * 1024;
 
 fn lexical_rebuild_default_staged_shard_builder_parallelism_for_workers_and_memory(
     workers: usize,
     available_memory_bytes: Option<u64>,
 ) -> usize {
-    let cpu_ceiling = workers.clamp(1, 8);
+    // Each shard builder owns a Tantivy writer pool. Keep the default outer
+    // farm small enough that builders × writer threads do not oversubscribe
+    // the host; explicit environment overrides remain available for tuned
+    // machines.
+    let cpu_ceiling = workers.div_ceil(3).clamp(1, 4);
     let Some(available_memory_bytes) = available_memory_bytes else {
         return cpu_ceiling;
     };
@@ -10321,7 +10743,7 @@ fn lexical_rebuild_default_staged_shard_builder_parallelism_for_workers_and_memo
         memory_budget / LEXICAL_REBUILD_STAGED_SHARD_BUILDER_MEMORY_SLOT_BYTES.max(1),
     )
     .unwrap_or(usize::MAX)
-    .clamp(1, 8);
+    .clamp(1, 4);
     cpu_ceiling.min(memory_ceiling).max(1)
 }
 
@@ -10436,35 +10858,26 @@ fn lexical_rebuild_staged_shard_builder_settings(
     planned_shard_count: usize,
 ) -> LexicalRebuildShardBuilderSettings {
     let planned_shard_count = planned_shard_count.max(1);
-    let writer_parallelism_budget = settings.tantivy_writer_threads.max(1);
+    let writer_threads_per_builder = if dotenvy::var("CASS_TANTIVY_MAX_WRITER_THREADS").is_ok() {
+        settings.tantivy_writer_threads.max(1)
+    } else {
+        settings.tantivy_writer_threads.clamp(1, 2)
+    };
     let max_builders = planned_shard_count
         .min(settings.staged_shard_builders.max(1))
-        .min(writer_parallelism_budget)
         .max(1);
     LexicalRebuildShardBuilderSettings {
         max_builders,
-        writer_parallelism_budget,
+        writer_threads_per_builder,
     }
 }
 
 fn lexical_rebuild_staged_shard_builder_writer_parallelism_for_dispatch(
-    writer_parallelism_budget: usize,
-    allowed_jobs: usize,
-    dispatch_slot_index: usize,
+    writer_threads_per_builder: usize,
+    _allowed_jobs: usize,
+    _dispatch_slot_index: usize,
 ) -> usize {
-    let writer_parallelism_budget = writer_parallelism_budget.max(1);
-    let allowed_jobs = allowed_jobs.max(1);
-    if dispatch_slot_index >= allowed_jobs {
-        return 1;
-    }
-    if allowed_jobs >= writer_parallelism_budget {
-        return 1;
-    }
-
-    let base = writer_parallelism_budget / allowed_jobs;
-    let remainder = writer_parallelism_budget % allowed_jobs;
-    base.saturating_add(usize::from(dispatch_slot_index < remainder))
-        .max(1)
+    writer_threads_per_builder.max(1)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -11790,6 +12203,20 @@ pub fn streaming_index_enabled() -> bool {
         .unwrap_or(true)
 }
 
+/// Connector fan-out is opt-in because each parser may retain one large
+/// session while it hands batches to the consumer. Serial mode keeps peak
+/// heap bounded without changing the connector set or canonical data.
+fn streaming_connector_parallel_enabled() -> bool {
+    dotenvy::var("CASS_STREAMING_CONNECTOR_PARALLEL")
+        .ok()
+        .is_some_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+}
+
 fn scan_path_exclusions_value_active(value: Option<&str>) -> bool {
     value.is_some_and(|raw| {
         raw.split([',', '\n'])
@@ -11851,6 +12278,7 @@ struct StreamingProducerConfig {
     since_ts: Option<i64>,
     local_since_ts_by_connector: Arc<HashMap<&'static str, Option<i64>>>,
     progress: Option<Arc<IndexingProgress>>,
+    progress_bump: Option<Arc<AtomicI64>>,
     active_source_filter: Arc<ActiveSessionSourceFilter>,
 }
 
@@ -11936,6 +12364,7 @@ fn spawn_connector_producer(
                 if let Some(p) = &config.progress {
                     p.tick_activity();
                 }
+                bump_index_run_lock_progress_if_present(config.progress_bump.as_ref());
                 batch_sender.push(conversation)
             }) {
                 Ok(()) => {
@@ -12046,6 +12475,7 @@ fn spawn_connector_producer(
                 if let Some(p) = &config.progress {
                     p.tick_activity();
                 }
+                bump_index_run_lock_progress_if_present(config.progress_bump.as_ref());
                 batch_sender.push(conversation)
             }) {
                 Ok(()) => {
@@ -12674,6 +13104,36 @@ fn run_streaming_index_with_connector_factories(
         return Ok(NonWatchIngestOutcome::default());
     }
 
+    // Large local archives are memory-bound by connector parsing, not by the
+    // bounded channel. Running six connector parsers concurrently lets each
+    // retain its current NormalizedConversation (and parser scratch space),
+    // multiplying a single large-session footprint until macOS starts
+    // swapping or the process is killed. Keep the channel/backpressure path,
+    // but serialize connector scans by default. Operators with ample memory
+    // can opt back into the old fan-out with CASS_STREAMING_CONNECTOR_PARALLEL=1.
+    if connector_factories.len() > 1 && !streaming_connector_parallel_enabled() {
+        let mut combined = NonWatchIngestOutcome::default();
+        let mut t_index = t_index;
+
+        for (name, factory) in connector_factories {
+            tracing::info!(connector = name, "serial_connector_scan_start");
+            let outcome = run_streaming_index_with_connector_factories(
+                storage,
+                t_index.as_deref_mut(),
+                opts,
+                since_ts,
+                lexical_strategy,
+                additional_scan_roots.clone(),
+                vec![(name, factory)],
+                scan_start_ts,
+                progress_bump,
+            )?;
+            combined = combined.accumulate(outcome);
+            tracing::info!(connector = name, "serial_connector_scan_complete");
+        }
+        return Ok(combined);
+    }
+
     let buffered_connectors: Vec<&'static str> = connector_factories
         .iter()
         .filter_map(|(name, factory)| {
@@ -12716,6 +13176,7 @@ fn run_streaming_index_with_connector_factories(
             &connector_factories,
         )?),
         progress: opts.progress.clone(),
+        progress_bump: progress_bump.cloned(),
         active_source_filter: Arc::new(ActiveSessionSourceFilter::new(
             opts.watch && opts.watch_once_paths.as_ref().is_none_or(Vec::is_empty),
         )),
@@ -13274,6 +13735,183 @@ fn explicit_scan_root_since_ts(
     }
 }
 
+fn run_semantic_native_only(
+    opts: &IndexOptions,
+    index_run_lock: &mut IndexRunLockGuard,
+    progress_bump: &Arc<AtomicI64>,
+) -> Result<()> {
+    // A semantic-only rebuild must not open the canonical archive through
+    // FrankenSQLite before native replay starts. That eager open was the
+    // multi-minute, multi-gigabyte wedge observed on the promoted archive.
+    prepare_progress_for_semantic_build(opts.progress.as_ref());
+    let mut set_semantic_phase = |phase: &'static str| {
+        if let Err(err) = index_run_lock.set_phase(SearchMaintenanceMode::Index, phase) {
+            tracing::debug!(
+                sub_phase = phase,
+                error = %err,
+                "semantic-only phase breadcrumb write failed (continuing)"
+            );
+        }
+    };
+    set_semantic_phase("semantic:initialize");
+    set_semantic_progress_phase(
+        opts.progress.as_ref(),
+        progress_bump,
+        INDEX_PHASE_SEMANTIC_INITIALIZE,
+        0,
+        0,
+    );
+
+    let semantic_indexer = SemanticIndexer::new(&opts.embedder, Some(&opts.data_dir))?;
+    let semantic_tier = semantic_tier_for_embedder_id(semantic_indexer.embedder_id())
+        .ok_or_else(|| anyhow::anyhow!("embedder {} has no resumable semantic tier", semantic_indexer.embedder_id()))?;
+    let db_fingerprint = lexical_storage_fingerprint_for_db(&opts.db_path)?;
+    let mut semantic_manifest = SemanticManifest::load_or_default(&opts.data_dir)
+        .map_err(|err| anyhow::anyhow!("loading semantic manifest: {err}"))?;
+    let semantic_progress_sink = crate::indexer::semantic_progress::SemanticProgressSink::open(
+        semantic_tier.as_str(),
+        semantic_indexer.embedder_id(),
+    )
+    .with_progress_bump(Arc::clone(progress_bump))
+    .with_activity_tick(Arc::new({
+        let progress = opts.progress.clone();
+        move || {
+            if let Some(progress) = progress.as_ref() {
+                progress.tick_activity();
+            }
+        }
+    }));
+    let batch_conversations = semantic_first_build_batch_conversations();
+
+    set_semantic_phase("semantic:replay");
+    set_semantic_progress_phase(
+        opts.progress.as_ref(),
+        progress_bump,
+        INDEX_PHASE_SEMANTIC_REPLAY,
+        0,
+        0,
+    );
+    tracing::info!(embedder = %opts.embedder, "starting native semantic indexing");
+
+    let published_index_path = loop {
+        set_semantic_phase("semantic:embedding");
+        let outcome = semantic_indexer.run_capped_backfill_from_native_with_sink(
+            &opts.db_path,
+            &opts.data_dir,
+            &mut semantic_manifest,
+            SemanticBackfillStoragePlan {
+                tier: semantic_tier,
+                db_fingerprint: db_fingerprint.clone(),
+                model_revision: semantic_model_revision_for_embedder_id(
+                    semantic_indexer.embedder_id(),
+                ),
+                max_conversations: batch_conversations,
+            },
+            &semantic_progress_sink,
+        )?;
+        let processed = usize::try_from(outcome.conversations_processed).unwrap_or(usize::MAX);
+        let total = usize::try_from(outcome.total_conversations).unwrap_or(usize::MAX);
+        update_semantic_progress(opts.progress.as_ref(), progress_bump, processed, total);
+        tracing::info!(
+            tier = semantic_tier.as_str(),
+            embedder = semantic_indexer.embedder_id(),
+            embedded_docs = outcome.embedded_docs,
+            conversations_processed = outcome.conversations_processed,
+            total_conversations = outcome.total_conversations,
+            checkpoint_saved = outcome.checkpoint_saved,
+            published = outcome.published,
+            "completed native semantic build batch"
+        );
+        if outcome.published {
+            break outcome.index_path;
+        }
+        if !outcome.checkpoint_saved {
+            anyhow::bail!(
+                "native semantic backfill made no progress; inspect {}",
+                outcome.manifest_path.display()
+            );
+        }
+    };
+
+    let vector_index = FsVectorIndex::open(&published_index_path).with_context(|| {
+        format!(
+            "opening published semantic index {}",
+            published_index_path.display()
+        )
+    })?;
+    let embedded_doc_count = vector_index.record_count();
+    if opts.build_hnsw && embedded_doc_count > 0 {
+        set_semantic_phase("semantic:hnsw");
+        set_semantic_progress_phase(
+            opts.progress.as_ref(),
+            progress_bump,
+            INDEX_PHASE_SEMANTIC_HNSW,
+            0,
+            embedded_doc_count,
+        );
+        let hnsw_path = semantic_indexer.build_hnsw_index(
+            &vector_index,
+            &opts.data_dir,
+            None,
+            None,
+        )?;
+        update_semantic_progress(
+            opts.progress.as_ref(),
+            progress_bump,
+            embedded_doc_count,
+            embedded_doc_count,
+        );
+        let size_bytes = fs::metadata(&hnsw_path)
+            .with_context(|| format!("stat semantic HNSW index {}", hnsw_path.display()))?
+            .len();
+        let relative_hnsw_path = hnsw_path
+            .strip_prefix(&opts.data_dir)
+            .unwrap_or(hnsw_path.as_path())
+            .to_string_lossy()
+            .to_string();
+        semantic_manifest.publish_hnsw(HnswRecord {
+            base_tier: semantic_tier,
+            embedder_id: semantic_indexer.embedder_id().to_string(),
+            ef_search: FS_HNSW_DEFAULT_EF_SEARCH,
+            index_path: relative_hnsw_path,
+            size_bytes,
+            built_at_ms: semantic_indexing_now_ms(),
+            ready: true,
+        });
+        semantic_manifest
+            .save(&opts.data_dir)
+            .map_err(|err| anyhow::anyhow!("saving semantic HNSW manifest after build: {err}"))?;
+    }
+
+    // Keep watch-mode catch-up correct without reopening FrankenSQLite just to
+    // write one scalar watermark. This is the same metadata row used by the
+    // existing writer path and is an atomic SQLite transaction.
+    set_semantic_phase("semantic:finalize");
+    set_semantic_progress_phase(
+        opts.progress.as_ref(),
+        progress_bump,
+        INDEX_PHASE_SEMANTIC_FINALIZE,
+        0,
+        1,
+    );
+    let conn = rusqlite::Connection::open(&opts.db_path).with_context(|| {
+        format!(
+            "opening native semantic watermark connection at {}",
+            opts.db_path.display()
+        )
+    })?;
+    conn.busy_timeout(Duration::from_secs(30))?;
+    let max_message_id: i64 = conn
+        .query_row("SELECT COALESCE(MAX(id), 0) FROM messages", [], |row| row.get(0))
+        .context("reading semantic indexing watermark")?;
+    conn.execute(
+        "INSERT OR REPLACE INTO meta(key, value) VALUES('last_embedded_message_id', ?1)",
+        rusqlite::params![max_message_id],
+    )?;
+    update_semantic_progress(opts.progress.as_ref(), progress_bump, 1, 1);
+    Ok(())
+}
+
 pub fn run_index(
     opts: IndexOptions,
     event_channel: Option<(Sender<IndexerEvent>, Receiver<IndexerEvent>)>,
@@ -13510,6 +14148,21 @@ pub fn run_index(
         }
     }
     if try_readonly_canonical_force_rebuild(&opts, &progress_bump)? {
+        return Ok(());
+    }
+
+    // Semantic-only CLI runs do not need the normal lexical/watch preflight
+    // or a FrankenSQLite storage handle. Enter the native resumable semantic
+    // path before that eager archive open; watch and targeted watch-once runs
+    // retain the existing combined pipeline because they may ingest first.
+    if (opts.semantic || opts.build_hnsw)
+        && !opts.watch
+        && opts
+            .watch_once_paths
+            .as_ref()
+            .is_none_or(|paths| paths.is_empty())
+    {
+        run_semantic_native_only(&opts, &mut index_run_lock, &progress_bump)?;
         return Ok(());
     }
 
@@ -14780,6 +15433,32 @@ pub fn run_index(
             tracing::info!(embedder = %opts.embedder, "starting semantic indexing");
 
             let semantic_indexer = SemanticIndexer::new(&opts.embedder, Some(&opts.data_dir))?;
+            let semantic_tier = semantic_tier_for_embedder_id(semantic_indexer.embedder_id())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "embedder {} has no resumable semantic tier",
+                        semantic_indexer.embedder_id()
+                    )
+                })?;
+            let db_fingerprint = lexical_storage_fingerprint_for_db(&opts.db_path)?;
+            let mut semantic_manifest = SemanticManifest::load_or_default(&opts.data_dir)
+                .map_err(|err| anyhow::anyhow!("loading semantic manifest: {err}"))?;
+            let semantic_progress_sink =
+                crate::indexer::semantic_progress::SemanticProgressSink::open(
+                    semantic_tier.as_str(),
+                    semantic_indexer.embedder_id(),
+                )
+                .with_progress_bump(Arc::clone(&progress_bump))
+                .with_activity_tick(Arc::new({
+                    let progress = opts.progress.clone();
+                    move || {
+                        if let Some(progress) = progress.as_ref() {
+                            progress.tick_activity();
+                        }
+                    }
+                }));
+            let batch_conversations = semantic_first_build_batch_conversations();
+
             set_semantic_phase("semantic:replay");
             set_semantic_progress_phase(
                 opts.progress.as_ref(),
@@ -14788,156 +15467,112 @@ pub fn run_index(
                 0,
                 0,
             );
-            let mut semantic_read_storage = FrankenStorage::open_readonly(&opts.db_path)
-                .with_context(|| {
-                    format!(
-                        "opening fresh readonly canonical storage for semantic indexing: {}",
-                        opts.db_path.display()
-                    )
-                })?;
-
-            let mut embedding_inputs = packet_embedding_inputs_from_storage_with_progress(
-                &semantic_read_storage,
-                |current, total| {
-                    update_semantic_progress(
-                        opts.progress.as_ref(),
-                        &progress_bump,
-                        current,
-                        total,
+            // Keep the first build bounded and durable. Each call appends to
+            // the staged FSVI, then atomically saves a manifest checkpoint.
+            // A restart resumes from the conversation/message cursor instead
+            // of replaying the entire archive or retaining the corpus in RAM.
+            let published_index_path = loop {
+                set_semantic_phase("semantic:embedding");
+                let outcome = semantic_indexer.run_capped_backfill_from_native_with_sink(
+                    &opts.db_path,
+                    &opts.data_dir,
+                    &mut semantic_manifest,
+                    SemanticBackfillStoragePlan {
+                        tier: semantic_tier,
+                        db_fingerprint: db_fingerprint.clone(),
+                        model_revision: semantic_model_revision_for_embedder_id(
+                            semantic_indexer.embedder_id(),
+                        ),
+                        max_conversations: batch_conversations,
+                    },
+                    &semantic_progress_sink,
+                )?;
+                let processed =
+                    usize::try_from(outcome.conversations_processed).unwrap_or(usize::MAX);
+                let total = usize::try_from(outcome.total_conversations).unwrap_or(usize::MAX);
+                update_semantic_progress(opts.progress.as_ref(), &progress_bump, processed, total);
+                tracing::info!(
+                    tier = semantic_tier.as_str(),
+                    embedder = semantic_indexer.embedder_id(),
+                    embedded_docs = outcome.embedded_docs,
+                    conversations_processed = outcome.conversations_processed,
+                    total_conversations = outcome.total_conversations,
+                    checkpoint_saved = outcome.checkpoint_saved,
+                    published = outcome.published,
+                    "completed bounded semantic build batch"
+                );
+                if outcome.published {
+                    break outcome.index_path;
+                }
+                if !outcome.checkpoint_saved {
+                    anyhow::bail!(
+                        "semantic backfill made no progress; inspect {}",
+                        outcome.manifest_path.display()
                     );
-                },
-            )?;
+                }
+            };
+
+            let index_path = published_index_path;
+            let vector_index = FsVectorIndex::open(&index_path).with_context(|| {
+                format!("opening published semantic index {}", index_path.display())
+            })?;
+            let embedded_doc_count = vector_index.record_count();
             tracing::info!(
-                message_count = embedding_inputs.len(),
-                packet_driven = true,
-                "built semantic inputs from canonical ConversationPacket replay"
+                path = %index_path.display(),
+                embedder = semantic_indexer.embedder_id(),
+                embedded_doc_count,
+                "saved resumable semantic vector index"
             );
 
-            embedding_inputs.retain(|message| {
-                !is_hard_message_noise(semantic_role_name(message.role), &message.content)
-            });
-
-            // Generate embeddings
-            set_semantic_phase("semantic:embedding");
-            set_semantic_progress_phase(
-                opts.progress.as_ref(),
-                &progress_bump,
-                INDEX_PHASE_SEMANTIC_EMBEDDING,
-                0,
-                embedding_inputs.len(),
-            );
-            let embedded_messages = semantic_indexer.embed_messages_with_progress(
-                &embedding_inputs,
-                |current, total| {
-                    update_semantic_progress(
-                        opts.progress.as_ref(),
-                        &progress_bump,
-                        current,
-                        total,
-                    );
-                },
-            )?;
-            tracing::info!(
-                embedded_count = embedded_messages.len(),
-                "generated embeddings"
-            );
-
-            if !embedded_messages.is_empty() {
-                let embedded_doc_count = embedded_messages.len();
-                let build_started_at_ms = semantic_indexing_now_ms();
-                set_semantic_phase("semantic:vector_publish");
+            // HNSW is derived and intentionally last. If it is interrupted,
+            // the durable exact vector index and semantic manifest are still
+            // usable, and the next run can rebuild only this accelerator.
+            if opts.build_hnsw && embedded_doc_count > 0 {
+                set_semantic_phase("semantic:hnsw");
                 set_semantic_progress_phase(
                     opts.progress.as_ref(),
                     &progress_bump,
-                    INDEX_PHASE_SEMANTIC_VECTOR_PUBLISH,
+                    INDEX_PHASE_SEMANTIC_HNSW,
                     0,
                     embedded_doc_count,
                 );
-                let vector_index = semantic_indexer.build_and_save_index_with_progress(
-                    embedded_messages,
+                let hnsw_path = semantic_indexer.build_hnsw_index(
+                    &vector_index,
                     &opts.data_dir,
-                    |current| {
-                        update_semantic_progress(
-                            opts.progress.as_ref(),
-                            &progress_bump,
-                            current,
-                            embedded_doc_count,
-                        );
-                    },
+                    None, // Use default M
+                    None, // Use default ef_construction
                 )?;
-                let index_path = crate::search::vector_index::vector_index_path(
-                    &opts.data_dir,
-                    semantic_indexer.embedder_id(),
-                );
-                tracing::info!(
-                    path = %index_path.display(),
-                    embedder = semantic_indexer.embedder_id(),
-                    "saved semantic vector index"
-                );
-
-                // Build HNSW index for approximate nearest neighbor search (if enabled)
-                if opts.build_hnsw {
-                    set_semantic_phase("semantic:hnsw");
-                    let vector_count = vector_index.record_count();
-                    set_semantic_progress_phase(
-                        opts.progress.as_ref(),
-                        &progress_bump,
-                        INDEX_PHASE_SEMANTIC_HNSW,
-                        0,
-                        vector_count,
-                    );
-                    let hnsw_path = semantic_indexer.build_hnsw_index(
-                        &vector_index,
-                        &opts.data_dir,
-                        None, // Use default M
-                        None, // Use default ef_construction
-                    )?;
-                    update_semantic_progress(
-                        opts.progress.as_ref(),
-                        &progress_bump,
-                        vector_count,
-                        vector_count,
-                    );
-                    tracing::info!(
-                        path = %hnsw_path.display(),
-                        embedder = semantic_indexer.embedder_id(),
-                        "saved HNSW index for approximate search"
-                    );
-                }
-
-                // Publish the artifact to the semantic manifest so `cass
-                // status` reflects the freshly-built index. Without this,
-                // `index --semantic` republishes the .fsvi file but leaves
-                // semantic_manifest.json pointed at stale metadata, so
-                // status reports `semantic: stale / available: false`
-                // even though semantic search works (issue #203).
-                set_semantic_phase("semantic:manifest");
-                set_semantic_progress_phase(
+                update_semantic_progress(
                     opts.progress.as_ref(),
                     &progress_bump,
-                    INDEX_PHASE_SEMANTIC_MANIFEST,
-                    0,
-                    1,
+                    embedded_doc_count,
+                    embedded_doc_count,
                 );
-                if let Err(err) = publish_direct_semantic_artifact(
-                    &semantic_read_storage,
-                    &opts.data_dir,
-                    &index_path,
-                    semantic_indexer.embedder_id(),
-                    semantic_indexer.embedder_dimension(),
-                    u64::try_from(embedded_doc_count).unwrap_or(u64::MAX),
-                    build_started_at_ms,
-                ) {
-                    tracing::warn!(
-                        embedder = semantic_indexer.embedder_id(),
-                        error = %err,
-                        "direct semantic artifact published to disk but \
-                         manifest update failed; cass status may report \
-                        stale/unavailable until next backfill cycle"
-                    );
-                } else {
-                    update_semantic_progress(opts.progress.as_ref(), &progress_bump, 1, 1);
-                }
+                tracing::info!(
+                    path = %hnsw_path.display(),
+                    embedder = semantic_indexer.embedder_id(),
+                    "saved HNSW index for approximate nearest neighbor search"
+                );
+                let size_bytes = fs::metadata(&hnsw_path)
+                    .with_context(|| format!("stat semantic HNSW index {}", hnsw_path.display()))?
+                    .len();
+                let relative_hnsw_path = hnsw_path
+                    .strip_prefix(&opts.data_dir)
+                    .unwrap_or(hnsw_path.as_path())
+                    .to_string_lossy()
+                    .to_string();
+                semantic_manifest.publish_hnsw(HnswRecord {
+                    base_tier: semantic_tier,
+                    embedder_id: semantic_indexer.embedder_id().to_string(),
+                    ef_search: FS_HNSW_DEFAULT_EF_SEARCH,
+                    index_path: relative_hnsw_path,
+                    size_bytes,
+                    built_at_ms: semantic_indexing_now_ms(),
+                    ready: true,
+                });
+                semantic_manifest.save(&opts.data_dir).map_err(|err| {
+                    anyhow::anyhow!("saving semantic HNSW manifest after build: {err}")
+                })?;
             }
 
             // Set watermark so incremental watch-mode embedding only sees new messages
@@ -14949,18 +15584,20 @@ pub fn run_index(
                 0,
                 1,
             );
-            semantic_read_storage.close_best_effort_in_place();
-            if let Some(max_id) = embedding_inputs.iter().map(|e| e.message_id).max() {
-                persist::with_ephemeral_writer(
-                    &storage,
-                    false,
-                    "updating semantic indexing watermark",
-                    |writer| {
-                        writer
-                            .set_last_embedded_message_id(i64::try_from(max_id).unwrap_or(i64::MAX))
-                    },
-                )?;
-            }
+            let max_message_id: i64 = storage
+                .raw()
+                .query_row_map(
+                    "SELECT COALESCE(MAX(id), 0) FROM messages",
+                    &[] as &[ParamValue],
+                    |row| row.get_typed(0),
+                )
+                .context("reading semantic indexing watermark")?;
+            persist::with_ephemeral_writer(
+                &storage,
+                false,
+                "updating semantic indexing watermark",
+                |writer| writer.set_last_embedded_message_id(max_message_id),
+            )?;
             update_semantic_progress(opts.progress.as_ref(), &progress_bump, 1, 1);
         }
     }
@@ -16821,14 +17458,17 @@ const INDEX_MIN_FREE_SPACE_BYTES: u64 = 512 * 1024 * 1024;
 enum IndexStorageHeadroomRequirement {
     IncrementalStartup,
     AuthoritativeLexicalRebuild,
+    ReadOnlyCanonicalLexicalRebuild,
 }
 
 fn index_startup_storage_headroom_requirement(
     full: bool,
     force_rebuild: bool,
 ) -> IndexStorageHeadroomRequirement {
-    if full || force_rebuild {
+    if full {
         IndexStorageHeadroomRequirement::AuthoritativeLexicalRebuild
+    } else if force_rebuild {
+        IndexStorageHeadroomRequirement::ReadOnlyCanonicalLexicalRebuild
     } else {
         IndexStorageHeadroomRequirement::IncrementalStartup
     }
@@ -16850,6 +17490,17 @@ fn ensure_authoritative_lexical_rebuild_storage_headroom(
         data_dir,
         db_path,
         IndexStorageHeadroomRequirement::AuthoritativeLexicalRebuild,
+    )
+}
+
+fn ensure_readonly_canonical_lexical_rebuild_storage_headroom(
+    data_dir: &Path,
+    db_path: &Path,
+) -> Result<()> {
+    ensure_index_storage_headroom(
+        data_dir,
+        db_path,
+        IndexStorageHeadroomRequirement::ReadOnlyCanonicalLexicalRebuild,
     )
 }
 
@@ -16976,6 +17627,15 @@ fn required_index_headroom_bytes(
                 .saturating_mul(2)
                 .saturating_add(lexical_bytes.saturating_mul(2));
             INDEX_MIN_FREE_SPACE_BYTES.max(projected)
+        }
+        IndexStorageHeadroomRequirement::ReadOnlyCanonicalLexicalRebuild => {
+            // The populated `--force-rebuild` fast path opens the canonical
+            // archive read-only and stages only a replacement Tantivy index.
+            // It cannot create a writable SQLite clone, WAL, or checkpoint,
+            // so demanding two copies of the archive here needlessly blocks
+            // recovery on large but otherwise healthy archives.
+            let lexical_bytes = lexical_index_size_bytes(data_dir);
+            INDEX_MIN_FREE_SPACE_BYTES.max(lexical_bytes.saturating_mul(2))
         }
     }
 }
@@ -17329,7 +17989,7 @@ pub(crate) fn repair_lexical_index_from_canonical_db_for_search(
 }
 
 #[cfg(test)]
-fn rebuild_tantivy_from_db_deferred_startup(
+pub(crate) fn rebuild_tantivy_from_db_deferred_startup(
     db_path: &Path,
     data_dir: &Path,
     total_conversations: usize,
@@ -17360,6 +18020,26 @@ fn rebuild_tantivy_from_db_deferred_startup_with_progress_bump(
     )
 }
 
+fn rebuild_tantivy_from_db_force_rebuild_with_progress_bump(
+    db_path: &Path,
+    data_dir: &Path,
+    total_conversations: usize,
+    progress: Option<Arc<IndexingProgress>>,
+    progress_bump: Arc<AtomicI64>,
+) -> Result<LexicalRebuildOutcome> {
+    rebuild_tantivy_from_db_with_options(
+        db_path,
+        data_dir,
+        total_conversations,
+        progress,
+        LexicalRebuildStartupOptions {
+            defer_initial_content_fingerprint: true,
+            skip_expensive_shard_plan: true,
+        },
+        Some(progress_bump),
+    )
+}
+
 fn rebuild_tantivy_from_db_deferred_startup_with_options(
     db_path: &Path,
     data_dir: &Path,
@@ -17374,6 +18054,7 @@ fn rebuild_tantivy_from_db_deferred_startup_with_options(
         progress,
         LexicalRebuildStartupOptions {
             defer_initial_content_fingerprint: true,
+            skip_expensive_shard_plan: false,
         },
         progress_bump,
     )
@@ -17555,42 +18236,43 @@ fn prepare_lexical_rebuild_page_work(
     let mut reservation = StreamingByteReservation::new(flow_limiter, reserved_bytes);
 
     let message_fetch_started = Instant::now();
-    let grouped_messages = match storage.fetch_messages_for_lexical_rebuild_batch(
-        &conversation_ids,
-        Some(work.pipeline_budget.batch_fetch_message_limit),
-        Some(work.pipeline_budget.batch_fetch_message_bytes_limit),
-    ) {
-        Ok(grouped) => grouped,
-        Err(err) if format!("{err:#}").contains("guardrail") => {
-            tracing::warn!(
-                sequence,
-                conversations = conversation_ids.len(),
-                max_messages = work.pipeline_budget.batch_fetch_message_limit,
-                max_content_bytes = work.pipeline_budget.batch_fetch_message_bytes_limit,
-                error = %err,
-                "lexical rebuild page exceeded batch-fetch guardrail inside page-prep worker; falling back to per-conversation fetches"
-            );
-            let mut grouped = HashMap::with_capacity(conversation_ids.len());
-            for conversation_id in &conversation_ids {
-                let messages = storage
-                    .fetch_messages_for_lexical_rebuild(*conversation_id)
-                    .with_context(|| {
-                        format!(
-                            "fetching lexical rebuild messages for conversation {}",
-                            conversation_id
-                        )
-                    })?;
-                grouped.insert(*conversation_id, messages);
-            }
-            grouped
-        }
-        Err(err) => {
-            return Err(err).context(format!(
-                "fetching lexical rebuild messages for {} conversations",
-                conversation_ids.len()
-            ));
-        }
-    };
+    let mut grouped_messages = HashMap::with_capacity(conversation_ids.len());
+    let start_conversation_id = conversation_ids.first().copied().unwrap_or_default();
+    let end_conversation_id = conversation_ids.last().copied().unwrap_or_default();
+    crate::storage::sqlite::FrankenStorage::stream_messages_for_lexical_rebuild_native(
+        storage.db_path(),
+        start_conversation_id,
+        end_conversation_id,
+        |row| {
+            let role = match row.role.to_ascii_lowercase().as_str() {
+                "user" => crate::model::types::MessageRole::User,
+                "agent" | "assistant" => crate::model::types::MessageRole::Agent,
+                "tool" => crate::model::types::MessageRole::Tool,
+                "system" => crate::model::types::MessageRole::System,
+                other => crate::model::types::MessageRole::Other(other.to_string()),
+            };
+            grouped_messages
+                .entry(row.conversation_id)
+                .or_insert_with(Vec::new)
+                .push(crate::model::types::Message {
+                    id: Some(row.id),
+                    idx: row.idx,
+                    role,
+                    author: row.author,
+                    created_at: row.created_at,
+                    content: row.content,
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                });
+            Ok(())
+        },
+    )
+    .with_context(|| {
+        format!(
+            "streaming native SQLite lexical rebuild messages for {} conversations",
+            conversation_ids.len()
+        )
+    })?;
     let message_fetch_duration = message_fetch_started.elapsed();
 
     let packet_prepare_started = Instant::now();
@@ -19331,8 +20013,8 @@ fn rebuild_tantivy_from_db_via_staged_shards(
         planned_shards = shard_plan.shards.len(),
         plan_id = %shard_plan.plan_id,
         shard_builders_max = shard_builder_settings.max_builders,
-        shard_builder_writer_parallelism_budget =
-            shard_builder_settings.writer_parallelism_budget,
+        shard_builder_writer_threads_per_builder =
+            shard_builder_settings.writer_threads_per_builder,
         eager_merge_workers = shard_merge_settings.workers,
         "running fresh authoritative lexical rebuild via staged shard-build path"
     );
@@ -19391,10 +20073,14 @@ fn rebuild_tantivy_from_db_via_staged_shards(
         shard_merge_settings.workers,
         pipeline_settings.controller_loadavg_high_watermark_1m_milli,
     );
-    let staged_shard_build_controller = LexicalRebuildStagedShardBuildController::new(
-        shard_builder_settings.max_builders,
-        pipeline_settings.controller_loadavg_high_watermark_1m_milli,
-    );
+    let staged_shard_build_controller =
+        LexicalRebuildStagedShardBuildController::new_with_memory_reserves_and_writer_threads(
+            shard_builder_settings.max_builders,
+            pipeline_settings.controller_loadavg_high_watermark_1m_milli,
+            lexical_rebuild_staged_shard_build_memory_reserve_bytes(),
+            lexical_rebuild_staged_shard_build_emergency_memory_reserve_bytes(),
+            shard_builder_settings.writer_threads_per_builder,
+        );
     let shard_build_telemetry = LexicalRebuildShardBuildTelemetry::default();
     let mut max_conversation_id = 0i64;
     let mut max_message_id = 0i64;
@@ -19433,20 +20119,26 @@ fn rebuild_tantivy_from_db_via_staged_shards(
          enqueued_shards: &mut usize,
          producer_finished: bool|
          -> Result<()> {
-            let staged_merge_runtime = staged_merge_controller.decide(
+            let mut staged_merge_runtime = staged_merge_controller.decide(
                 producer_finished,
                 latest_pipeline_runtime,
                 merge_coordinator,
             );
+            // Eager staged merges are file-backed assembly now, so they do
+            // not need to reserve builder slots while the producer is still
+            // feeding shards.  Deferring this metadata-only work until the
+            // producer drains lets the builder farm use its full admission
+            // budget without changing the merge fan-in or final topology.
+            if !producer_finished && staged_merge_runtime.allowed_jobs > 0 {
+                staged_merge_runtime.allowed_jobs = 0;
+                staged_merge_runtime.controller_reason =
+                    "deferring_file_backed_staged_assembly_until_producer_drains".to_string();
+            }
             merge_coordinator.set_allowed_pending_merge_jobs(
                 staged_merge_runtime.allowed_jobs,
                 &merge_work_tx,
             )?;
-            let applied_runtime = staged_merge_controller.decide(
-                producer_finished,
-                latest_pipeline_runtime,
-                merge_coordinator,
-            );
+            let applied_runtime = staged_merge_runtime;
             apply_staged_merge_runtime_snapshot(
                 latest_pipeline_runtime,
                 progress.as_ref(),
@@ -19477,7 +20169,7 @@ fn rebuild_tantivy_from_db_via_staged_shards(
                 let dispatch_slot_index = *active_shard_build_jobs;
                 work.writer_parallelism =
                     lexical_rebuild_staged_shard_builder_writer_parallelism_for_dispatch(
-                        shard_builder_settings.writer_parallelism_budget,
+                        shard_builder_settings.writer_threads_per_builder,
                         staged_shard_build_runtime.allowed_jobs,
                         dispatch_slot_index,
                     );
@@ -19855,13 +20547,22 @@ fn rebuild_tantivy_from_db_via_staged_shards(
                                 ));
                             }
 
+                            let equivalence_started = perf_profile.as_ref().map(|_| Instant::now());
+                            equivalence_accumulator.absorb_packets_with_pool(
+                                &packets,
+                                lexical_rebuild_worker_pool.as_deref(),
+                            );
+                            if let (Some(profile), Some(started)) =
+                                (perf_profile.as_mut(), equivalence_started)
+                            {
+                                profile.equivalence_duration += started.elapsed();
+                            }
                             for mut packet in packets {
                                 if options.defer_initial_content_fingerprint
                                     && let Some(last_message_id) = packet.last_message_id
                                 {
                                     max_message_id = max_message_id.max(last_message_id);
                                 }
-                                equivalence_accumulator.absorb_packet(&packet);
                                 current_shard_message_bytes =
                                     current_shard_message_bytes.saturating_add(packet.message_bytes);
                                 packet.flow_reservation_bytes = 0;
@@ -20562,15 +21263,16 @@ fn rebuild_tantivy_from_db_with_options(
     // carve-out's bead-0k0sk follow-up is this fix).
     let page_size = LEXICAL_REBUILD_PAGE_SIZE;
     let pipeline_settings = lexical_rebuild_pipeline_settings_snapshot();
-    let staged_shard_plan = if restart_from_zero && total_conversations > 0 {
-        Some(plan_lexical_rebuild_shards_from_storage_with_settings(
-            &storage,
-            &pipeline_settings,
-            total_conversations,
-        )?)
-    } else {
-        None
-    };
+    let staged_shard_plan =
+        if restart_from_zero && total_conversations > 0 && !options.skip_expensive_shard_plan {
+            Some(plan_lexical_rebuild_shards_from_storage_with_settings(
+                &storage,
+                &pipeline_settings,
+                total_conversations,
+            )?)
+        } else {
+            None
+        };
     if staged_shard_plan.is_some() {
         log_prep_step("plan_lexical_shards", &mut prep_step_started);
     }
@@ -20666,7 +21368,7 @@ fn rebuild_tantivy_from_db_with_options(
         steady_commit_interval_messages,
         steady_commit_interval_message_bytes,
     );
-    let controller_policy = lexical_rebuild_responsiveness_policy();
+    let controller_policy = lexical_rebuild_responsiveness_policy_for_db(db_path);
     let available_parallelism = pipeline_settings.available_parallelism;
     let reserved_cores = pipeline_settings.reserved_cores;
     let controller_loadavg_high_watermark_1m_milli =
@@ -21203,13 +21905,22 @@ fn rebuild_tantivy_from_db_with_options(
                             message_fetch_duration: _message_fetch_duration,
                             packet_prepare_duration: _packet_prepare_duration,
                         } = prepared_page;
+                        let equivalence_started = perf_profile.as_ref().map(|_| Instant::now());
+                        equivalence_accumulator.absorb_packets_with_pool(
+                            &packets,
+                            lexical_rebuild_worker_pool.as_deref(),
+                        );
+                        if let (Some(profile), Some(started)) =
+                            (perf_profile.as_mut(), equivalence_started)
+                        {
+                            profile.equivalence_duration += started.elapsed();
+                        }
                         for packet in packets {
                             if options.defer_initial_content_fingerprint
                                 && let Some(last_message_id) = packet.last_message_id
                             {
                                 max_message_id = max_message_id.max(last_message_id);
                             }
-                            equivalence_accumulator.absorb_packet(&packet);
                             finish_conversation!(packet)?;
                         }
                         if flush_streamed_lexical_rebuild_batch_for_planned_shard_boundary(
@@ -26332,6 +27043,41 @@ pub mod persist {
     where
         F: FnOnce(&FrankenStorage) -> Result<T>,
     {
+        with_ephemeral_writer_mode(
+            storage,
+            defer_checkpoints,
+            context,
+            ephemeral_writer_reuse_enabled(),
+            f,
+        )
+    }
+
+    /// Reuse the short-lived writer for the incremental one-conversation path.
+    /// The storage layer rotates the cached connection at a bounded cadence,
+    /// preserving the setup win without retaining unbounded frankensqlite
+    /// page/MVCC state during long-running watch sessions.
+    pub(super) fn with_reusable_ephemeral_writer<T, F>(
+        storage: &FrankenStorage,
+        defer_checkpoints: bool,
+        context: &str,
+        f: F,
+    ) -> Result<T>
+    where
+        F: FnOnce(&FrankenStorage) -> Result<T>,
+    {
+        with_ephemeral_writer_mode(storage, defer_checkpoints, context, true, f)
+    }
+
+    fn with_ephemeral_writer_mode<T, F>(
+        storage: &FrankenStorage,
+        defer_checkpoints: bool,
+        context: &str,
+        reuse_writer: bool,
+        f: F,
+    ) -> Result<T>
+    where
+        F: FnOnce(&FrankenStorage) -> Result<T>,
+    {
         let db_path = storage
             .database_path()
             .with_context(|| format!("resolving database path for {context}"))?;
@@ -26339,7 +27085,12 @@ pub mod persist {
         // with the short-lived writer so watch-mode observability and follow-up
         // policy transitions still reflect the active ingestion mode.
         apply_index_writer_checkpoint_policy(storage, defer_checkpoints);
-        let (writer, reusable) = storage.acquire_cached_ephemeral_writer().with_context(|| {
+        let (writer, reusable) = if reuse_writer {
+            storage.acquire_cached_ephemeral_writer()
+        } else {
+            FrankenStorage::open_writer(&db_path).map(|writer| (writer, false))
+        }
+        .with_context(|| {
             format!(
                 "opening short-lived frankensqlite writer for {context}: {}",
                 db_path.display()
@@ -26427,6 +27178,20 @@ pub mod persist {
                 Err(err)
             }
         }
+    }
+
+    fn ephemeral_writer_reuse_enabled() -> bool {
+        if cfg!(test) {
+            return true;
+        }
+        dotenvy::var("CASS_REUSE_EPHEMERAL_WRITER")
+            .ok()
+            .is_some_and(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
     }
 
     fn transient_franken_error(err: &anyhow::Error) -> Option<&FrankenError> {
@@ -27040,7 +27805,7 @@ pub mod persist {
             conversation_id,
             conversation_inserted: _conversation_inserted,
             inserted_indices,
-        } = with_ephemeral_writer(storage, false, "persist_conversation", |writer| {
+        } = with_reusable_ephemeral_writer(storage, false, "persist_conversation", |writer| {
             let agent = Agent {
                 id: None,
                 slug: conv.agent_slug.clone(),
@@ -27092,7 +27857,7 @@ pub mod persist {
             conversation_id,
             conversation_inserted: _conversation_inserted,
             inserted_indices,
-        } = with_ephemeral_writer(storage, false, "persist_conversation", |writer| {
+        } = with_reusable_ephemeral_writer(storage, false, "persist_conversation", |writer| {
             let agent = Agent {
                 id: None,
                 slug: conv.agent_slug.clone(),
@@ -27854,6 +28619,55 @@ pub mod persist {
                 .unwrap();
 
             assert_eq!(count, 1, "temp table should persist on the reused writer");
+        }
+
+        #[test]
+        fn reusable_ephemeral_writer_rotates_at_bounded_lifetime() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let db_path = dir.path().join("bounded-ephemeral-writer-reuse.db");
+            let storage = create_franken_db(&db_path);
+
+            with_reusable_ephemeral_writer(
+                &storage,
+                false,
+                "bounded-ephemeral-writer-reuse",
+                |writer| {
+                    writer.raw().execute(
+                        "CREATE TEMP TABLE bounded_writer_reuse(marker INTEGER NOT NULL);",
+                    )?;
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+            // The cache must not retain one frankensqlite connection forever.
+            // After the rotation boundary a fresh connection has no temp table.
+            for _ in 1..128 {
+                with_reusable_ephemeral_writer(
+                    &storage,
+                    false,
+                    "bounded-ephemeral-writer-reuse",
+                    |_writer| Ok(()),
+                )
+                .unwrap();
+            }
+
+            let result = with_reusable_ephemeral_writer(
+                &storage,
+                false,
+                "bounded-ephemeral-writer-reuse",
+                |writer| {
+                    Ok(writer.raw().query_row_map(
+                        "SELECT COUNT(*) FROM bounded_writer_reuse;",
+                        &[],
+                        |row| row.get_typed::<i64>(0),
+                    )?)
+                },
+            );
+            assert!(
+                result.is_err(),
+                "rotated writer must not retain connection-local temp tables"
+            );
         }
 
         #[test]
@@ -31328,6 +32142,18 @@ mod tests {
         assert!(
             !super::semantic_model_revision_for_embedder_id("minilm-384").is_empty(),
             "minilm revision should resolve to ModelManifest::minilm_v2().revision"
+        );
+    }
+
+    #[test]
+    fn semantic_first_build_batch_conversations_is_positive_and_configurable() {
+        let _guard = set_env("CASS_SEMANTIC_FIRST_BUILD_BATCH_CONVERSATIONS", "7");
+        assert_eq!(super::semantic_first_build_batch_conversations(), 7);
+
+        let _guard = set_env("CASS_SEMANTIC_FIRST_BUILD_BATCH_CONVERSATIONS", "0");
+        assert_eq!(
+            super::semantic_first_build_batch_conversations(),
+            super::DEFAULT_SEMANTIC_FIRST_BUILD_BATCH_CONVERSATIONS
         );
     }
 
@@ -34815,7 +35641,7 @@ mod tests {
             GIB,
         );
         let runtime = LexicalRebuildPipelineRuntimeSnapshot {
-            host_available_memory_bytes: Some(768 * MIB as u64),
+            host_available_memory_bytes: Some(1024 * MIB as u64),
             ..LexicalRebuildPipelineRuntimeSnapshot::default()
         };
         let staged_merge_runtime = LexicalRebuildStagedMergeRuntimeSnapshot::default();
@@ -34827,9 +35653,9 @@ mod tests {
             decision.controller_reason,
             format!(
                 "host_available_memory_bytes_{}_below_emergency_reserve_{}_admitting_single_small_staged_shard_build_estimated_builder_bytes_{}",
-                768 * MIB,
+                1024 * MIB,
                 GIB,
-                512 * MIB
+                768 * MIB
             )
         );
     }
@@ -34879,9 +35705,44 @@ mod tests {
                 "host_available_memory_bytes_{}_reserve_{}_estimated_builder_bytes_{}_limiting_staged_shard_builds_to_1",
                 8 * GIB,
                 4 * GIB,
-                36usize * (64usize << 20)
+                36usize * (64usize << 20) + 256usize * 1024usize * 1024usize
             )
         );
+    }
+
+    #[test]
+    fn lexical_rebuild_staged_shard_build_controller_accounts_for_writer_heap() {
+        const GIB: usize = 1024 * 1024 * 1024;
+        let runtime = LexicalRebuildPipelineRuntimeSnapshot {
+            host_available_memory_bytes: Some(8 * GIB as u64),
+            ..LexicalRebuildPipelineRuntimeSnapshot::default()
+        };
+        let staged_merge_runtime = LexicalRebuildStagedMergeRuntimeSnapshot::default();
+        let one_thread =
+            LexicalRebuildStagedShardBuildController::new_with_memory_reserves_and_writer_threads(
+                8,
+                None,
+                4 * GIB,
+                GIB,
+                1,
+            );
+        let eight_threads =
+            LexicalRebuildStagedShardBuildController::new_with_memory_reserves_and_writer_threads(
+                8,
+                None,
+                4 * GIB,
+                GIB,
+                8,
+            );
+
+        let one_thread_decision =
+            one_thread.decide(&runtime, &staged_merge_runtime, 0, 8, Some(64 << 20));
+        let eight_thread_decision =
+            eight_threads.decide(&runtime, &staged_merge_runtime, 0, 8, Some(64 << 20));
+
+        assert_eq!(one_thread_decision.allowed_jobs, 4);
+        assert_eq!(eight_thread_decision.allowed_jobs, 2);
+        assert!(eight_thread_decision.allowed_jobs < one_thread_decision.allowed_jobs);
     }
 
     #[test]
@@ -35037,6 +35898,26 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn doctor_candidate_rebuild_defaults_to_steady_without_changing_ordinary_archives() {
+        let _responsiveness = unset_env_var("CASS_RESPONSIVENESS_DISABLE");
+        let _controller_mode = unset_env_var("CASS_TANTIVY_REBUILD_CONTROLLER_MODE");
+
+        assert_eq!(
+            lexical_rebuild_responsiveness_policy_for_db(std::path::Path::new(
+                "/tmp/cass-data/doctor/candidates/recovery/database/candidate.db",
+            )),
+            LexicalRebuildResponsivenessPolicy::Steady
+        );
+        assert_eq!(
+            lexical_rebuild_responsiveness_policy_for_db(std::path::Path::new(
+                "/tmp/cass-data/agent_search.db",
+            )),
+            LexicalRebuildResponsivenessPolicy::Auto
+        );
+    }
+
+    #[test]
     fn lexical_rebuild_default_worker_parallelism_reserves_machine_headroom() {
         assert_eq!(lexical_rebuild_default_reserved_cores_for_available(1), 0);
         assert_eq!(
@@ -35188,22 +36069,22 @@ mod tests {
             lexical_rebuild_default_staged_shard_builder_parallelism_for_workers_and_memory(
                 4, None,
             ),
-            4
+            2
         );
         assert_eq!(
             lexical_rebuild_default_staged_shard_builder_parallelism_for_workers_and_memory(
                 8,
                 Some(128 * GIB),
             ),
-            2,
-            "128 GiB hosts should not default to an 8-shard Tantivy build storm"
+            3,
+            "the default farm should leave CPU headroom for Tantivy writer threads and the merge stage"
         );
         assert_eq!(
             lexical_rebuild_default_staged_shard_builder_parallelism_for_workers_and_memory(
                 32,
                 Some(512 * GIB),
             ),
-            8
+            4
         );
     }
 
@@ -35219,19 +36100,19 @@ mod tests {
             lexical_rebuild_default_staged_shard_max_message_bytes_for_available_memory(Some(
                 32 * GIB
             )),
-            16 * 1024 * 1024
+            256 * 1024 * 1024
         );
         assert_eq!(
             lexical_rebuild_default_staged_shard_max_message_bytes_for_available_memory(Some(
                 128 * GIB
             )),
-            64 * 1024 * 1024
+            384 * 1024 * 1024
         );
         assert_eq!(
             lexical_rebuild_default_staged_shard_max_message_bytes_for_available_memory(Some(
                 512 * GIB
             )),
-            128 * 1024 * 1024
+            384 * 1024 * 1024
         );
     }
 
@@ -35388,7 +36269,7 @@ mod tests {
     }
 
     #[test]
-    fn lexical_rebuild_staged_shard_builder_settings_preserve_total_writer_budget() {
+    fn lexical_rebuild_staged_shard_builder_settings_separate_builder_and_writer_fanout() {
         let settings = LexicalRebuildPipelineSettingsSnapshot {
             workers: 12,
             available_parallelism: 12,
@@ -35419,46 +36300,58 @@ mod tests {
             lexical_rebuild_staged_shard_builder_settings(&settings, 3),
             LexicalRebuildShardBuilderSettings {
                 max_builders: 3,
-                writer_parallelism_budget: 8,
+                writer_threads_per_builder: 2,
             }
         );
         assert_eq!(
             lexical_rebuild_staged_shard_builder_settings(&settings, 32),
             LexicalRebuildShardBuilderSettings {
                 max_builders: 8,
-                writer_parallelism_budget: 8,
+                writer_threads_per_builder: 2,
             }
         );
 
-        let constrained_writer_budget = LexicalRebuildPipelineSettingsSnapshot {
+        let constrained_writer_threads = LexicalRebuildPipelineSettingsSnapshot {
             tantivy_writer_threads: 4,
+            ..settings.clone()
+        };
+        assert_eq!(
+            lexical_rebuild_staged_shard_builder_settings(&constrained_writer_threads, 32),
+            LexicalRebuildShardBuilderSettings {
+                max_builders: 8,
+                writer_threads_per_builder: 2,
+            }
+        );
+
+        let many_builders_low_writer_threads = LexicalRebuildPipelineSettingsSnapshot {
+            tantivy_writer_threads: 3,
+            staged_shard_builders: 16,
             ..settings
         };
         assert_eq!(
-            lexical_rebuild_staged_shard_builder_settings(&constrained_writer_budget, 32),
+            lexical_rebuild_staged_shard_builder_settings(&many_builders_low_writer_threads, 32),
             LexicalRebuildShardBuilderSettings {
-                max_builders: 4,
-                writer_parallelism_budget: 4,
+                max_builders: 16,
+                writer_threads_per_builder: 2,
             }
         );
     }
 
     #[test]
-    fn lexical_rebuild_staged_shard_builder_dispatch_writer_parallelism_rebalances_budget() {
+    fn lexical_rebuild_staged_shard_builder_dispatch_uses_per_builder_cap() {
         let balanced = (0..6)
             .map(|slot| {
                 lexical_rebuild_staged_shard_builder_writer_parallelism_for_dispatch(8, 6, slot)
             })
             .collect::<Vec<_>>();
-        assert_eq!(balanced, vec![2, 2, 1, 1, 1, 1]);
-        assert_eq!(balanced.iter().sum::<usize>(), 8);
+        assert_eq!(balanced, vec![8; 6]);
 
         let widened = (0..2)
             .map(|slot| {
                 lexical_rebuild_staged_shard_builder_writer_parallelism_for_dispatch(8, 2, slot)
             })
             .collect::<Vec<_>>();
-        assert_eq!(widened, vec![4, 4]);
+        assert_eq!(widened, vec![8, 8]);
     }
 
     #[test]
@@ -40912,6 +41805,7 @@ mod tests {
                 since_ts: None,
                 local_since_ts_by_connector: Arc::new(HashMap::new()),
                 progress: Some(progress.clone()),
+                progress_bump: None,
                 active_source_filter: Arc::new(ActiveSessionSourceFilter::default()),
             },
         );
@@ -41446,6 +42340,7 @@ mod tests {
                 since_ts: None,
                 local_since_ts_by_connector: Arc::new(HashMap::new()),
                 progress: None,
+                progress_bump: None,
                 active_source_filter: Arc::new(ActiveSessionSourceFilter::default()),
             },
         );
@@ -41602,6 +42497,41 @@ mod tests {
     }
 
     #[test]
+    fn readonly_canonical_rebuild_headroom_excludes_archive_clone() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let db_path = data_dir.join("agent_search.db");
+        std::fs::File::create(&db_path)
+            .unwrap()
+            .set_len(300 * 1024 * 1024)
+            .unwrap();
+        let index_dir = data_dir.join(LEXICAL_INDEX_ROOT_DIR).join("seg");
+        std::fs::create_dir_all(&index_dir).unwrap();
+        std::fs::File::create(index_dir.join("0.store"))
+            .unwrap()
+            .set_len(200 * 1024 * 1024)
+            .unwrap();
+
+        let readonly = required_index_headroom_bytes(
+            &data_dir,
+            &db_path,
+            IndexStorageHeadroomRequirement::ReadOnlyCanonicalLexicalRebuild,
+        );
+        let expected = INDEX_MIN_FREE_SPACE_BYTES.max(2 * 200 * 1024 * 1024);
+
+        assert_eq!(readonly, expected);
+        assert!(
+            readonly
+                < required_index_headroom_bytes(
+                    &data_dir,
+                    &db_path,
+                    IndexStorageHeadroomRequirement::AuthoritativeLexicalRebuild,
+                ),
+            "read-only canonical rebuild must not reserve writable archive-clone space"
+        );
+    }
+
+    #[test]
     fn incremental_headroom_ignores_lexical_index_size() {
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().to_path_buf();
@@ -41674,7 +42604,7 @@ mod tests {
     }
 
     #[test]
-    fn full_and_force_rebuild_startup_headroom_keep_archive_clone_requirement() {
+    fn full_rebuild_keeps_archive_clone_but_force_rebuild_uses_readonly_budget() {
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("agent_search.db");
         std::fs::File::create(&db_path)
@@ -41694,7 +42624,7 @@ mod tests {
         );
         assert_eq!(
             index_startup_storage_headroom_requirement(false, true),
-            IndexStorageHeadroomRequirement::AuthoritativeLexicalRebuild
+            IndexStorageHeadroomRequirement::ReadOnlyCanonicalLexicalRebuild
         );
         assert_eq!(
             required_index_headroom_bytes(
@@ -41703,7 +42633,16 @@ mod tests {
                 IndexStorageHeadroomRequirement::AuthoritativeLexicalRebuild,
             ),
             clone_requirement,
-            "full/force rebuilds still need enough scratch for atomic publish safety"
+            "full rebuilds still need enough scratch for atomic publish safety"
+        );
+        assert_eq!(
+            required_index_headroom_bytes(
+                tmp.path(),
+                &db_path,
+                IndexStorageHeadroomRequirement::ReadOnlyCanonicalLexicalRebuild,
+            ),
+            INDEX_MIN_FREE_SPACE_BYTES,
+            "populated force rebuilds must not reserve writable archive-clone space"
         );
     }
 
@@ -43779,6 +44718,106 @@ mod tests {
         assert_eq!(legacy_evidence.document_count, 4);
         assert_eq!(legacy_evidence.manifest_fingerprint.len(), 64);
         assert_eq!(legacy_evidence.golden_query_digest.len(), 64);
+
+        let mut batched_accumulator = LexicalRebuildEquivalenceAccumulator::new();
+        batched_accumulator.absorb_packets_with_pool(&legacy_packets, None);
+        assert_eq!(
+            batched_accumulator.finalize(),
+            legacy_evidence,
+            "batch absorption must preserve packet-order equivalence evidence"
+        );
+
+        let worker_pool = ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .expect("equivalence test worker pool");
+        let mut pooled_batched_accumulator = LexicalRebuildEquivalenceAccumulator::new();
+        pooled_batched_accumulator.absorb_packets_with_pool(&keyset_packets, Some(&worker_pool));
+        assert_eq!(
+            pooled_batched_accumulator.finalize(),
+            keyset_evidence,
+            "pooled batch absorption must preserve the golden digests"
+        );
+    }
+
+    #[test]
+    fn lexical_rebuild_equivalence_literal_probe_mask_matches_contains_reference() {
+        let doc = frankensearch::lexical_tantivy::CassDocumentRef {
+            agent: "codex",
+            workspace: Some("/workspace/[literal]"),
+            workspace_original: None,
+            source_path: "/source/overlap-literal.jsonl",
+            msg_idx: 7,
+            created_at: Some(1_700_000_000_000),
+            title: Some("title-only literal"),
+            content: "content-only",
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            conversation_id: Some(1),
+        };
+        let probes = [
+            "",
+            "[",
+            "overlap",
+            "lap",
+            "title-only",
+            "/workspace/[",
+            "/source/",
+            "literal",
+            "literal",
+            "missing",
+        ];
+        let accumulator = LexicalRebuildEquivalenceAccumulator::with_probes(
+            probes.iter().map(|probe| (*probe).to_string()),
+        );
+        let mask = accumulator.probe_hit_mask_for_doc(&doc);
+
+        for (probe_idx, probe) in probes.iter().enumerate() {
+            let expected = doc.content.contains(probe)
+                || doc.title.is_some_and(|title| title.contains(probe))
+                || doc
+                    .workspace
+                    .is_some_and(|workspace| workspace.contains(probe))
+                || doc.source_path.contains(probe);
+            assert_eq!(
+                mask & (1_u64 << probe_idx) != 0,
+                expected,
+                "literal probe bit {probe_idx} disagrees for {probe:?}"
+            );
+        }
+        assert_ne!(mask & (1_u64 << 7), 0, "first duplicate probe must hit");
+        assert_ne!(mask & (1_u64 << 8), 0, "second duplicate probe must hit");
+    }
+
+    #[test]
+    fn lexical_rebuild_equivalence_coalesced_string_framing_matches_reference_bytes() {
+        let long = "x".repeat(300);
+        let values = [Some("agent"), None, Some(""), Some(long.as_str())];
+        let mut coalesced = smallvec::SmallVec::<[u8; 8]>::new();
+        let mut reference = Vec::new();
+        for value in values {
+            lexical_rebuild_equivalence_append_opt_str(&mut coalesced, value);
+            match value {
+                Some(s) => {
+                    reference.push(0x01_u8);
+                    reference.extend_from_slice(&(s.len() as u64).to_le_bytes());
+                    reference.extend_from_slice(s.as_bytes());
+                }
+                None => reference.push(0x00_u8),
+            }
+        }
+        assert_eq!(coalesced.as_slice(), reference.as_slice());
+    }
+
+    #[test]
+    fn lexical_rebuild_equivalence_large_content_parallel_update_is_byte_identical() {
+        let content = vec![b'x'; LEXICAL_REBUILD_EQUIVALENCE_RAYON_MIN_BYTES + 17];
+        let mut optimized = blake3::Hasher::new();
+        lexical_rebuild_equivalence_update_content(&mut optimized, &content);
+        let mut reference = blake3::Hasher::new();
+        reference.update(&content);
+        assert_eq!(optimized.finalize(), reference.finalize());
     }
 
     #[test]
@@ -43844,6 +44883,49 @@ mod tests {
         assert_ne!(
             targeted.golden_query_digest, shuffled.golden_query_digest,
             "probe order must be part of the digest"
+        );
+
+        // Exercise the exact substring semantics that a multi-pattern matcher
+        // can accidentally change: empty probes, overlapping probes, and
+        // duplicate probes must agree with the original per-probe `contains`
+        // implementation.
+        let adversarial_probes = [
+            "",
+            "lexical-fixture-1",
+            "ical-fixture-1",
+            "lexical-fixture-1",
+            "missing-golden-query",
+        ];
+        let adversarial = probe_evidence(&adversarial_probes);
+        let expected_counts = adversarial_probes
+            .iter()
+            .map(|probe| {
+                packets
+                    .iter()
+                    .flat_map(|packet| packet.prebuilt_docs())
+                    .filter(|doc| {
+                        doc.content.contains(probe)
+                            || doc
+                                .title
+                                .map(|value| value.contains(probe))
+                                .unwrap_or(false)
+                            || doc
+                                .workspace
+                                .map(|value| value.contains(probe))
+                                .unwrap_or(false)
+                            || doc.source_path.contains(probe)
+                    })
+                    .count() as u64
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            adversarial
+                .golden_query_hit_counts
+                .iter()
+                .map(|hit| hit.hit_count)
+                .collect::<Vec<_>>(),
+            expected_counts,
+            "multi-pattern equivalence matching must preserve per-probe contains semantics"
         );
     }
 
@@ -44118,6 +45200,7 @@ mod tests {
                 None,
                 LexicalRebuildStartupOptions {
                     defer_initial_content_fingerprint: true,
+                    skip_expensive_shard_plan: false,
                 },
                 None,
             )
@@ -44181,6 +45264,7 @@ mod tests {
             None,
             LexicalRebuildStartupOptions {
                 defer_initial_content_fingerprint: true,
+                skip_expensive_shard_plan: false,
             },
             None,
         )
@@ -44324,6 +45408,7 @@ mod tests {
                 None,
                 LexicalRebuildStartupOptions {
                     defer_initial_content_fingerprint: true,
+                    skip_expensive_shard_plan: false,
                 },
                 None,
             )
@@ -44439,6 +45524,7 @@ mod tests {
                 None,
                 LexicalRebuildStartupOptions {
                     defer_initial_content_fingerprint: true,
+                    skip_expensive_shard_plan: false,
                 },
                 None,
             )
@@ -44551,6 +45637,7 @@ mod tests {
                 None,
                 LexicalRebuildStartupOptions {
                     defer_initial_content_fingerprint: true,
+                    skip_expensive_shard_plan: false,
                 },
                 None,
             )
@@ -46219,6 +47306,7 @@ mod tests {
                 None,
                 LexicalRebuildStartupOptions {
                     defer_initial_content_fingerprint: true,
+                    skip_expensive_shard_plan: false,
                 },
                 None,
             )
@@ -51782,7 +52870,7 @@ mod tests {
     }
 
     #[test]
-    fn matching_lexical_rebuild_state_status_if_present_skips_db_state_without_checkpoint() {
+    fn matching_lexical_rebuild_state_status_if_present_loads_db_state_without_checkpoint() {
         let tmp = TempDir::new().unwrap();
         let index_path = tmp.path().join("index");
         fs::create_dir_all(&index_path).unwrap();
@@ -51800,7 +52888,63 @@ mod tests {
         .unwrap();
 
         assert_eq!(status, MatchingLexicalRebuildStateStatus::default());
-        assert!(!load_current_db_state_called.get());
+        assert!(load_current_db_state_called.get());
+    }
+
+    #[test]
+    fn published_lexical_generation_reuse_gate_is_red_then_green() {
+        let db_state = LexicalRebuildDbState {
+            db_path: "agent_search.db".to_string(),
+            total_conversations: 62_352,
+            total_messages: 2_034_592,
+            storage_fingerprint: "content-v1:62352:62352:4189224".to_string(),
+        };
+        let mut manifest = lexical_generation::LexicalGenerationManifest::new_scratch(
+            "gen-test",
+            "attempt-test",
+            db_state.storage_fingerprint.clone(),
+            1,
+        );
+        manifest.conversation_count = 62_352;
+        manifest.message_count = 2_034_592;
+        manifest.indexed_doc_count = 2_034_592;
+        manifest.transition_build(
+            lexical_generation::LexicalGenerationBuildState::Validated,
+            2,
+        );
+        manifest.transition_publish(
+            lexical_generation::LexicalGenerationPublishState::Published,
+            3,
+        );
+
+        assert!(published_lexical_generation_matches_db_state(
+            &manifest, &db_state, 2_034_592,
+        ));
+
+        // Red: a single new conversation must not reuse the old generation.
+        let mut changed_db = db_state.clone();
+        changed_db.total_conversations += 1;
+        assert!(!published_lexical_generation_matches_db_state(
+            &manifest,
+            &changed_db,
+            2_034_592,
+        ));
+
+        // Red: a content fingerprint mismatch must not be hidden by matching
+        // row counts.
+        changed_db = db_state.clone();
+        changed_db.storage_fingerprint = "content-v1:62352:62352:4189225".to_string();
+        assert!(!published_lexical_generation_matches_db_state(
+            &manifest,
+            &changed_db,
+            2_034_592,
+        ));
+
+        // Green remains exact when the canonical DB and live Tantivy doc
+        // count match the published manifest.
+        assert!(published_lexical_generation_matches_db_state(
+            &manifest, &db_state, 2_034_592,
+        ));
     }
 
     #[test]

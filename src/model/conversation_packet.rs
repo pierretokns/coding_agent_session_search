@@ -175,6 +175,19 @@ pub struct ConversationPacket {
     pub projections: ConversationPacketSinkProjections,
 }
 
+/// Borrowed canonical-replay message fields used when a sink needs packet
+/// hashes and projections but must not materialize a second owned message
+/// payload. The lexical rebuild uses this for its intentionally reduced
+/// message shape (null extras and no snippets).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConversationPacketReplayText<'a> {
+    pub idx: i64,
+    pub role: &'a str,
+    pub author: Option<&'a str>,
+    pub created_at: Option<i64>,
+    pub content: &'a str,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ConversationPacketTextSink {
     Lexical,
@@ -454,6 +467,97 @@ impl ConversationPacket {
         self.version == other.version
             && self.hashes == other.hashes
             && self.projections == other.projections
+    }
+
+    /// Compute the canonical-replay contract metadata from borrowed message
+    /// text without allocating an owned `ConversationPacket` payload.
+    ///
+    /// This is intentionally equivalent to replaying messages with null
+    /// extras and no snippets, which is the reduced shape used by the lexical
+    /// rebuild. It keeps the ordering, role normalization, hash labels, and
+    /// projection semantics identical while avoiding a second copy of large
+    /// message bodies.
+    pub fn canonical_replay_hashes_and_projections_from_text(
+        conversation: &Conversation,
+        provenance: &ConversationPacketProvenance,
+        metadata_json: &Value,
+        messages: &[ConversationPacketReplayText<'_>],
+    ) -> (ConversationPacketHashes, ConversationPacketSinkProjections) {
+        let first_message_at = messages
+            .iter()
+            .filter_map(|message| message.created_at)
+            .min();
+        let last_message_at = messages
+            .iter()
+            .filter_map(|message| message.created_at)
+            .max();
+        let identity = ConversationPacketIdentity {
+            conversation_id: conversation.id,
+            agent_slug: conversation.agent_slug.clone(),
+            external_id: conversation.external_id.clone(),
+            workspace: conversation.workspace.as_deref().map(path_to_packet_string),
+            source_path: path_to_packet_string(&conversation.source_path),
+            title: conversation.title.clone(),
+        };
+        let timestamps = ConversationPacketTimestamps {
+            started_at: conversation.started_at,
+            ended_at: conversation.ended_at,
+            first_message_at,
+            last_message_at,
+        };
+
+        let mut semantic = blake3::Hasher::new();
+        update_u32(&mut semantic, "version", CONVERSATION_PACKET_VERSION);
+        update_identity_hash(&mut semantic, &identity);
+        update_provenance_hash(&mut semantic, provenance);
+        update_timestamps_hash(&mut semantic, &timestamps);
+        update_json(&mut semantic, "metadata_json", metadata_json);
+        update_replay_text_messages_hash(&mut semantic, messages);
+
+        let mut message_hasher = blake3::Hasher::new();
+        update_u32(&mut message_hasher, "version", CONVERSATION_PACKET_VERSION);
+        update_replay_text_messages_hash(&mut message_hasher, messages);
+
+        let mut lexical_indices = Vec::new();
+        let mut total_content_bytes = 0usize;
+        let mut analytics = ConversationPacketAnalyticsProjection {
+            user_messages: 0,
+            assistant_messages: 0,
+            tool_messages: 0,
+            system_messages: 0,
+            other_messages: 0,
+        };
+        for (idx, message) in messages.iter().enumerate() {
+            if !message.content.is_empty() {
+                lexical_indices.push(idx);
+            }
+            total_content_bytes = total_content_bytes.saturating_add(message.content.len());
+            match message.role {
+                "user" => analytics.user_messages += 1,
+                "assistant" => analytics.assistant_messages += 1,
+                "tool" => analytics.tool_messages += 1,
+                "system" => analytics.system_messages += 1,
+                _ => analytics.other_messages += 1,
+            }
+        }
+        let projections = ConversationPacketSinkProjections {
+            lexical: ConversationPacketLexicalProjection {
+                message_indices: lexical_indices.clone(),
+                total_content_bytes,
+            },
+            semantic: ConversationPacketSemanticProjection {
+                message_indices: lexical_indices,
+                total_content_bytes,
+            },
+            analytics,
+        };
+        (
+            ConversationPacketHashes {
+                semantic_hash: semantic.finalize().to_hex().to_string(),
+                message_hash: message_hasher.finalize().to_hex().to_string(),
+            },
+            projections,
+        )
     }
 
     pub fn text_slab(&self) -> ConversationPacketTextSlab {
@@ -749,6 +853,22 @@ fn update_messages_hash(hasher: &mut blake3::Hasher, messages: &[ConversationPac
     }
 }
 
+fn update_replay_text_messages_hash(
+    hasher: &mut blake3::Hasher,
+    messages: &[ConversationPacketReplayText<'_>],
+) {
+    update_usize(hasher, "message_count", messages.len());
+    for message in messages {
+        update_i64(hasher, "message_idx", message.idx);
+        update_str(hasher, "message_role", message.role);
+        update_opt_str(hasher, "message_author", message.author);
+        update_opt_i64(hasher, "message_created_at", message.created_at);
+        update_str(hasher, "message_content", message.content);
+        update_json(hasher, "message_extra_json", &Value::Null);
+        update_usize(hasher, "snippet_count", 0);
+    }
+}
+
 fn update_label(hasher: &mut blake3::Hasher, label: &str) {
     hasher.update(label.as_bytes());
     hasher.update(&[0]);
@@ -984,6 +1104,43 @@ mod tests {
         assert_eq!(raw.projections.lexical.message_indices, vec![0, 1]);
         assert_eq!(raw.projections.analytics.user_messages, 1);
         assert_eq!(raw.projections.analytics.assistant_messages, 1);
+    }
+
+    #[test]
+    fn borrowed_replay_text_metadata_matches_reduced_canonical_packet() {
+        let provenance = ConversationPacketProvenance::local();
+        let mut reduced = canonical_conversation();
+        for message in &mut reduced.messages {
+            message.id = None;
+            message.extra_json = Value::Null;
+            message.snippets.clear();
+        }
+        let packet = ConversationPacket::from_canonical_replay(&reduced, provenance.clone());
+        let rows = reduced
+            .messages
+            .iter()
+            .map(|message| ConversationPacketReplayText {
+                idx: message.idx,
+                role: match message.role {
+                    MessageRole::User => "user",
+                    MessageRole::Agent => "assistant",
+                    _ => "other",
+                },
+                author: message.author.as_deref(),
+                created_at: message.created_at,
+                content: message.content.as_str(),
+            })
+            .collect::<Vec<_>>();
+        let (hashes, projections) =
+            ConversationPacket::canonical_replay_hashes_and_projections_from_text(
+                &reduced,
+                &provenance,
+                &reduced.metadata_json,
+                &rows,
+            );
+
+        assert_eq!(hashes, packet.hashes);
+        assert_eq!(projections, packet.projections);
     }
 
     #[test]

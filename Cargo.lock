@@ -488,6 +488,7 @@ dependencies = [
  "cfg-if",
  "constant_time_eq",
  "cpufeatures 0.3.0",
+ "rayon-core",
 ]
 
 [[package]]
@@ -848,7 +849,7 @@ checksum = "3f88a43d011fc4a6876cb7344703e297c71dda42494fee094d5f7c76bf13f746"
 
 [[package]]
 name = "coding-agent-search"
-version = "0.6.23"
+version = "0.6.30"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -894,6 +895,7 @@ dependencies = [
  "insta",
  "itertools 0.15.0",
  "itoa",
+ "libc",
  "lru 0.18.0",
  "memmap2",
  "mime_guess",
@@ -2075,7 +2077,7 @@ dependencies = [
 [[package]]
 name = "fsqlite"
 version = "0.1.19"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=62a58ee388775ffdf133c069372a6d01e3a589b4#62a58ee388775ffdf133c069372a6d01e3a589b4"
+source = "git+https://github.com/pierretokns/frankensqlite?rev=9aaee293#9aaee29377fd16e156b4ce1f1a004ecf82d69cae"
 dependencies = [
  "fsqlite-core",
  "fsqlite-error",
@@ -2090,7 +2092,7 @@ dependencies = [
 [[package]]
 name = "fsqlite-ast"
 version = "0.1.19"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=62a58ee388775ffdf133c069372a6d01e3a589b4#62a58ee388775ffdf133c069372a6d01e3a589b4"
+source = "git+https://github.com/pierretokns/frankensqlite?rev=9aaee293#9aaee29377fd16e156b4ce1f1a004ecf82d69cae"
 dependencies = [
  "fsqlite-types",
 ]
@@ -2098,7 +2100,7 @@ dependencies = [
 [[package]]
 name = "fsqlite-btree"
 version = "0.1.19"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=62a58ee388775ffdf133c069372a6d01e3a589b4#62a58ee388775ffdf133c069372a6d01e3a589b4"
+source = "git+https://github.com/pierretokns/frankensqlite?rev=9aaee293#9aaee29377fd16e156b4ce1f1a004ecf82d69cae"
 dependencies = [
  "foldhash 0.2.0",
  "fsqlite-error",
@@ -2115,7 +2117,7 @@ dependencies = [
 [[package]]
 name = "fsqlite-core"
 version = "0.1.19"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=62a58ee388775ffdf133c069372a6d01e3a589b4#62a58ee388775ffdf133c069372a6d01e3a589b4"
+source = "git+https://github.com/pierretokns/frankensqlite?rev=9aaee293#9aaee29377fd16e156b4ce1f1a004ecf82d69cae"
 dependencies = [
  "asupersync",
  "blake3",
@@ -2152,7 +2154,7 @@ dependencies = [
 [[package]]
 name = "fsqlite-error"
 version = "0.1.19"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=62a58ee388775ffdf133c069372a6d01e3a589b4#62a58ee388775ffdf133c069372a6d01e3a589b4"
+source = "git+https://github.com/pierretokns/frankensqlite?rev=9aaee293#9aaee29377fd16e156b4ce1f1a004ecf82d69cae"
 dependencies = [
  "thiserror 2.0.18",
 ]
@@ -2160,7 +2162,7 @@ dependencies = [
 [[package]]
 name = "fsqlite-ext-fts5"
 version = "0.1.19"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=62a58ee388775ffdf133c069372a6d01e3a589b4#62a58ee388775ffdf133c069372a6d01e3a589b4"
+source = "git+https://github.com/pierretokns/frankensqlite?rev=9aaee293#9aaee29377fd16e156b4ce1f1a004ecf82d69cae"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -2172,7 +2174,7 @@ dependencies = [
 [[package]]
 name = "fsqlite-ext-icu"
 version = "0.1.19"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=62a58ee388775ffdf133c069372a6d01e3a589b4#62a58ee388775ffdf133c069372a6d01e3a589b4"
+source = "git+https://github.com/pierretokns/frankensqlite?rev=9aaee293#9aaee29377fd16e156b4ce1f1a004ecf82d69cae"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -2183,7 +2185,7 @@ dependencies = [
 [[package]]
 name = "fsqlite-ext-json"
 version = "0.1.19"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=62a58ee388775ffdf133c069372a6d01e3a589b4#62a58ee388775ffdf133c069372a6d01e3a589b4"
+source = "git+https://github.com/pierretokns/frankensqlite?rev=9aaee293#9aaee29377fd16e156b4ce1f1a004ecf82d69cae"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -2195,7 +2197,7 @@ dependencies = [
 [[package]]
 name = "fsqlite-ext-misc"
 version = "0.1.19"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=62a58ee388775ffdf133c069372a6d01e3a589b4#62a58ee388775ffdf133c069372a6d01e3a589b4"
+source = "git+https://github.com/pierretokns/frankensqlite?rev=9aaee293#9aaee29377fd16e156b4ce1f1a004ecf82d69cae"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -2208,7 +2210,7 @@ dependencies = [
 [[package]]
 name = "fsqlite-ext-rtree"
 version = "0.1.19"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=62a58ee388775ffdf133c069372a6d01e3a589b4#62a58ee388775ffdf133c069372a6d01e3a589b4"
+source = "git+https://github.com/pierretokns/frankensqlite?rev=9aaee293#9aaee29377fd16e156b4ce1f1a004ecf82d69cae"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -2218,7 +2220,7 @@ dependencies = [
 [[package]]
 name = "fsqlite-func"
 version = "0.1.19"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=62a58ee388775ffdf133c069372a6d01e3a589b4#62a58ee388775ffdf133c069372a6d01e3a589b4"
+source = "git+https://github.com/pierretokns/frankensqlite?rev=9aaee293#9aaee29377fd16e156b4ce1f1a004ecf82d69cae"
 dependencies = [
  "chrono",
  "fsqlite-error",
@@ -2229,7 +2231,7 @@ dependencies = [
 [[package]]
 name = "fsqlite-mvcc"
 version = "0.1.19"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=62a58ee388775ffdf133c069372a6d01e3a589b4#62a58ee388775ffdf133c069372a6d01e3a589b4"
+source = "git+https://github.com/pierretokns/frankensqlite?rev=9aaee293#9aaee29377fd16e156b4ce1f1a004ecf82d69cae"
 dependencies = [
  "asupersync",
  "blake3",
@@ -2253,7 +2255,7 @@ dependencies = [
 [[package]]
 name = "fsqlite-observability"
 version = "0.1.19"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=62a58ee388775ffdf133c069372a6d01e3a589b4#62a58ee388775ffdf133c069372a6d01e3a589b4"
+source = "git+https://github.com/pierretokns/frankensqlite?rev=9aaee293#9aaee29377fd16e156b4ce1f1a004ecf82d69cae"
 dependencies = [
  "fsqlite-types",
  "parking_lot",
@@ -2264,7 +2266,7 @@ dependencies = [
 [[package]]
 name = "fsqlite-pager"
 version = "0.1.19"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=62a58ee388775ffdf133c069372a6d01e3a589b4#62a58ee388775ffdf133c069372a6d01e3a589b4"
+source = "git+https://github.com/pierretokns/frankensqlite?rev=9aaee293#9aaee29377fd16e156b4ce1f1a004ecf82d69cae"
 dependencies = [
  "argon2",
  "blake3",
@@ -2287,7 +2289,7 @@ dependencies = [
 [[package]]
 name = "fsqlite-parser"
 version = "0.1.19"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=62a58ee388775ffdf133c069372a6d01e3a589b4#62a58ee388775ffdf133c069372a6d01e3a589b4"
+source = "git+https://github.com/pierretokns/frankensqlite?rev=9aaee293#9aaee29377fd16e156b4ce1f1a004ecf82d69cae"
 dependencies = [
  "fsqlite-ast",
  "fsqlite-error",
@@ -2300,7 +2302,7 @@ dependencies = [
 [[package]]
 name = "fsqlite-planner"
 version = "0.1.19"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=62a58ee388775ffdf133c069372a6d01e3a589b4#62a58ee388775ffdf133c069372a6d01e3a589b4"
+source = "git+https://github.com/pierretokns/frankensqlite?rev=9aaee293#9aaee29377fd16e156b4ce1f1a004ecf82d69cae"
 dependencies = [
  "blake3",
  "fsqlite-ast",
@@ -2317,7 +2319,7 @@ dependencies = [
 [[package]]
 name = "fsqlite-types"
 version = "0.1.19"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=62a58ee388775ffdf133c069372a6d01e3a589b4#62a58ee388775ffdf133c069372a6d01e3a589b4"
+source = "git+https://github.com/pierretokns/frankensqlite?rev=9aaee293#9aaee29377fd16e156b4ce1f1a004ecf82d69cae"
 dependencies = [
  "asupersync",
  "bitflags 2.13.0",
@@ -2336,7 +2338,7 @@ dependencies = [
 [[package]]
 name = "fsqlite-vdbe"
 version = "0.1.19"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=62a58ee388775ffdf133c069372a6d01e3a589b4#62a58ee388775ffdf133c069372a6d01e3a589b4"
+source = "git+https://github.com/pierretokns/frankensqlite?rev=9aaee293#9aaee29377fd16e156b4ce1f1a004ecf82d69cae"
 dependencies = [
  "asupersync",
  "crossbeam-deque",
@@ -2358,7 +2360,7 @@ dependencies = [
 [[package]]
 name = "fsqlite-vfs"
 version = "0.1.19"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=62a58ee388775ffdf133c069372a6d01e3a589b4#62a58ee388775ffdf133c069372a6d01e3a589b4"
+source = "git+https://github.com/pierretokns/frankensqlite?rev=9aaee293#9aaee29377fd16e156b4ce1f1a004ecf82d69cae"
 dependencies = [
  "advisory-lock",
  "asupersync",
@@ -2376,7 +2378,7 @@ dependencies = [
 [[package]]
 name = "fsqlite-wal"
 version = "0.1.19"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=62a58ee388775ffdf133c069372a6d01e3a589b4#62a58ee388775ffdf133c069372a6d01e3a589b4"
+source = "git+https://github.com/pierretokns/frankensqlite?rev=9aaee293#9aaee29377fd16e156b4ce1f1a004ecf82d69cae"
 dependencies = [
  "asupersync",
  "blake3",

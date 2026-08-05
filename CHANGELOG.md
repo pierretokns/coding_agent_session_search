@@ -15,6 +15,153 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_session_search>
 
 ---
 
+## [Unreleased]
+
+## [v0.6.30] -- 2026-08-04
+
+Lexical equivalence throughput release.
+
+### Performance
+
+- Use BLAKE3's exact Rayon-backed update path for lexical equivalence content
+  at the documented large-buffer crossover, while retaining the serial path for
+  ordinary messages and preserving byte-identical evidence.
+- Speed up fork release assembly by validating the root package version without recloning sibling repositories.
+- Make the Windows release matrix leg non-blocking so a transient Windows
+  toolchain failure cannot suppress verified Linux/macOS release artifacts.
+
+### Verified
+
+- Exact lexical equivalence evidence tests pass, including legacy/keyset replay
+  equality and byte-identical large-content hashing.
+- Two release-profile scale-4 reconstruction runs processed 435.9 MB and
+  400,000 messages in 6.44–9.11 seconds (45.6–64.6 MiB/s), with ordered
+  equivalence hashing at 0.26–0.64 seconds.
+
+## [v0.6.29] -- 2026-08-04
+
+Storage and approximate-search correctness release.
+
+### Fixed
+
+- **Storage reports now deduplicate hardlinked evidence.** Raw-mirror files and
+  doctor evidence that reference the same inode are counted once in physical
+  footprint reports, while existing logical cleanup accounting remains
+  unchanged.
+- **Normal semantic builds now publish HNSW metadata.** Approximate search has
+  a durable pairing between the HNSW sidecar and its exact FSVI artifact, and
+  exact rebuilds invalidate the derived graph for that tier.
+- **Filtered approximate pages repair from exact FSVI.** Stored-only session
+  path filters can no longer leave an underfilled ANN page marked as an
+  approximate result when a bounded exact retry is required.
+
+### Verified
+
+- Focused storage deduplication tests, the full exact-artifact contract suite,
+  semantic session-path retry coverage, and the native-ANN selective-filter
+  regression all pass under the optimized profile.
+
+## [v0.6.28] -- 2026-08-04
+
+Lexical-generation reuse release.
+
+### Fixed
+
+- **Missing lexical checkpoints no longer force a redundant full rebuild.** A
+  validated and published lexical-generation manifest can now restore the
+  completed-generation identity when the checkpoint sidecar is missing. Reuse
+  requires an exact canonical DB fingerprint, conversation count, searchable
+  Tantivy contract, and live document count; incomplete, stale, or mismatched
+  generations still rebuild.
+
+### Verified
+
+- Red/green tests prove that a changed conversation count or content
+  fingerprint rejects reuse, while an unchanged generation is accepted with
+  its existing identity and document count.
+
+---
+
+## [v0.6.27] -- 2026-08-04
+
+Bounded semantic throughput release.
+
+### Added
+
+- **Optional two-worker native MiniLM embedding.** Set
+  `CASS_SEMANTIC_EMBED_WORKERS=2` for large batches. The workers preserve
+  input order and exact vectors while keeping the pool bounded; the default
+  remains one model to avoid imposing the extra memory cost on ordinary users.
+
+### Verified
+
+- On the local Apple Silicon model bundle, two workers measured 1.97× the
+  throughput of one worker for matched 128-document batches at 465 MiB peak
+  RSS, with an exact-vector determinism regression passing.
+
+## [v0.6.26] -- 2026-08-04
+
+Semantic backfill guardrail follow-up release.
+
+### Fixed
+
+- **Large conversations are bounded before message materialization.** Semantic
+  backfill now performs aggregate post-cursor message-count and raw-byte
+  preflights against the checkpoint limits, preventing a conversation with
+  many individually-small messages from bypassing the memory guardrail.
+
+### Release engineering
+
+- Manual release tag inputs are passed through environment variables before
+  shell validation, and crates.io publication is restricted to the upstream
+  repository. Fork releases remain binary-and-checksum releases only.
+
+## [v0.6.25] -- 2026-08-04
+
+Semantic backfill safety and fork-release patch release.
+
+### Fixed
+
+- **Semantic backfill now bounds pathological message materialization.** A
+  length-only SQLite probe rejects a single raw message over 16 MiB before its
+  body is transferred into a Rust `Message` or sent to the embedder. Set
+  `CASS_SEMANTIC_MAX_RAW_MESSAGE_BYTES=0` only when unbounded input is
+  intentional.
+- **Checkpoint-capped semantic batches materialize candidates incrementally.**
+  The backfill now fetches one ordered conversation at a time and stops before
+  the next whole conversation would exceed the checkpoint budget, reducing
+  peak memory and preserving crash-safe cursor semantics. Aggregate
+  message-count and raw-byte preflights reject a conversation that cannot fit
+  within the configured checkpoint limits before its bodies are transferred.
+
+### Release engineering
+
+- Fork tags are validated for SemVer, Cargo version, and a matching changelog
+  heading before cross-platform builds run. The fork's default-branch release
+  dispatcher publishes tagged archives and checksums to the fork's GitHub
+  Releases page.
+
+## [v0.6.24] -- 2026-08-04
+
+Performance and fork-release maintenance release.
+
+### Fixed
+
+- **Semantic resume candidate selection no longer forces a full messages-table
+  scan.** The post-checkpoint selector now uses a bounded, ordered distinct
+  query, preserving the message/conversation cursor invariants while avoiding
+  repeated O(total-messages) scans on large archives.
+- **Fork releases now validate their release contract.** Tag SemVer, Cargo
+  version, and Keep-a-Changelog heading must agree before artifact builds run.
+  Release notes, installer links, and checksum URLs resolve against the fork
+  repository instead of the upstream project.
+
+### Release engineering
+
+- Fork tags publish the existing cross-platform archives, SHA256 manifests,
+  SBOM, provenance attestations, and signatures without attempting to update
+  the upstream Homebrew or Scoop repositories.
+
 ## [v0.6.23] -- 2026-07-30
 
 **Everything landed in the 128 commits between the [v0.6.22 GitHub
@@ -1709,7 +1856,8 @@ Initial development. Project scaffolding, architecture design, and first impleme
 
 ---
 
-[Unreleased]: https://github.com/Dicklesworthstone/coding_agent_session_search/compare/v0.2.2...HEAD
+[Unreleased]: https://github.com/pierretokns/coding_agent_session_search/compare/v0.6.24...HEAD
+[v0.6.24]: https://github.com/pierretokns/coding_agent_session_search/compare/v0.6.23...v0.6.24
 [v0.2.2]: https://github.com/Dicklesworthstone/coding_agent_session_search/compare/v0.2.1...v0.2.2
 [v0.2.1]: https://github.com/Dicklesworthstone/coding_agent_session_search/compare/v0.2.0...v0.2.1
 [v0.2.0]: https://github.com/Dicklesworthstone/coding_agent_session_search/compare/v0.1.64...v0.2.0

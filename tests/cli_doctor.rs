@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
 fn test_canonical_json_value(value: Value) -> Value {
@@ -231,6 +231,41 @@ fn seed_healthy_empty_index(test_home: &Path, data_dir: &Path) {
     );
 }
 
+fn write_matching_integrity_attestation(data_dir: &Path, verdict: &str) {
+    let db_path = data_dir.join("agent_search.db");
+    let wal_path = data_dir.join("agent_search.db-wal");
+    let mtime_ns = |path: &Path| {
+        fs::metadata(path)
+            .expect("attestation file metadata")
+            .modified()
+            .expect("attestation file mtime")
+            .duration_since(UNIX_EPOCH)
+            .expect("attestation mtime epoch")
+            .as_nanos() as i64
+    };
+    let checked_at_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("attestation clock")
+        .as_millis() as i64;
+    let wal_metadata = fs::metadata(&wal_path).ok();
+    let attestation = json!({
+        "version": 1,
+        "verdict": verdict,
+        "check_depth": "integrity_check",
+        "checked_at_ms": checked_at_ms,
+        "db_size_bytes": fs::metadata(&db_path).expect("db metadata").len(),
+        "db_mtime_ns": mtime_ns(&db_path),
+        "wal_size_bytes": wal_metadata.as_ref().map_or(0, |metadata| metadata.len()),
+        "wal_mtime_ns": wal_metadata.map_or(0, |_| mtime_ns(&wal_path)),
+        "detail": "synthetic cached attestation for doctor reuse regression"
+    });
+    fs::write(
+        data_dir.join("integrity_attestation.json"),
+        serde_json::to_vec_pretty(&attestation).expect("attestation json"),
+    )
+    .expect("write attestation");
+}
+
 fn write_test_sqlite_db(path: &Path, marker: &str) {
     fs::create_dir_all(path.parent().expect("sqlite db parent")).expect("create sqlite db parent");
     let conn = FrankenConnection::open(path.to_string_lossy().into_owned())
@@ -402,6 +437,161 @@ fn run_doctor_cleanup_apply(test_home: &Path, data_dir: &Path, fingerprint: &str
         String::from_utf8_lossy(&out.stderr)
     );
     serde_json::from_slice(&out.stdout).expect("doctor cleanup apply JSON")
+}
+
+fn write_interrupted_candidate_fixture(
+    data_dir: &Path,
+    candidate_id: &str,
+    non_empty_evidence: Option<&[u8]>,
+) -> std::path::PathBuf {
+    let candidate_dir = data_dir
+        .join("doctor")
+        .join("candidates")
+        .join(candidate_id);
+    fs::create_dir_all(&candidate_dir).expect("create candidate fixture");
+    let manifest = json!({
+        "schema_version": 1,
+        "manifest_kind": "cass_doctor_reconstruct_candidate_v1",
+        "candidate_id": candidate_id,
+        "lifecycle_status": "in_progress",
+        "artifact_count": 0,
+        "source_fingerprint": "fixture-source-fingerprint",
+        "coverage_gate": {"status": "unknown", "promote_allowed": false}
+    });
+    fs::write(
+        candidate_dir.join("manifest.json"),
+        serde_json::to_vec_pretty(&manifest).expect("candidate fixture manifest json"),
+    )
+    .expect("write candidate fixture manifest");
+    for relative in [
+        "database",
+        "logs",
+        "index/lexical",
+        "index/semantic",
+        "receipts",
+    ] {
+        fs::create_dir_all(candidate_dir.join(relative))
+            .expect("create empty candidate scaffolding");
+    }
+    if let Some(bytes) = non_empty_evidence {
+        let progress_dir = candidate_dir.join("logs");
+        fs::create_dir_all(&progress_dir).expect("create candidate progress dir");
+        fs::write(progress_dir.join("reconstruct-progress.jsonl"), bytes)
+            .expect("write candidate progress evidence");
+    }
+    candidate_dir
+}
+
+#[test]
+fn doctor_candidates_cleanup_quarantines_only_empty_interrupted_candidates() {
+    let test_home = tempfile::tempdir().expect("tempdir");
+    let data_dir = test_home.path().join("cass-data");
+    let empty_a = write_interrupted_candidate_fixture(&data_dir, "empty-a", None);
+    let empty_b = write_interrupted_candidate_fixture(&data_dir, "empty-b", None);
+    let resumable =
+        write_interrupted_candidate_fixture(&data_dir, "resumable", Some(b"cursor=1\n"));
+
+    let preview = cass_cmd(test_home.path())
+        .args([
+            "doctor",
+            "candidates",
+            "cleanup",
+            "--dry-run",
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("run interrupted candidate cleanup preview");
+    assert!(
+        preview.status.success(),
+        "candidate cleanup preview failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&preview.stdout),
+        String::from_utf8_lossy(&preview.stderr)
+    );
+    let payload: Value = serde_json::from_slice(&preview.stdout).expect("candidate cleanup JSON");
+    assert_eq!(
+        payload["kind"].as_str(),
+        Some("cleanup_interrupted_candidates")
+    );
+    assert_eq!(payload["eligible_count"].as_u64(), Some(2));
+    assert_eq!(payload["blocked_count"].as_u64(), Some(1));
+    assert!(payload["approval_fingerprint"].as_str().is_some());
+    assert!(empty_a.exists(), "dry-run must not move empty candidates");
+    assert!(empty_b.exists(), "dry-run must not move empty candidates");
+    assert!(
+        resumable.exists(),
+        "dry-run must not touch resumable candidates"
+    );
+
+    let fingerprint = payload["approval_fingerprint"]
+        .as_str()
+        .expect("cleanup approval fingerprint");
+    let apply = cass_cmd(test_home.path())
+        .args([
+            "doctor",
+            "candidates",
+            "cleanup",
+            "--yes",
+            "--plan-fingerprint",
+            fingerprint,
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("run interrupted candidate cleanup apply");
+    assert!(
+        apply.status.success(),
+        "candidate cleanup apply failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&apply.stdout),
+        String::from_utf8_lossy(&apply.stderr)
+    );
+    let applied: Value =
+        serde_json::from_slice(&apply.stdout).expect("candidate cleanup apply JSON");
+    assert_eq!(applied["status"].as_str(), Some("applied"));
+    assert_eq!(applied["quarantined_count"].as_u64(), Some(2));
+    assert!(
+        !empty_a.exists(),
+        "empty candidate should be atomically quarantined"
+    );
+    assert!(
+        !empty_b.exists(),
+        "empty candidate should be atomically quarantined"
+    );
+    assert!(
+        resumable.exists(),
+        "candidate with progress evidence must remain resumable"
+    );
+    assert!(
+        data_dir
+            .join("doctor")
+            .join("quarantine")
+            .join("interrupted-candidates")
+            .join("empty-a")
+            .exists(),
+        "quarantine must preserve the candidate instead of deleting it"
+    );
+
+    let repeat = cass_cmd(test_home.path())
+        .args([
+            "doctor",
+            "candidates",
+            "cleanup",
+            "--dry-run",
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("rerun interrupted candidate cleanup preview");
+    assert!(
+        repeat.status.success(),
+        "cleanup rerun should be idempotent"
+    );
+    let repeat_payload: Value = serde_json::from_slice(&repeat.stdout).expect("rerun cleanup JSON");
+    assert_eq!(repeat_payload["status"].as_str(), Some("noop"));
+    assert_eq!(repeat_payload["eligible_count"].as_u64(), Some(0));
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1804,6 +1994,48 @@ fn doctor_check_json_reports_read_only_truth_surface_without_writes() {
                     && check["safe_for_auto_repair"].as_bool() == Some(false)
             })),
         "semantic_model check should be structured as a non-archive derived-asset finding: {payload:#}"
+    );
+}
+
+#[test]
+fn doctor_check_reuses_matching_integrity_attestation_without_deep_probe() {
+    let test_home = tempfile::tempdir().expect("tempdir");
+    let data_dir = test_home.path().join("cass-data");
+    seed_healthy_empty_index(test_home.path(), &data_dir);
+    write_matching_integrity_attestation(&data_dir, "fail");
+
+    let out = cass_cmd(test_home.path())
+        .args([
+            "doctor",
+            "check",
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .env("CASS_DOCTOR_DB_PROBE_TIMEOUT_SECS", "1")
+        .output()
+        .expect("run cached doctor check");
+    assert!(
+        !out.status.success(),
+        "cached failed attestation should make doctor unhealthy"
+    );
+    let payload: Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    assert_eq!(
+        payload["storage_integrity"]["attestation_source"].as_str(),
+        Some("cached"),
+        "doctor should expose cached provenance: {payload:#}"
+    );
+    assert!(
+        payload["checks"]
+            .as_array()
+            .is_some_and(|checks| checks.iter().any(|check| {
+                check["name"].as_str() == Some("database")
+                    && check["status"].as_str() == Some("fail")
+                    && check["message"]
+                        .as_str()
+                        .is_some_and(|message| message.contains("cached integrity_check"))
+            })),
+        "doctor should report the cached failure instead of timing out: {payload:#}"
     );
 }
 

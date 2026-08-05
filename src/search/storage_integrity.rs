@@ -816,9 +816,9 @@ fn copy_snapshot_file_bounded(
     }
 }
 
-/// Inspect the native VFS reservation state without acquiring a transaction or
-/// opening the pager. On Unix, `check_reserved_lock` delegates to `F_GETLK` on
-/// SQLite's reserved byte, so it neither changes the main file nor recovers or
+/// Inspect the native reservation state without acquiring a transaction or
+/// opening the pager. On Unix this asks the kernel for `F_GETLK` on SQLite's
+/// reserved byte, so it neither changes the main file nor recovers or
 /// checkpoints sidecars. The work runs on a bounded thread because a storage
 /// diagnosis must never inherit an engine-level wait indefinitely.
 fn probe_writer_lock_state(
@@ -841,26 +841,33 @@ fn probe_writer_lock_state(
 
 #[cfg(unix)]
 fn inspect_native_writer_lock(db_path: &std::path::Path) -> LockAdmissionProbe {
-    use frankensqlite::fsqlite_vfs::{UnixVfs, Vfs as _, VfsFile as _};
-    use fsqlite_types::cx::Cx;
-    use fsqlite_types::flags::VfsOpenFlags;
+    // Do not open the path through FrankenSQLite's VFS here. Even its
+    // read-only pager admission can materialize namespace/WAL-index sidecars,
+    // which violates `doctor check`'s no-write contract. SQLite's Unix lock
+    // probe is just F_GETLK against the reserved byte; ask the kernel directly
+    // on a read-only descriptor instead.
+    use std::os::fd::AsRawFd;
 
-    let cx = Cx::new();
-    let vfs = UnixVfs::new();
-    let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::READONLY;
-    let (mut file, _) = match vfs.open(&cx, Some(db_path), flags) {
-        Ok(opened) => opened,
-        Err(err) => return lock_admission_outcome_from_error(&err),
+    const RESERVED_BYTE: libc::off_t = 0x4000_0001;
+    let file = match std::fs::OpenOptions::new().read(true).open(db_path) {
+        Ok(file) => file,
+        Err(_) => return LockAdmissionProbe::Unclassified,
     };
-    let outcome = match file.check_reserved_lock(&cx) {
-        Ok(true) => LockAdmissionProbe::BusyOrLocked,
-        Ok(false) => LockAdmissionProbe::Available,
-        Err(err) => lock_admission_outcome_from_error(&err),
+    let mut lock = libc::flock {
+        l_type: libc::F_WRLCK as i16,
+        l_whence: libc::SEEK_SET as i16,
+        l_start: RESERVED_BYTE,
+        l_len: 1,
+        l_pid: 0,
     };
-    if file.close(&cx).is_err() && outcome == LockAdmissionProbe::Available {
-        LockAdmissionProbe::Unclassified
+    let result = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETLK, &mut lock) };
+    if result != 0 {
+        return LockAdmissionProbe::Unclassified;
+    }
+    if lock.l_type == libc::F_UNLCK as i16 {
+        LockAdmissionProbe::Available
     } else {
-        outcome
+        LockAdmissionProbe::BusyOrLocked
     }
 }
 
@@ -870,24 +877,6 @@ fn inspect_native_writer_lock(_db_path: &std::path::Path) -> LockAdmissionProbe 
     // this diagnostic non-mutating there and rely on the typed raw read/query
     // errors below until a side-effect-free lock-inspection API is available.
     LockAdmissionProbe::Unclassified
-}
-
-#[cfg(unix)]
-fn lock_admission_outcome_from_error(err: &frankensqlite::FrankenError) -> LockAdmissionProbe {
-    use crate::search::contention_diagnostics::{ContentionClass, classify_franken_error};
-
-    if classify_franken_error(err).is_some_and(|class| {
-        matches!(
-            class,
-            ContentionClass::BusyLocked
-                | ContentionClass::BusyRecovery
-                | ContentionClass::SnapshotConflict
-        )
-    }) {
-        LockAdmissionProbe::BusyOrLocked
-    } else {
-        LockAdmissionProbe::Unclassified
-    }
 }
 
 fn elapsed_millis(started: std::time::Instant) -> i64 {

@@ -21,6 +21,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::thread;
 
 use super::embedder::{Embedder, EmbedderError, EmbedderResult};
 use frankensearch::{ModelCategory, ModelTier, NativeEmbedder};
@@ -469,6 +470,101 @@ impl Embedder for FastEmbedder {
     }
 }
 
+/// Bounded MiniLM worker pool for large semantic batches.
+///
+/// The native model already parallelizes a single forward pass internally, so
+/// this is deliberately capped at two independently loaded models and is
+/// opt-in through `CASS_SEMANTIC_EMBED_WORKERS=2`. Keeping the default at one
+/// preserves the low-memory path for ordinary searches and small archives.
+pub struct ParallelFastEmbedder {
+    workers: Vec<FastEmbedder>,
+}
+
+impl ParallelFastEmbedder {
+    /// Load one or two independent native MiniLM workers from the same bundle.
+    pub fn load_from_dir(model_dir: &Path, worker_count: usize) -> EmbedderResult<Self> {
+        let worker_count = worker_count.clamp(1, 2);
+        let mut workers = Vec::with_capacity(worker_count);
+        for _ in 0..worker_count {
+            workers.push(FastEmbedder::load_from_dir(model_dir)?);
+        }
+        Ok(Self { workers })
+    }
+
+    pub fn worker_count(&self) -> usize {
+        self.workers.len()
+    }
+
+    fn worker_panic_error(&self) -> EmbedderError {
+        EmbedderError::EmbeddingFailed {
+            model: self.workers[0].model_id().to_string(),
+            source: Box::new(std::io::Error::other("parallel embed worker panicked")),
+        }
+    }
+}
+
+impl Embedder for ParallelFastEmbedder {
+    fn embed_sync(&self, text: &str) -> EmbedderResult<Vec<f32>> {
+        self.workers[0].embed_sync(text)
+    }
+
+    fn embed_batch_sync(&self, texts: &[&str]) -> EmbedderResult<Vec<Vec<f32>>> {
+        if texts.is_empty() || self.workers.len() == 1 || texts.len() == 1 {
+            return self.workers[0].embed_batch_sync(texts);
+        }
+
+        let worker_count = self.workers.len().min(texts.len());
+        let chunk_size = texts.len().div_ceil(worker_count);
+        let results = thread::scope(|scope| {
+            let handles = self
+                .workers
+                .iter()
+                .take(worker_count)
+                .zip(texts.chunks(chunk_size))
+                .map(|(worker, chunk)| scope.spawn(move || worker.embed_batch_sync(chunk)))
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| {
+                    handle
+                        .join()
+                        .unwrap_or_else(|_| Err(self.worker_panic_error()))
+                })
+                .collect::<Vec<_>>()
+        });
+
+        let mut vectors = Vec::with_capacity(texts.len());
+        for result in results {
+            vectors.extend(result?);
+        }
+        Ok(vectors)
+    }
+
+    fn dimension(&self) -> usize {
+        self.workers[0].dimension()
+    }
+
+    fn id(&self) -> &str {
+        self.workers[0].id()
+    }
+
+    fn model_name(&self) -> &str {
+        self.workers[0].model_name()
+    }
+
+    fn is_semantic(&self) -> bool {
+        true
+    }
+
+    fn category(&self) -> ModelCategory {
+        ModelCategory::TransformerEmbedder
+    }
+
+    fn tier(&self) -> ModelTier {
+        ModelTier::Quality
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -548,5 +644,24 @@ mod tests {
         assert_eq!(FastEmbedder::canonical_name("minilm-384"), Some("minilm"));
         assert!(FastEmbedder::canonical_name("snowflake-arctic-s-384").is_none());
         assert!(FastEmbedder::canonical_name("nomic-embed-text-v1.5").is_none());
+    }
+
+    #[test]
+    #[ignore = "needs a real safetensors MiniLM model via FRANKENSEARCH_MODEL_DIR"]
+    fn parallel_minilm_workers_preserve_order_and_exact_vectors() {
+        let model_dir = model_dir_override().expect("FRANKENSEARCH_MODEL_DIR");
+        let single = FastEmbedder::load_from_dir(&model_dir).expect("single model");
+        let parallel = ParallelFastEmbedder::load_from_dir(&model_dir, 2).expect("two models");
+        assert_eq!(parallel.worker_count(), 2);
+
+        let docs = [
+            "first deterministic semantic document",
+            "second deterministic semantic document",
+            "third deterministic semantic document",
+            "fourth deterministic semantic document",
+        ];
+        let expected = single.embed_batch_sync(&docs).expect("single vectors");
+        let actual = parallel.embed_batch_sync(&docs).expect("parallel vectors");
+        assert_eq!(actual, expected);
     }
 }
