@@ -404,6 +404,161 @@ fn run_doctor_cleanup_apply(test_home: &Path, data_dir: &Path, fingerprint: &str
     serde_json::from_slice(&out.stdout).expect("doctor cleanup apply JSON")
 }
 
+fn write_interrupted_candidate_fixture(
+    data_dir: &Path,
+    candidate_id: &str,
+    non_empty_evidence: Option<&[u8]>,
+) -> std::path::PathBuf {
+    let candidate_dir = data_dir
+        .join("doctor")
+        .join("candidates")
+        .join(candidate_id);
+    fs::create_dir_all(&candidate_dir).expect("create candidate fixture");
+    let manifest = json!({
+        "schema_version": 1,
+        "manifest_kind": "cass_doctor_reconstruct_candidate_v1",
+        "candidate_id": candidate_id,
+        "lifecycle_status": "in_progress",
+        "artifact_count": 0,
+        "source_fingerprint": "fixture-source-fingerprint",
+        "coverage_gate": {"status": "unknown", "promote_allowed": false}
+    });
+    fs::write(
+        candidate_dir.join("manifest.json"),
+        serde_json::to_vec_pretty(&manifest).expect("candidate fixture manifest json"),
+    )
+    .expect("write candidate fixture manifest");
+    for relative in [
+        "database",
+        "logs",
+        "index/lexical",
+        "index/semantic",
+        "receipts",
+    ] {
+        fs::create_dir_all(candidate_dir.join(relative))
+            .expect("create empty candidate scaffolding");
+    }
+    if let Some(bytes) = non_empty_evidence {
+        let progress_dir = candidate_dir.join("logs");
+        fs::create_dir_all(&progress_dir).expect("create candidate progress dir");
+        fs::write(progress_dir.join("reconstruct-progress.jsonl"), bytes)
+            .expect("write candidate progress evidence");
+    }
+    candidate_dir
+}
+
+#[test]
+fn doctor_candidates_cleanup_quarantines_only_empty_interrupted_candidates() {
+    let test_home = tempfile::tempdir().expect("tempdir");
+    let data_dir = test_home.path().join("cass-data");
+    let empty_a = write_interrupted_candidate_fixture(&data_dir, "empty-a", None);
+    let empty_b = write_interrupted_candidate_fixture(&data_dir, "empty-b", None);
+    let resumable =
+        write_interrupted_candidate_fixture(&data_dir, "resumable", Some(b"cursor=1\n"));
+
+    let preview = cass_cmd(test_home.path())
+        .args([
+            "doctor",
+            "candidates",
+            "cleanup",
+            "--dry-run",
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("run interrupted candidate cleanup preview");
+    assert!(
+        preview.status.success(),
+        "candidate cleanup preview failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&preview.stdout),
+        String::from_utf8_lossy(&preview.stderr)
+    );
+    let payload: Value = serde_json::from_slice(&preview.stdout).expect("candidate cleanup JSON");
+    assert_eq!(
+        payload["kind"].as_str(),
+        Some("cleanup_interrupted_candidates")
+    );
+    assert_eq!(payload["eligible_count"].as_u64(), Some(2));
+    assert_eq!(payload["blocked_count"].as_u64(), Some(1));
+    assert!(payload["approval_fingerprint"].as_str().is_some());
+    assert!(empty_a.exists(), "dry-run must not move empty candidates");
+    assert!(empty_b.exists(), "dry-run must not move empty candidates");
+    assert!(
+        resumable.exists(),
+        "dry-run must not touch resumable candidates"
+    );
+
+    let fingerprint = payload["approval_fingerprint"]
+        .as_str()
+        .expect("cleanup approval fingerprint");
+    let apply = cass_cmd(test_home.path())
+        .args([
+            "doctor",
+            "candidates",
+            "cleanup",
+            "--yes",
+            "--plan-fingerprint",
+            fingerprint,
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("run interrupted candidate cleanup apply");
+    assert!(
+        apply.status.success(),
+        "candidate cleanup apply failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&apply.stdout),
+        String::from_utf8_lossy(&apply.stderr)
+    );
+    let applied: Value =
+        serde_json::from_slice(&apply.stdout).expect("candidate cleanup apply JSON");
+    assert_eq!(applied["status"].as_str(), Some("applied"));
+    assert_eq!(applied["quarantined_count"].as_u64(), Some(2));
+    assert!(
+        !empty_a.exists(),
+        "empty candidate should be atomically quarantined"
+    );
+    assert!(
+        !empty_b.exists(),
+        "empty candidate should be atomically quarantined"
+    );
+    assert!(
+        resumable.exists(),
+        "candidate with progress evidence must remain resumable"
+    );
+    assert!(
+        data_dir
+            .join("doctor")
+            .join("quarantine")
+            .join("interrupted-candidates")
+            .join("empty-a")
+            .exists(),
+        "quarantine must preserve the candidate instead of deleting it"
+    );
+
+    let repeat = cass_cmd(test_home.path())
+        .args([
+            "doctor",
+            "candidates",
+            "cleanup",
+            "--dry-run",
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("rerun interrupted candidate cleanup preview");
+    assert!(
+        repeat.status.success(),
+        "cleanup rerun should be idempotent"
+    );
+    let repeat_payload: Value = serde_json::from_slice(&repeat.stdout).expect("rerun cleanup JSON");
+    assert_eq!(repeat_payload["status"].as_str(), Some("noop"));
+    assert_eq!(repeat_payload["eligible_count"].as_u64(), Some(0));
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DoctorNoWriteTreeEntry {
     entry_kind: String,

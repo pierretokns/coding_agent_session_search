@@ -661,6 +661,460 @@ pub fn run_doctor_cleanup_interrupted_artifacts(
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+struct InterruptedCandidateInspection {
+    candidate_id: String,
+    source: PathBuf,
+    manifest_blake3: String,
+    eligible: bool,
+    reason: String,
+    extra_entry_count: usize,
+}
+
+fn collect_interrupted_candidate_inspections(
+    data_dir: &Path,
+) -> std::result::Result<Vec<InterruptedCandidateInspection>, CliError> {
+    let candidates_root = data_dir.join("doctor").join("candidates");
+    if !candidates_root.exists() {
+        return Ok(Vec::new());
+    }
+    let root_meta = std::fs::symlink_metadata(&candidates_root).map_err(|e| {
+        io_error(
+            format!(
+                "reading doctor candidate root {}: {e}",
+                candidates_root.display()
+            ),
+            None,
+        )
+    })?;
+    if !root_meta.file_type().is_dir() {
+        return Err(CliError {
+            code: 4,
+            kind: "refused-unsafe",
+            message: format!(
+                "doctor candidate root is not a directory: {}",
+                candidates_root.display()
+            ),
+            hint: Some(
+                "Move the unexpected path aside and retry after verifying the data directory."
+                    .to_string(),
+            ),
+            retryable: false,
+        });
+    }
+
+    let mut inspections = Vec::new();
+    let entries = std::fs::read_dir(&candidates_root).map_err(|e| {
+        io_error(
+            format!(
+                "enumerating doctor candidates {}: {e}",
+                candidates_root.display()
+            ),
+            None,
+        )
+    })?;
+    for entry in entries {
+        let entry =
+            entry.map_err(|e| io_error(format!("enumerating doctor candidate: {e}"), None))?;
+        let candidate_dir = entry.path();
+        let candidate_id = entry.file_name().to_string_lossy().to_string();
+        let candidate_meta = std::fs::symlink_metadata(&candidate_dir).map_err(|e| {
+            io_error(
+                format!("reading candidate {}: {e}", candidate_dir.display()),
+                None,
+            )
+        })?;
+        if !candidate_meta.file_type().is_dir() {
+            continue;
+        }
+
+        let manifest_path = candidate_dir.join("manifest.json");
+        let manifest_meta = match std::fs::symlink_metadata(&manifest_path) {
+            Ok(meta) if meta.file_type().is_file() => meta,
+            _ => continue,
+        };
+        let manifest_bytes = std::fs::read(&manifest_path).map_err(|e| {
+            io_error(
+                format!(
+                    "reading candidate manifest {}: {e}",
+                    manifest_path.display()
+                ),
+                None,
+            )
+        })?;
+        let manifest_blake3 = blake3::hash(&manifest_bytes).to_hex().to_string();
+        let manifest = match serde_json::from_slice::<serde_json::Value>(&manifest_bytes) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        if manifest
+            .get("manifest_kind")
+            .and_then(serde_json::Value::as_str)
+            != Some("cass_doctor_reconstruct_candidate_v1")
+            || manifest
+                .get("lifecycle_status")
+                .and_then(serde_json::Value::as_str)
+                != Some("in_progress")
+        {
+            continue;
+        }
+
+        let mut extra_entry_count = 0usize;
+        let mut has_symlink = false;
+        let mut stack = vec![candidate_dir.clone()];
+        while let Some(dir) = stack.pop() {
+            let children = std::fs::read_dir(&dir).map_err(|e| {
+                io_error(
+                    format!("enumerating candidate {}: {e}", dir.display()),
+                    None,
+                )
+            })?;
+            for child in children {
+                let child = child
+                    .map_err(|e| io_error(format!("enumerating candidate entry: {e}"), None))?;
+                let child_path = child.path();
+                if child_path == manifest_path {
+                    continue;
+                }
+                let meta = std::fs::symlink_metadata(&child_path).map_err(|e| {
+                    io_error(
+                        format!("reading candidate entry {}: {e}", child_path.display()),
+                        None,
+                    )
+                })?;
+                if meta.file_type().is_symlink() {
+                    extra_entry_count += 1;
+                    has_symlink = true;
+                } else if meta.file_type().is_dir() {
+                    stack.push(child_path);
+                } else {
+                    // Empty directory scaffolding is harmless and common for
+                    // interrupted jobs. Any regular file is evidence, even a
+                    // zero-byte placeholder, so it remains blocked.
+                    extra_entry_count += 1;
+                }
+            }
+        }
+
+        let artifact_count = manifest
+            .get("artifact_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(1);
+        let (eligible, reason) = if !manifest_meta.file_type().is_file() {
+            (false, "manifest_is_not_regular_file".to_string())
+        } else if artifact_count != 0 {
+            (false, "manifest_reports_artifacts".to_string())
+        } else if has_symlink {
+            (false, "candidate_contains_symlink".to_string())
+        } else if extra_entry_count != 0 {
+            (
+                false,
+                "candidate_contains_resume_or_artifact_evidence".to_string(),
+            )
+        } else {
+            (true, "manifest_only_candidate".to_string())
+        };
+        inspections.push(InterruptedCandidateInspection {
+            candidate_id,
+            source: candidate_dir,
+            manifest_blake3,
+            eligible,
+            reason,
+            extra_entry_count,
+        });
+    }
+    inspections.sort_by(|left, right| left.candidate_id.cmp(&right.candidate_id));
+    Ok(inspections)
+}
+
+fn interrupted_candidate_cleanup_fingerprint(
+    inspections: &[InterruptedCandidateInspection],
+) -> String {
+    let records: Vec<_> = inspections
+        .iter()
+        .filter(|inspection| inspection.eligible)
+        .map(|inspection| {
+            serde_json::json!({
+                "candidate_id": inspection.candidate_id,
+                "manifest_blake3": inspection.manifest_blake3,
+                "extra_entry_count": inspection.extra_entry_count,
+            })
+        })
+        .collect();
+    let encoded = serde_json::to_vec(&serde_json::json!({
+        "policy_version": 1,
+        "candidates": records,
+    }))
+    .expect("serialize interrupted candidate cleanup fingerprint");
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"cass-doctor-interrupted-candidate-cleanup-v1");
+    hasher.update(&[0]);
+    hasher.update(&encoded);
+    format!(
+        "cleanup-interrupted-candidates-{}",
+        hasher.finalize().to_hex()
+    )
+}
+
+fn interrupted_candidate_cleanup_envelope(
+    data_dir: &Path,
+    inspections: &[InterruptedCandidateInspection],
+    status: &str,
+    quarantined: &[String],
+) -> serde_json::Value {
+    let eligible_count = inspections.iter().filter(|item| item.eligible).count();
+    let blocked_count = inspections.iter().filter(|item| !item.eligible).count();
+    let candidates: Vec<_> = inspections
+        .iter()
+        .map(|item| {
+            serde_json::json!({
+                "candidate_id": item.candidate_id,
+                "path": item.source.display().to_string(),
+                "eligible": item.eligible,
+                "reason": item.reason,
+                "extra_entry_count": item.extra_entry_count,
+                "manifest_blake3": item.manifest_blake3,
+            })
+        })
+        .collect();
+    let fingerprint = interrupted_candidate_cleanup_fingerprint(inspections);
+    serde_json::json!({
+        "schema_version": 1,
+        "doctor_contract_version": 1,
+        "kind": "cleanup_interrupted_candidates",
+        "status": status,
+        "data_dir": data_dir.display().to_string(),
+        "candidates_root": data_dir.join("doctor").join("candidates").display().to_string(),
+        "quarantine_root": data_dir.join("doctor").join("quarantine").join("interrupted-candidates").display().to_string(),
+        "eligible_count": eligible_count,
+        "blocked_count": blocked_count,
+        "candidates": candidates,
+        "approval_fingerprint": fingerprint,
+        "would_mutate": eligible_count > 0 && status != "applied",
+        "quarantined_count": quarantined.len(),
+        "quarantined": quarantined,
+        "note": "Only manifest-only interrupted candidates are eligible. Eligible candidates are atomically renamed into quarantine; nothing is deleted.",
+    })
+}
+
+fn write_candidate_cleanup_receipt(
+    quarantine_root: &Path,
+    envelope: &serde_json::Value,
+) -> std::result::Result<PathBuf, CliError> {
+    let receipt_path = quarantine_root.join(format!("cleanup-receipt-{}.json", now_unix_ms()));
+    let temp_path = receipt_path.with_extension("json.tmp");
+    let encoded = serde_json::to_vec_pretty(envelope).map_err(|e| CliError {
+        code: 9,
+        kind: "internal",
+        message: format!("serialize candidate cleanup receipt: {e}"),
+        hint: None,
+        retryable: false,
+    })?;
+    std::fs::write(&temp_path, encoded).map_err(|e| {
+        io_error(
+            format!(
+                "write candidate cleanup receipt {}: {e}",
+                temp_path.display()
+            ),
+            None,
+        )
+    })?;
+    std::fs::rename(&temp_path, &receipt_path).map_err(|e| {
+        io_error(
+            format!(
+                "commit candidate cleanup receipt {}: {e}",
+                receipt_path.display()
+            ),
+            None,
+        )
+    })?;
+    Ok(receipt_path)
+}
+
+/// Inspect and safely quarantine manifest-only interrupted reconstruct
+/// candidates. This is deliberately separate from generic doctor cleanup:
+/// completed candidates remain available for promotion, while candidates with
+/// any resume/artifact evidence remain blocked for manual inspection.
+pub fn run_doctor_cleanup_interrupted_candidates(
+    data_dir_override: Option<PathBuf>,
+    dry_run: bool,
+    yes: bool,
+    plan_fingerprint: Option<String>,
+    structured_format: Option<RobotFormat>,
+) -> CliResult<()> {
+    let data_dir = data_dir_override.unwrap_or_else(default_data_dir);
+    let inspections = collect_interrupted_candidate_inspections(&data_dir)?;
+    let eligible_count = inspections.iter().filter(|item| item.eligible).count();
+    let fingerprint = interrupted_candidate_cleanup_fingerprint(&inspections);
+
+    if eligible_count == 0 {
+        let envelope = interrupted_candidate_cleanup_envelope(&data_dir, &inspections, "noop", &[]);
+        if structured_format.is_some() {
+            print_json(&envelope)?;
+        } else {
+            println!("No empty interrupted reconstruct candidates require quarantine.");
+        }
+        return Ok(());
+    }
+
+    if dry_run || !yes {
+        if !dry_run && !yes {
+            return Err(CliError {
+                code: 4,
+                kind: "refused-unsafe",
+                message: format!(
+                    "found {eligible_count} empty interrupted reconstruct candidate(s); cleanup requires --yes"
+                ),
+                hint: Some(format!(
+                    "Review the dry-run fingerprint {fingerprint}, then re-run with --yes --plan-fingerprint {fingerprint}."
+                )),
+                retryable: false,
+            });
+        }
+        let envelope =
+            interrupted_candidate_cleanup_envelope(&data_dir, &inspections, "dry_run", &[]);
+        if structured_format.is_some() {
+            print_json(&envelope)?;
+        } else {
+            println!(
+                "{} empty interrupted reconstruct candidate(s) are eligible for quarantine.",
+                eligible_count
+            );
+            println!("Approval fingerprint: {fingerprint}");
+        }
+        return Ok(());
+    }
+
+    if plan_fingerprint.as_deref() != Some(fingerprint.as_str()) {
+        return Err(CliError {
+            code: 4,
+            kind: "refused-unsafe",
+            message: "candidate cleanup plan fingerprint did not match the current candidate set"
+                .to_string(),
+            hint: Some(format!(
+                "Re-run the dry-run and apply its exact fingerprint: {fingerprint}"
+            )),
+            retryable: false,
+        });
+    }
+
+    let db_path = data_dir.join("agent_search.db");
+    let _lock_guard =
+        crate::doctor_acquire_mutation_lock(&data_dir, &db_path).map_err(|observation| {
+            CliError {
+                code: 4,
+                kind: "refused-unsafe",
+                message: format!("could not acquire doctor mutation lock: {observation:?}"),
+                hint: Some(
+                    "Wait for the active doctor/index operation to finish and retry.".to_string(),
+                ),
+                retryable: true,
+            }
+        })?;
+
+    // Re-read after acquiring the lock. The fingerprint is an optimistic
+    // concurrency guard: no candidate may be moved if the operator's preview
+    // is stale.
+    let current = collect_interrupted_candidate_inspections(&data_dir)?;
+    let current_fingerprint = interrupted_candidate_cleanup_fingerprint(&current);
+    if current_fingerprint != fingerprint {
+        return Err(CliError {
+            code: 4,
+            kind: "refused-unsafe",
+            message: "candidate cleanup state changed after the plan was inspected".to_string(),
+            hint: Some(format!(
+                "Re-run the dry-run and apply its new fingerprint: {current_fingerprint}"
+            )),
+            retryable: true,
+        });
+    }
+
+    let quarantine_root = data_dir
+        .join("doctor")
+        .join("quarantine")
+        .join("interrupted-candidates");
+    std::fs::create_dir_all(&quarantine_root).map_err(|e| {
+        io_error(
+            format!(
+                "creating candidate quarantine {}: {e}",
+                quarantine_root.display()
+            ),
+            None,
+        )
+    })?;
+    // Preflight every destination before moving anything. This prevents a
+    // collision on a later candidate from leaving an earlier candidate moved.
+    for item in current.iter().filter(|item| item.eligible) {
+        let destination = quarantine_root.join(&item.candidate_id);
+        if destination.exists() {
+            return Err(CliError {
+                code: 4,
+                kind: "refused-unsafe",
+                message: format!(
+                    "candidate quarantine destination already exists: {}",
+                    destination.display()
+                ),
+                hint: Some("Inspect the existing quarantine entry before retrying.".to_string()),
+                retryable: false,
+            });
+        }
+    }
+    let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for item in current.iter().filter(|item| item.eligible) {
+        let destination = quarantine_root.join(&item.candidate_id);
+        if let Err(error) = std::fs::rename(&item.source, &destination) {
+            for (source, previous_destination) in moved.iter().rev() {
+                let _ = std::fs::rename(previous_destination, source);
+            }
+            return Err(io_error(
+                format!("quarantining candidate {}: {error}", item.source.display()),
+                Some(
+                    "No candidate is deleted; inspect the partial move and retry after resolving the filesystem error.",
+                ),
+            ));
+        }
+        moved.push((item.source.clone(), destination));
+    }
+
+    let quarantined: Vec<String> = moved
+        .iter()
+        .map(|(_, dst)| dst.display().to_string())
+        .collect();
+    let mut envelope =
+        interrupted_candidate_cleanup_envelope(&data_dir, &current, "applied", &quarantined);
+    if let Ok(object) = envelope.as_object_mut().ok_or(()) {
+        object.insert(
+            "plan_fingerprint".to_string(),
+            serde_json::Value::String(fingerprint),
+        );
+    }
+    let receipt_path = match write_candidate_cleanup_receipt(&quarantine_root, &envelope) {
+        Ok(path) => path,
+        Err(error) => {
+            for (source, destination) in moved.iter().rev() {
+                let _ = std::fs::rename(destination, source);
+            }
+            return Err(error);
+        }
+    };
+    if let Some(object) = envelope.as_object_mut() {
+        object.insert(
+            "receipt_path".to_string(),
+            serde_json::Value::String(receipt_path.display().to_string()),
+        );
+    }
+    if structured_format.is_some() {
+        print_json(&envelope)?;
+    } else {
+        println!(
+            "Quarantined {} empty interrupted reconstruct candidate(s).",
+            moved.len()
+        );
+        println!("Receipt: {}", receipt_path.display());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
