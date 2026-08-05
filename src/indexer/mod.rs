@@ -2787,7 +2787,7 @@ fn try_readonly_canonical_force_rebuild(
         "selected_lexical_population_strategy"
     );
 
-    ensure_authoritative_lexical_rebuild_storage_headroom(&opts.data_dir, &opts.db_path)?;
+    ensure_readonly_canonical_lexical_rebuild_storage_headroom(&opts.data_dir, &opts.db_path)?;
     let rebuild_start = Instant::now();
     let rebuild = rebuild_tantivy_from_db_deferred_startup_with_progress_bump(
         &opts.db_path,
@@ -17069,6 +17069,7 @@ const INDEX_MIN_FREE_SPACE_BYTES: u64 = 512 * 1024 * 1024;
 enum IndexStorageHeadroomRequirement {
     IncrementalStartup,
     AuthoritativeLexicalRebuild,
+    ReadOnlyCanonicalLexicalRebuild,
 }
 
 fn index_startup_storage_headroom_requirement(
@@ -17098,6 +17099,17 @@ fn ensure_authoritative_lexical_rebuild_storage_headroom(
         data_dir,
         db_path,
         IndexStorageHeadroomRequirement::AuthoritativeLexicalRebuild,
+    )
+}
+
+fn ensure_readonly_canonical_lexical_rebuild_storage_headroom(
+    data_dir: &Path,
+    db_path: &Path,
+) -> Result<()> {
+    ensure_index_storage_headroom(
+        data_dir,
+        db_path,
+        IndexStorageHeadroomRequirement::ReadOnlyCanonicalLexicalRebuild,
     )
 }
 
@@ -17224,6 +17236,15 @@ fn required_index_headroom_bytes(
                 .saturating_mul(2)
                 .saturating_add(lexical_bytes.saturating_mul(2));
             INDEX_MIN_FREE_SPACE_BYTES.max(projected)
+        }
+        IndexStorageHeadroomRequirement::ReadOnlyCanonicalLexicalRebuild => {
+            // The populated `--force-rebuild` fast path opens the canonical
+            // archive read-only and stages only a replacement Tantivy index.
+            // It cannot create a writable SQLite clone, WAL, or checkpoint,
+            // so demanding two copies of the archive here needlessly blocks
+            // recovery on large but otherwise healthy archives.
+            let lexical_bytes = lexical_index_size_bytes(data_dir);
+            INDEX_MIN_FREE_SPACE_BYTES.max(lexical_bytes.saturating_mul(2))
         }
     }
 }
@@ -42059,6 +42080,41 @@ mod tests {
         // db(300 MiB)*2 = 600 MiB already clears the 512 MiB floor, so the whole
         // delta is attributable to the lexical index being counted twice.
         assert_eq!(with_index - without_index, 2 * 200 * 1024 * 1024);
+    }
+
+    #[test]
+    fn readonly_canonical_rebuild_headroom_excludes_archive_clone() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let db_path = data_dir.join("agent_search.db");
+        std::fs::File::create(&db_path)
+            .unwrap()
+            .set_len(300 * 1024 * 1024)
+            .unwrap();
+        let index_dir = data_dir.join(LEXICAL_INDEX_ROOT_DIR).join("seg");
+        std::fs::create_dir_all(&index_dir).unwrap();
+        std::fs::File::create(index_dir.join("0.store"))
+            .unwrap()
+            .set_len(200 * 1024 * 1024)
+            .unwrap();
+
+        let readonly = required_index_headroom_bytes(
+            &data_dir,
+            &db_path,
+            IndexStorageHeadroomRequirement::ReadOnlyCanonicalLexicalRebuild,
+        );
+        let expected = INDEX_MIN_FREE_SPACE_BYTES.max(2 * 200 * 1024 * 1024);
+
+        assert_eq!(readonly, expected);
+        assert!(
+            readonly
+                < required_index_headroom_bytes(
+                    &data_dir,
+                    &db_path,
+                    IndexStorageHeadroomRequirement::AuthoritativeLexicalRebuild,
+                ),
+            "read-only canonical rebuild must not reserve writable archive-clone space"
+        );
     }
 
     #[test]
