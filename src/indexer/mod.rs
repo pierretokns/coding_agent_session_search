@@ -9257,16 +9257,38 @@ fn lexical_rebuild_content_fingerprint(
 }
 
 fn lexical_rebuild_storage_fingerprint(db_path: &Path) -> Result<String> {
-    let mut storage = FrankenStorage::open_readonly(db_path).with_context(|| {
+    // Fingerprinting is a read-only metadata operation. Opening the promoted
+    // archive through FrankenSQLite here forced its eager pager/schema path
+    // before semantic indexing could even start; on the 60 GB archive that
+    // looked like a semantic wedge. Native SQLite answers the three scalar
+    // queries without materializing the archive and matches the fingerprint
+    // contract used by the lexical checkpoint.
+    let conn = rusqlite::Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| {
         format!(
-            "opening readonly storage to compute lexical fingerprint for {}",
+            "opening native SQLite readonly connection to compute lexical fingerprint for {}",
             db_path.display()
         )
     })?;
-    let total_conversations = count_total_conversations_exact(&storage)?;
-    let fingerprint = lexical_rebuild_content_fingerprint(&storage, total_conversations)?;
-    storage.close_best_effort_in_place();
-    Ok(fingerprint)
+    conn.busy_timeout(Duration::from_secs(30))?;
+    conn.execute_batch("PRAGMA query_only = 1;")?;
+    let total_conversations: i64 = conn
+        .query_row("SELECT COUNT(*) FROM conversations", [], |row| row.get(0))
+        .context("counting conversations for lexical fingerprint")?;
+    let max_conversation_id: i64 = conn
+        .query_row("SELECT COALESCE(MAX(id), 0) FROM conversations", [], |row| row.get(0))
+        .context("computing lexical rebuild conversation fingerprint")?;
+    let max_message_id: i64 = conn
+        .query_row("SELECT COALESCE(MAX(id), 0) FROM messages", [], |row| row.get(0))
+        .context("computing lexical rebuild message fingerprint")?;
+    Ok(lexical_rebuild_content_fingerprint_value(
+        usize::try_from(total_conversations.max(0)).unwrap_or(usize::MAX),
+        max_conversation_id,
+        max_message_id,
+    ))
 }
 
 fn count_total_conversations_exact(storage: &FrankenStorage) -> Result<usize> {
@@ -13638,6 +13660,174 @@ fn explicit_scan_root_since_ts(
     }
 }
 
+fn run_semantic_native_only(
+    opts: &IndexOptions,
+    index_run_lock: &mut IndexRunLockGuard,
+    progress_bump: &Arc<AtomicI64>,
+) -> Result<()> {
+    // A semantic-only rebuild must not open the canonical archive through
+    // FrankenSQLite before native replay starts. That eager open was the
+    // multi-minute, multi-gigabyte wedge observed on the promoted archive.
+    prepare_progress_for_semantic_build(opts.progress.as_ref());
+    let mut set_semantic_phase = |phase: &'static str| {
+        if let Err(err) = index_run_lock.set_phase(SearchMaintenanceMode::Index, phase) {
+            tracing::debug!(
+                sub_phase = phase,
+                error = %err,
+                "semantic-only phase breadcrumb write failed (continuing)"
+            );
+        }
+    };
+    set_semantic_phase("semantic:initialize");
+    set_semantic_progress_phase(
+        opts.progress.as_ref(),
+        progress_bump,
+        INDEX_PHASE_SEMANTIC_INITIALIZE,
+        0,
+        0,
+    );
+
+    let semantic_indexer = SemanticIndexer::new(&opts.embedder, Some(&opts.data_dir))?;
+    let semantic_tier = semantic_tier_for_embedder_id(semantic_indexer.embedder_id())
+        .ok_or_else(|| anyhow::anyhow!("embedder {} has no resumable semantic tier", semantic_indexer.embedder_id()))?;
+    let db_fingerprint = lexical_storage_fingerprint_for_db(&opts.db_path)?;
+    let mut semantic_manifest = SemanticManifest::load_or_default(&opts.data_dir)
+        .map_err(|err| anyhow::anyhow!("loading semantic manifest: {err}"))?;
+    let semantic_progress_sink = crate::indexer::semantic_progress::SemanticProgressSink::open(
+        semantic_tier.as_str(),
+        semantic_indexer.embedder_id(),
+    );
+    let batch_conversations = semantic_first_build_batch_conversations();
+
+    set_semantic_phase("semantic:replay");
+    set_semantic_progress_phase(
+        opts.progress.as_ref(),
+        progress_bump,
+        INDEX_PHASE_SEMANTIC_REPLAY,
+        0,
+        0,
+    );
+    tracing::info!(embedder = %opts.embedder, "starting native semantic indexing");
+
+    let published_index_path = loop {
+        set_semantic_phase("semantic:embedding");
+        let outcome = semantic_indexer.run_capped_backfill_from_native_with_sink(
+            &opts.db_path,
+            &opts.data_dir,
+            &mut semantic_manifest,
+            SemanticBackfillStoragePlan {
+                tier: semantic_tier,
+                db_fingerprint: db_fingerprint.clone(),
+                model_revision: semantic_model_revision_for_embedder_id(
+                    semantic_indexer.embedder_id(),
+                ),
+                max_conversations: batch_conversations,
+            },
+            &semantic_progress_sink,
+        )?;
+        let processed = usize::try_from(outcome.conversations_processed).unwrap_or(usize::MAX);
+        let total = usize::try_from(outcome.total_conversations).unwrap_or(usize::MAX);
+        update_semantic_progress(opts.progress.as_ref(), progress_bump, processed, total);
+        tracing::info!(
+            tier = semantic_tier.as_str(),
+            embedder = semantic_indexer.embedder_id(),
+            embedded_docs = outcome.embedded_docs,
+            conversations_processed = outcome.conversations_processed,
+            total_conversations = outcome.total_conversations,
+            checkpoint_saved = outcome.checkpoint_saved,
+            published = outcome.published,
+            "completed native semantic build batch"
+        );
+        if outcome.published {
+            break outcome.index_path;
+        }
+        if !outcome.checkpoint_saved {
+            anyhow::bail!(
+                "native semantic backfill made no progress; inspect {}",
+                outcome.manifest_path.display()
+            );
+        }
+    };
+
+    let vector_index = FsVectorIndex::open(&published_index_path).with_context(|| {
+        format!(
+            "opening published semantic index {}",
+            published_index_path.display()
+        )
+    })?;
+    let embedded_doc_count = vector_index.record_count();
+    if opts.build_hnsw && embedded_doc_count > 0 {
+        set_semantic_phase("semantic:hnsw");
+        set_semantic_progress_phase(
+            opts.progress.as_ref(),
+            progress_bump,
+            INDEX_PHASE_SEMANTIC_HNSW,
+            0,
+            embedded_doc_count,
+        );
+        let hnsw_path = semantic_indexer.build_hnsw_index(
+            &vector_index,
+            &opts.data_dir,
+            None,
+            None,
+        )?;
+        update_semantic_progress(
+            opts.progress.as_ref(),
+            progress_bump,
+            embedded_doc_count,
+            embedded_doc_count,
+        );
+        let size_bytes = fs::metadata(&hnsw_path)
+            .with_context(|| format!("stat semantic HNSW index {}", hnsw_path.display()))?
+            .len();
+        let relative_hnsw_path = hnsw_path
+            .strip_prefix(&opts.data_dir)
+            .unwrap_or(hnsw_path.as_path())
+            .to_string_lossy()
+            .to_string();
+        semantic_manifest.publish_hnsw(HnswRecord {
+            base_tier: semantic_tier,
+            embedder_id: semantic_indexer.embedder_id().to_string(),
+            ef_search: FS_HNSW_DEFAULT_EF_SEARCH,
+            index_path: relative_hnsw_path,
+            size_bytes,
+            built_at_ms: semantic_indexing_now_ms(),
+            ready: true,
+        });
+        semantic_manifest
+            .save(&opts.data_dir)
+            .map_err(|err| anyhow::anyhow!("saving semantic HNSW manifest after build: {err}"))?;
+    }
+
+    // Keep watch-mode catch-up correct without reopening FrankenSQLite just to
+    // write one scalar watermark. This is the same metadata row used by the
+    // existing writer path and is an atomic SQLite transaction.
+    set_semantic_phase("semantic:finalize");
+    set_semantic_progress_phase(
+        opts.progress.as_ref(),
+        progress_bump,
+        INDEX_PHASE_SEMANTIC_FINALIZE,
+        0,
+        1,
+    );
+    let conn = rusqlite::Connection::open(&opts.db_path).with_context(|| {
+        format!(
+            "opening native semantic watermark connection at {}",
+            opts.db_path.display()
+        )
+    })?;
+    conn.busy_timeout(Duration::from_secs(30))?;
+    let max_message_id: i64 = conn
+        .query_row("SELECT COALESCE(MAX(id), 0) FROM messages", [], |row| row.get(0))
+        .context("reading semantic indexing watermark")?;
+    conn.execute(
+        "INSERT OR REPLACE INTO meta(key, value) VALUES('last_embedded_message_id', ?1)",
+        rusqlite::params![max_message_id],
+    )?;
+    update_semantic_progress(opts.progress.as_ref(), progress_bump, 1, 1);
+    Ok(())
+}
+
 pub fn run_index(
     opts: IndexOptions,
     event_channel: Option<(Sender<IndexerEvent>, Receiver<IndexerEvent>)>,
@@ -13874,6 +14064,21 @@ pub fn run_index(
         }
     }
     if try_readonly_canonical_force_rebuild(&opts, &progress_bump)? {
+        return Ok(());
+    }
+
+    // Semantic-only CLI runs do not need the normal lexical/watch preflight
+    // or a FrankenSQLite storage handle. Enter the native resumable semantic
+    // path before that eager archive open; watch and targeted watch-once runs
+    // retain the existing combined pipeline because they may ingest first.
+    if (opts.semantic || opts.build_hnsw)
+        && !opts.watch
+        && opts
+            .watch_once_paths
+            .as_ref()
+            .is_none_or(|paths| paths.is_empty())
+    {
+        run_semantic_native_only(&opts, &mut index_run_lock, &progress_bump)?;
         return Ok(());
     }
 
@@ -15169,22 +15374,14 @@ pub fn run_index(
                 0,
                 0,
             );
-            let mut semantic_read_storage = FrankenStorage::open_readonly(&opts.db_path)
-                .with_context(|| {
-                    format!(
-                        "opening fresh readonly canonical storage for semantic indexing: {}",
-                        opts.db_path.display()
-                    )
-                })?;
-
             // Keep the first build bounded and durable. Each call appends to
             // the staged FSVI, then atomically saves a manifest checkpoint.
             // A restart resumes from the conversation/message cursor instead
             // of replaying the entire archive or retaining the corpus in RAM.
             let published_index_path = loop {
                 set_semantic_phase("semantic:embedding");
-                let outcome = semantic_indexer.run_capped_backfill_from_storage_with_sink(
-                    &semantic_read_storage,
+                let outcome = semantic_indexer.run_capped_backfill_from_native_with_sink(
+                    &opts.db_path,
                     &opts.data_dir,
                     &mut semantic_manifest,
                     SemanticBackfillStoragePlan {
@@ -15221,7 +15418,6 @@ pub fn run_index(
                     );
                 }
             };
-            semantic_read_storage.close_best_effort_in_place();
 
             let index_path = published_index_path;
             let vector_index = FsVectorIndex::open(&index_path).with_context(|| {

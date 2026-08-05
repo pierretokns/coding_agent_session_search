@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use frankensearch::index::{
@@ -17,6 +17,9 @@ use frankensqlite::{
 };
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use rayon::prelude::*;
+use rusqlite::{
+    Connection as NativeSqliteConnection, OpenFlags as NativeOpenFlags, OptionalExtension, params,
+};
 
 use crate::indexer::memoization::{
     ContentAddressedMemoCache, MemoCacheAuditRecord, MemoContentHash, MemoKey, MemoLookup,
@@ -941,7 +944,8 @@ fn fetch_bounded_semantic_candidate_conversation_ids(
             .query_with_params_for_each(
                 "SELECT conversation_id
                  FROM messages
-                 WHERE id > ?1 AND conversation_id > ?2
+                 WHERE id > ?1
+                   AND (conversation_id > ?2 OR conversation_id = ?2)
                  GROUP BY conversation_id
                  ORDER BY conversation_id ASC
                  LIMIT ?3",
@@ -1490,6 +1494,391 @@ struct CheckpointCappedSelection {
     grouped_messages: HashMap<i64, Vec<Message>>,
     last_conversation_id: Option<i64>,
     stopped_before_candidate: bool,
+}
+
+/// Lightweight native reader used by the first semantic rebuild.
+///
+/// FrankenSQLite's read-only open path eagerly walks this archive's pager and
+/// can spend many minutes at 100% CPU before the first semantic checkpoint.
+/// The semantic replay is observational and does not need FrankenSQLite's
+/// writer or compatibility layer, so keep it on SQLite's mature native reader
+/// just as the lexical rebuild does. The packet conversion below remains the
+/// shared canonical path, preserving semantic document identity and filtering.
+struct NativeSemanticReader {
+    conn: NativeSqliteConnection,
+}
+
+impl NativeSemanticReader {
+    fn open(path: &Path) -> Result<Self> {
+        let conn = NativeSqliteConnection::open_with_flags(
+            path,
+            NativeOpenFlags::SQLITE_OPEN_READ_ONLY | NativeOpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .with_context(|| format!("opening native semantic reader at {}", path.display()))?;
+        conn.busy_timeout(Duration::from_secs(30))
+            .context("setting native semantic reader busy timeout")?;
+        conn.execute_batch("PRAGMA query_only = 1;")
+            .context("setting native semantic reader query_only")?;
+        Ok(Self { conn })
+    }
+
+    fn total_conversations(&self) -> Result<u64> {
+        let count: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM conversations c
+                 WHERE EXISTS (
+                     SELECT 1 FROM messages m WHERE m.conversation_id = c.id
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .context("counting native semantic conversations")?;
+        Ok(u64::try_from(count.max(0)).unwrap_or(u64::MAX))
+    }
+
+    fn candidate_ids(
+        &self,
+        after_conversation_id: i64,
+        after_message_id: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<i64>> {
+        let limit = i64::try_from(limit.max(1)).unwrap_or(i64::MAX);
+        let mut selected = Vec::new();
+        if let Some(after_message_id) = after_message_id {
+            let mut statement = self.conn.prepare(
+                "SELECT conversation_id
+                 FROM messages
+                 WHERE id > ?1 AND conversation_id > ?2
+                 GROUP BY conversation_id
+                 ORDER BY conversation_id ASC
+                 LIMIT ?3",
+            )?;
+            let rows = statement.query_map(
+                params![after_message_id, after_conversation_id, limit],
+                |row| row.get(0),
+            )?;
+            for row in rows {
+                selected.push(row.context("reading native semantic candidate conversation")?);
+            }
+        } else {
+            let mut statement = self.conn.prepare(
+                "SELECT c.id
+                 FROM conversations c
+                 WHERE c.id > ?1
+                   AND EXISTS (
+                       SELECT 1 FROM messages m WHERE m.conversation_id = c.id
+                   )
+                 ORDER BY c.id ASC
+                 LIMIT ?2",
+            )?;
+            let rows = statement.query_map(params![after_conversation_id, limit], |row| {
+                row.get(0)
+            })?;
+            for row in rows {
+                selected.push(row.context("reading native semantic candidate conversation")?);
+            }
+        }
+        Ok(selected)
+    }
+
+    fn fetch_conversations(
+        &self,
+        conversation_ids: &[i64],
+    ) -> Result<Vec<CanonicalEmbeddingConversationRow>> {
+        if conversation_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = std::iter::repeat_n("?", conversation_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT c.id,
+                    COALESCE(a.slug, 'unknown'),
+                    COALESCE(c.agent_id, 0),
+                    c.workspace_id,
+                    w.path,
+                    c.external_id,
+                    c.title,
+                    c.source_path,
+                    c.started_at,
+                    c.ended_at,
+                    c.source_id,
+                    c.origin_host
+             FROM conversations c
+             LEFT JOIN agents a ON a.id = c.agent_id
+             LEFT JOIN workspaces w ON w.id = c.workspace_id
+             WHERE c.id IN ({placeholders})
+             ORDER BY c.id ASC"
+        );
+        let mut statement = self.conn.prepare(&sql)?;
+        let mut rows = statement.query(rusqlite::params_from_iter(conversation_ids.iter()))?;
+        let mut conversations = Vec::with_capacity(conversation_ids.len());
+        while let Some(row) = rows.next()? {
+            let source_path: String = row.get(7)?;
+            conversations.push(CanonicalEmbeddingConversationRow {
+                conversation_id: row.get(0)?,
+                agent_slug: row.get(1)?,
+                agent_id: row.get(2)?,
+                workspace_id: row.get(3)?,
+                workspace: row.get::<_, Option<String>>(4)?.map(PathBuf::from),
+                external_id: row.get(5)?,
+                title: row.get(6)?,
+                source_path: PathBuf::from(source_path),
+                started_at: row.get(8)?,
+                ended_at: row.get(9)?,
+                source_id: row.get(10)?,
+                origin_host: row.get(11)?,
+            });
+        }
+        Ok(conversations)
+    }
+
+    fn fetch_messages(
+        &self,
+        conversation_id: i64,
+        after_message_id: Option<i64>,
+        max_raw_message_bytes: usize,
+        max_messages: usize,
+        max_bytes: u64,
+    ) -> Result<(Vec<Message>, bool)> {
+        if max_raw_message_bytes > 0 {
+            let limit = i64::try_from(max_raw_message_bytes).unwrap_or(i64::MAX);
+            let oversized: Option<(i64, i64)> = if let Some(after_message_id) = after_message_id {
+                self.conn
+                    .query_row(
+                        "SELECT id, LENGTH(CAST(content AS BLOB))
+                         FROM messages
+                         WHERE conversation_id = ?1 AND id > ?2
+                           AND LENGTH(CAST(content AS BLOB)) > ?3
+                         ORDER BY idx LIMIT 1",
+                        params![conversation_id, after_message_id, limit],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()?
+            } else {
+                self.conn
+                    .query_row(
+                        "SELECT id, LENGTH(CAST(content AS BLOB))
+                         FROM messages
+                         WHERE conversation_id = ?1
+                           AND LENGTH(CAST(content AS BLOB)) > ?2
+                         ORDER BY idx LIMIT 1",
+                        params![conversation_id, limit],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()?
+            };
+            if let Some((message_id, byte_len)) = oversized {
+                bail!(
+                    "semantic backfill raw-message guardrail rejected conversation {conversation_id} message {message_id}: bytes={byte_len} limit={max_raw_message_bytes}"
+                );
+            }
+        }
+
+        let mut statement = self.conn.prepare(
+            if after_message_id.is_some() {
+                "SELECT id, idx, role, author, created_at, content
+                 FROM messages
+                 WHERE conversation_id = ?1 AND id > ?2 ORDER BY idx"
+            } else {
+                "SELECT id, idx, role, author, created_at, content
+                 FROM messages
+                 WHERE conversation_id = ?1 ORDER BY idx"
+            },
+        )?;
+        let mut rows = if let Some(after_message_id) = after_message_id {
+            statement.query(params![conversation_id, after_message_id])?
+        } else {
+            statement.query(params![conversation_id])?
+        };
+        let mut messages = Vec::new();
+        let mut selected_bytes = 0u64;
+        let mut capped = false;
+        while let Some(row) = rows.next()? {
+            if max_messages > 0 && messages.len() >= max_messages {
+                capped = true;
+                break;
+            }
+            let message = native_message_from_row(row)
+                .context("reading native semantic message")?;
+            let message_bytes = saturating_u64_from_usize(message.content.len());
+            if max_bytes > 0
+                && !messages.is_empty()
+                && selected_bytes.saturating_add(message_bytes) > max_bytes
+            {
+                capped = true;
+                break;
+            }
+            selected_bytes = selected_bytes.saturating_add(message_bytes);
+            messages.push(message);
+        }
+        Ok((messages, capped))
+    }
+
+    fn fetch_batch(
+        &self,
+        after_conversation_id: i64,
+        after_message_id: Option<i64>,
+        max_conversations: usize,
+        total_conversations: u64,
+        caps: SemanticCheckpointCaps,
+    ) -> Result<CanonicalEmbeddingBatch> {
+        let candidate_ids = self.candidate_ids(
+            after_conversation_id,
+            after_message_id,
+            max_conversations.saturating_add(1),
+        )?;
+        let has_more = candidate_ids.len() > max_conversations;
+        let conversation_ids = candidate_ids
+            .into_iter()
+            .take(max_conversations)
+            .collect::<Vec<_>>();
+        if conversation_ids.is_empty() {
+            return Ok(CanonicalEmbeddingBatch {
+                inputs: Vec::new(),
+                conversations_in_batch: 0,
+                last_conversation_id: after_conversation_id,
+                total_conversations,
+                cursor_exhausted: true,
+            });
+        }
+
+        let conversations = self.fetch_conversations(&conversation_ids)?;
+        let mut selected = Vec::new();
+        let mut grouped_messages = HashMap::new();
+        let mut selected_messages = 0usize;
+        let mut selected_bytes = 0u64;
+        let mut last_conversation_id = None;
+        let mut stopped_before_candidate = false;
+        let max_raw_message_bytes = resolved_semantic_max_raw_message_bytes();
+
+        for conversation in conversations {
+            if caps.message_limited() || caps.byte_limited() {
+                let (count, bytes) = self.conversation_bounds(
+                    conversation.conversation_id,
+                    after_message_id,
+                )?;
+                if caps.message_limited() && count > caps.max_messages as u64 {
+                    if !selected.is_empty() {
+                        stopped_before_candidate = true;
+                        break;
+                    }
+                }
+                if caps.byte_limited() && bytes > caps.max_bytes && !selected.is_empty() {
+                    stopped_before_candidate = true;
+                    break;
+                }
+            }
+            let remaining_message_cap = caps
+                .max_messages
+                .checked_sub(selected_messages)
+                .unwrap_or(0);
+            let remaining_byte_cap = caps
+                .max_bytes
+                .checked_sub(selected_bytes)
+                .unwrap_or(0);
+            let (messages, hit_checkpoint_cap) = self.fetch_messages(
+                conversation.conversation_id,
+                after_message_id,
+                max_raw_message_bytes,
+                remaining_message_cap,
+                remaining_byte_cap,
+            )?;
+            if messages.is_empty() {
+                continue;
+            }
+            let message_count = messages.len();
+            let byte_count = messages
+                .iter()
+                .map(|message| saturating_u64_from_usize(message.content.len()))
+                .fold(0u64, u64::saturating_add);
+            let exceeds_messages = caps.message_limited()
+                && !selected.is_empty()
+                && selected_messages.saturating_add(message_count) > caps.max_messages;
+            let exceeds_bytes = caps.byte_limited()
+                && !selected.is_empty()
+                && selected_bytes.saturating_add(byte_count) > caps.max_bytes;
+            if exceeds_messages || exceeds_bytes {
+                stopped_before_candidate = true;
+                break;
+            }
+            selected_messages = selected_messages.saturating_add(message_count);
+            selected_bytes = selected_bytes.saturating_add(byte_count);
+            last_conversation_id = Some(conversation.conversation_id);
+            grouped_messages.insert(conversation.conversation_id, messages);
+            selected.push(conversation);
+            if hit_checkpoint_cap {
+                stopped_before_candidate = true;
+                break;
+            }
+        }
+
+        let (inputs, _) = packet_embedding_inputs_from_materialized_canonical_messages(
+            &selected,
+            &mut grouped_messages,
+            |_| true,
+        );
+        let continuation = after_message_id.is_some_and(|_| {
+            selected
+                .first()
+                .is_some_and(|conversation| conversation.conversation_id == after_conversation_id)
+        });
+        let continuation_count = if continuation { 1 } else { 0 };
+        Ok(CanonicalEmbeddingBatch {
+            inputs,
+            conversations_in_batch: u64::try_from(selected.len().saturating_sub(continuation_count))
+                .unwrap_or(u64::MAX),
+            last_conversation_id: last_conversation_id.unwrap_or(after_conversation_id),
+            total_conversations,
+            cursor_exhausted: !has_more && !stopped_before_candidate,
+        })
+    }
+
+    fn conversation_bounds(
+        &self,
+        conversation_id: i64,
+        after_message_id: Option<i64>,
+    ) -> Result<(u64, u64)> {
+        let (sql, values): (&str, Vec<i64>) = if let Some(after_message_id) = after_message_id {
+            (
+                "SELECT COUNT(*), COALESCE(SUM(LENGTH(CAST(content AS BLOB))), 0)
+                 FROM messages WHERE conversation_id = ?1 AND id > ?2",
+                vec![conversation_id, after_message_id],
+            )
+        } else {
+            (
+                "SELECT COUNT(*), COALESCE(SUM(LENGTH(CAST(content AS BLOB))), 0)
+                 FROM messages WHERE conversation_id = ?1",
+                vec![conversation_id],
+            )
+        };
+        let (count, bytes): (i64, i64) = self.conn.query_row(sql, rusqlite::params_from_iter(values), |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?;
+        Ok((u64::try_from(count.max(0)).unwrap_or(u64::MAX), u64::try_from(bytes.max(0)).unwrap_or(u64::MAX)))
+    }
+}
+
+fn native_message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
+    let role: String = row.get(2)?;
+    Ok(Message {
+        id: Some(row.get(0)?),
+        idx: row.get(1)?,
+        role: match role.as_str() {
+            "user" => crate::model::types::MessageRole::User,
+            "agent" | "assistant" => crate::model::types::MessageRole::Agent,
+            "tool" => crate::model::types::MessageRole::Tool,
+            "system" => crate::model::types::MessageRole::System,
+            other => crate::model::types::MessageRole::Other(other.to_string()),
+        },
+        author: row.get(3)?,
+        created_at: row.get(4)?,
+        content: row.get(5)?,
+        extra_json: serde_json::Value::Null,
+        snippets: Vec::new(),
+    })
 }
 
 fn materialize_checkpoint_capped_conversations(
@@ -3237,6 +3626,92 @@ impl SemanticIndexer {
             SemanticCheckpointCaps::from_env(),
             sink,
         )
+    }
+
+    /// Native-reader counterpart to the FrankenSQLite semantic replay path.
+    /// The writer and manifest publication remain unchanged; only the
+    /// read-only archive scan moves to SQLite's bounded native reader.
+    pub fn run_capped_backfill_from_native_with_sink(
+        &self,
+        db_path: &Path,
+        data_dir: &Path,
+        manifest: &mut SemanticManifest,
+        plan: SemanticBackfillStoragePlan,
+        sink: &SemanticProgressSink,
+    ) -> Result<SemanticBackfillBatchOutcome> {
+        let reader = NativeSemanticReader::open(db_path)?;
+        let caps = SemanticCheckpointCaps::from_env();
+        let prior_checkpoint = manifest.checkpoint.as_ref().filter(|checkpoint| {
+            checkpoint.tier == plan.tier
+                && checkpoint.embedder_id == self.embedder_id()
+                && checkpoint.is_valid(&plan.db_fingerprint)
+        });
+        let mut after_conversation_id = prior_checkpoint.map_or(0, |checkpoint| checkpoint.last_offset);
+        let mut after_message_id = prior_checkpoint.and_then(|checkpoint| checkpoint.last_message_id);
+        let total_conversations = cached_semantic_total_conversations(
+            manifest,
+            plan.tier,
+            self.embedder_id(),
+            &plan.db_fingerprint,
+        )
+        .map_or_else(|| reader.total_conversations(), |(total, _)| Ok(total))?;
+
+        loop {
+            let batch = reader.fetch_batch(
+                after_conversation_id,
+                after_message_id,
+                plan.max_conversations,
+                total_conversations,
+                caps,
+            )?;
+            let batch_last_message_id = batch
+                .inputs
+                .iter()
+                .filter_map(|input| i64::try_from(input.message_id).ok())
+                .max();
+            let next_last_message_id = match (after_message_id, batch_last_message_id) {
+                (Some(prior), Some(current)) => Some(prior.max(current)),
+                (Some(prior), None) => Some(prior),
+                (None, Some(current)) => Some(current),
+                (None, None) => None,
+            };
+            let outcome = self.run_backfill_batch_with_sink(
+                &batch.inputs,
+                data_dir,
+                manifest,
+                SemanticBackfillBatchPlan {
+                    tier: plan.tier,
+                    db_fingerprint: plan.db_fingerprint.clone(),
+                    model_revision: plan.model_revision.clone(),
+                    total_conversations,
+                    conversations_in_batch: batch.conversations_in_batch,
+                    last_offset: batch.last_conversation_id,
+                    cursor_exhausted: batch.cursor_exhausted,
+                },
+                next_last_message_id,
+                sink,
+            )?;
+            if outcome.published {
+                return Ok(outcome);
+            }
+            if !outcome.checkpoint_saved {
+                bail!("native semantic backfill made no progress; inspect {}", outcome.manifest_path.display());
+            }
+            let message_cursor_advanced = next_last_message_id
+                .zip(after_message_id)
+                .is_some_and(|(next, prior)| next > prior)
+                || after_message_id.is_none() && next_last_message_id.is_some();
+            if outcome.last_offset <= after_conversation_id
+                && batch.conversations_in_batch == 0
+                && !message_cursor_advanced
+            {
+                bail!(
+                    "native semantic backfill cursor did not advance beyond conversation {after_conversation_id}"
+                );
+            }
+            after_conversation_id = outcome.last_offset;
+            after_message_id = next_last_message_id;
+        }
     }
 
     fn run_backfill_from_storage_with_caps_and_sink(
