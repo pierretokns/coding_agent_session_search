@@ -52,7 +52,7 @@ const CONTRACTS: &[DependencyContract] = &[
         // that API and its no-create/bounded-open tests; a version-only pin is
         // ambiguous because both sources declare 0.1.19.
         expected_git: "https://github.com/pierretokns/frankensqlite",
-        expected_rev: "9aaee293",
+        expected_rev: "9aaee29377fd16e156b4ce1f1a004ecf82d69cae",
         expected_version: "0.1.19",
         expected_features: &["file-backed-bulk-load", "fts5"],
         expected_default_features: None,
@@ -70,7 +70,7 @@ const CONTRACTS: &[DependencyContract] = &[
         manifest_package_field: Some("fsqlite-types"),
         // Keep shared types on the identical immutable source as the facade.
         expected_git: "https://github.com/pierretokns/frankensqlite",
-        expected_rev: "9aaee293",
+        expected_rev: "9aaee29377fd16e156b4ce1f1a004ecf82d69cae",
         expected_version: "0.1.19",
         expected_features: &[],
         expected_default_features: None,
@@ -88,7 +88,7 @@ const CONTRACTS: &[DependencyContract] = &[
         manifest_package_field: Some("fsqlite-types"),
         // Keep shared types on the identical immutable source as the facade.
         expected_git: "https://github.com/pierretokns/frankensqlite",
-        expected_rev: "9aaee293",
+        expected_rev: "9aaee29377fd16e156b4ce1f1a004ecf82d69cae",
         expected_version: "0.1.19",
         expected_features: &[],
         expected_default_features: None,
@@ -329,7 +329,7 @@ fn validate_fsqlite_registry_source_override(manifest: &Value, packaged_manifest
     }
 
     const EXPECTED_GIT: &str = "https://github.com/pierretokns/frankensqlite";
-    const EXPECTED_REV: &str = "9aaee293";
+    const EXPECTED_REV: &str = "9aaee29377fd16e156b4ce1f1a004ecf82d69cae";
 
     let patch_tables = table(manifest, "patch", "manifest root");
     let crates_io = table_value(Some(patch_tables), "crates-io", "[patch]")
