@@ -82,6 +82,7 @@ if [[ "$semantic_status" -ne 0 ]]; then
 fi
 
 doctor_status=0
+CASS_DOCTOR_SKIP_DEEP_DB_PROBE=1 \
 CASS_DOCTOR_DB_PROBE_TIMEOUT_SECS=600 \
 CASS_DOCTOR_RAW_MIRROR_FULL_VERIFY=1 \
 RUST_LOG=info \

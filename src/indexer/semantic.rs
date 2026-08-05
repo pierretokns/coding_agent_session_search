@@ -1550,7 +1550,7 @@ impl NativeSemanticReader {
             let mut statement = self.conn.prepare(
                 "SELECT conversation_id
                  FROM messages
-                 WHERE id > ?1 AND conversation_id > ?2
+                 WHERE id > ?1 AND conversation_id >= ?2
                  GROUP BY conversation_id
                  ORDER BY conversation_id ASC
                  LIMIT ?3",
@@ -4012,6 +4012,69 @@ mod tests {
     use std::path::Path;
     use tempfile::tempdir;
 
+    #[test]
+    fn native_semantic_resume_keeps_the_same_conversation_tail() -> Result<()> {
+        let temp = tempdir()?;
+        let db_path = temp.path().join("agent_search.db");
+        let conn = NativeSqliteConnection::open(&db_path)?;
+        conn.execute_batch(
+            "CREATE TABLE conversations (
+                 id INTEGER PRIMARY KEY,
+                 agent_id INTEGER,
+                 workspace_id INTEGER,
+                 external_id TEXT,
+                 title TEXT,
+                 source_path TEXT NOT NULL,
+                 started_at INTEGER,
+                 ended_at INTEGER,
+                 source_id TEXT,
+                 origin_host TEXT
+             );
+             CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT);
+             CREATE TABLE workspaces (id INTEGER PRIMARY KEY, path TEXT);
+             CREATE TABLE messages (
+                 id INTEGER PRIMARY KEY,
+                 conversation_id INTEGER NOT NULL,
+                 idx INTEGER NOT NULL,
+                 role TEXT NOT NULL,
+                 author TEXT,
+                 created_at INTEGER,
+                 content TEXT NOT NULL
+             );
+             INSERT INTO conversations
+                 (id, agent_id, source_path, title)
+             VALUES (1, 1, 'session.jsonl', 'partial session'),
+                    (2, 1, 'later.jsonl', 'later session');
+             INSERT INTO agents (id, slug) VALUES (1, 'codex');
+             INSERT INTO messages
+                 (id, conversation_id, idx, role, content)
+             VALUES (1, 1, 0, 'user', 'already embedded'),
+                    (2, 1, 1, 'assistant', 'tail that must be resumed'),
+                    (3, 2, 0, 'user', 'later conversation');",
+        )?;
+
+        let reader = NativeSemanticReader::open(&db_path)?;
+        let batch = reader.fetch_batch(
+            1,
+            Some(1),
+            1,
+            2,
+            SemanticCheckpointCaps {
+                max_messages: 1,
+                max_bytes: 0,
+            },
+        )?;
+
+        assert_eq!(batch.last_conversation_id, 1);
+        assert_eq!(batch.conversations_in_batch, 0);
+        assert!(!batch.cursor_exhausted);
+        assert_eq!(
+            batch.inputs.iter().map(|input| input.content.as_str()).collect::<Vec<_>>(),
+            vec!["tail that must be resumed"]
+        );
+        Ok(())
+    }
+
     /// cass #309: length-aware embed batching must cap both row count and
     /// `row_count × max_canonical_len` per batch, never drop or reorder rows,
     /// and keep a single over-budget message as its own one-row batch.
@@ -6112,7 +6175,10 @@ mod tests {
             1,
             SemanticCheckpointCaps {
                 max_messages: 1,
-                max_bytes: 1,
+                // This test verifies bounded conversation-page replay. A
+                // byte cap smaller than one message is intentionally rejected
+                // by the single-conversation guardrail.
+                max_bytes: 0,
             },
             |input| {
                 contents.push(input.content);
