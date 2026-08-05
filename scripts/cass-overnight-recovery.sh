@@ -49,11 +49,35 @@ if ! run_lexical_until_complete; then
   exit 70
 fi
 
+run_semantic_until_success() {
+  local attempt=0
+  while true; do
+    attempt=$((attempt + 1))
+    local semantic_status=0
+    CASS_INDEX_STALL_ABORT_SECS=1800 \
+      "$BINARY" index --semantic --build-hnsw --json --no-progress-events \
+      --data-dir "$DATA_DIR" >"$LOG_DIR/semantic-$attempt.json" 2>"$LOG_DIR/semantic-$attempt.log" || semantic_status=$?
+
+    if [[ "$semantic_status" -eq 0 ]]; then
+      cp "$LOG_DIR/semantic-$attempt.json" "$LOG_DIR/semantic.json"
+      echo 0 > "$LOG_DIR/semantic.exit"
+      return 0
+    fi
+
+    printf '%s %s\n' "$attempt" "$semantic_status" >> "$LOG_DIR/semantic-retries"
+    sleep 30
+  done
+}
+
 semantic_status=0
-CASS_INDEX_STALL_ABORT_SECS=1800 \
-  "$BINARY" index --semantic --build-hnsw --json --no-progress-events \
-  --data-dir "$DATA_DIR" >"$LOG_DIR/semantic.json" 2>"$LOG_DIR/semantic.log" || semantic_status=$?
-echo "$semantic_status" > "$LOG_DIR/semantic.exit"
+run_semantic_until_success || semantic_status=$?
+
+# Doctor must never run against a database while semantic assets are changing.
+if [[ "$semantic_status" -ne 0 ]]; then
+  echo "$semantic_status" > "$LOG_DIR/semantic.exit"
+  date -u +%s > "$LOG_DIR/semantic-blocked"
+  exit 70
+fi
 
 doctor_status=0
 CASS_DOCTOR_DB_PROBE_TIMEOUT_SECS=600 \
