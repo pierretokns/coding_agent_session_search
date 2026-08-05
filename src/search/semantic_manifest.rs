@@ -7195,6 +7195,13 @@ mod tests {
         manifest.write_immutable(data_dir).expect("seal generation")
     }
 
+    // macOS exposes the system temporary directory through /var -> /private/var.
+    // Publication deliberately rejects symlinked directory chains, so accepted
+    // contract tests must pass the canonical spelling of their temporary root.
+    fn canonical_test_dir(temp: &tempfile::TempDir) -> std::path::PathBuf {
+        fs::canonicalize(temp.path()).expect("canonical temporary test directory")
+    }
+
     #[test]
     fn accepted_manifest_uses_frankensearch_identity_and_rejects_hash_controls() {
         use frankensearch::core::EmbeddingIdentityBundleV1;
@@ -7326,24 +7333,26 @@ mod tests {
         assert_eq!(error.reason_code(), "semantic_manifest_not_durably_sealed");
 
         let seal_temp = tempfile::tempdir().unwrap();
+        let seal_dir = canonical_test_dir(&seal_temp);
         write_generation_artifacts(
-            seal_temp.path(),
+            &seal_dir,
             &manifest,
             &BTreeMap::from([(SemanticArtifactRole::FastVector, bytes.clone())]),
         );
         let artifact_path = manifest
-            .generation_dir(seal_temp.path())
+            .generation_dir(&seal_dir)
             .unwrap()
             .join(&manifest.artifacts[0].relative_path);
         fs::write(wal_path_for(&artifact_path), b"injected-sidecar").unwrap();
         assert!(matches!(
-            manifest.write_immutable(seal_temp.path()),
+            manifest.write_immutable(&seal_dir),
             Err(SemanticGenerationError::ArtifactIo { .. })
         ));
 
         let load_temp = tempfile::tempdir().unwrap();
+        let load_dir = canonical_test_dir(&load_temp);
         seal_generation(
-            load_temp.path(),
+            &load_dir,
             &manifest,
             &BTreeMap::from([(SemanticArtifactRole::FastVector, bytes)]),
         );
@@ -7351,15 +7360,15 @@ mod tests {
             SemanticCurrentPointerV1::for_manifest(&manifest, manifest.sealed_at_ms + 1, 1)
                 .unwrap();
         pointer
-            .publish_atomic(load_temp.path(), &SemanticExpectedCurrentV1::Absent)
+            .publish_atomic(&load_dir, &SemanticExpectedCurrentV1::Absent)
             .unwrap();
         let artifact_path = manifest
-            .generation_dir(load_temp.path())
+            .generation_dir(&load_dir)
             .unwrap()
             .join(&manifest.artifacts[0].relative_path);
         fs::write(wal_path_for(&artifact_path), b"post-seal-sidecar").unwrap();
         assert!(matches!(
-            load_current_semantic_generation(load_temp.path(), Some(&corpus)),
+            load_current_semantic_generation(&load_dir, Some(&corpus)),
             Err(SemanticGenerationError::ArtifactIo { .. })
         ));
     }
@@ -7938,6 +7947,7 @@ mod tests {
         ];
         for checkpoint in checkpoints {
             let temp = tempfile::tempdir().unwrap();
+            let data_dir = canonical_test_dir(&temp);
             let corpus = test_corpus_identity();
             let bytes = b"durable-vector".to_vec();
             let artifact = complete_generation_artifact(
@@ -7952,12 +7962,12 @@ mod tests {
                 vec![artifact],
             );
             write_generation_artifacts(
-                temp.path(),
+                &data_dir,
                 &manifest,
                 &BTreeMap::from([(SemanticArtifactRole::FastVector, bytes)]),
             );
             let error = manifest
-                .write_immutable_with_hook(temp.path(), |observed| {
+                .write_immutable_with_hook(&data_dir, |observed| {
                     if observed == checkpoint {
                         return Err(SemanticGenerationError::ManifestIo {
                             generation_id: manifest.generation_id.clone(),
@@ -7969,7 +7979,7 @@ mod tests {
                 .expect_err("injected checkpoint must fail");
             assert!(matches!(error, SemanticGenerationError::ManifestIo { .. }));
 
-            let manifest_path = manifest.manifest_path(temp.path()).unwrap();
+            let manifest_path = manifest.manifest_path(&data_dir).unwrap();
             if matches!(
                 checkpoint,
                 ManifestSealCheckpoint::ManifestPublished
@@ -7984,7 +7994,7 @@ mod tests {
                     "pre-publication fault exposed a final manifest"
                 );
             }
-            let generation_dir = manifest.generation_dir(temp.path()).unwrap();
+            let generation_dir = manifest.generation_dir(&data_dir).unwrap();
             assert!(
                 fs::read_dir(generation_dir)
                     .unwrap()
@@ -8003,6 +8013,7 @@ mod tests {
         use std::sync::{Arc, Barrier};
 
         let temp = tempfile::tempdir().unwrap();
+        let data_dir = canonical_test_dir(&temp);
         let corpus = test_corpus_identity();
         let mut manifests = Vec::new();
         for (suffix, bytes) in [("a", b"vector-a".to_vec()), ("b", b"vector-b".to_vec())] {
@@ -8018,7 +8029,7 @@ mod tests {
                 vec![artifact],
             );
             seal_generation(
-                temp.path(),
+                &data_dir,
                 &manifest,
                 &BTreeMap::from([(SemanticArtifactRole::FastVector, bytes)]),
             );
@@ -8026,7 +8037,7 @@ mod tests {
         }
 
         let barrier = Arc::new(Barrier::new(3));
-        let data_dir = Arc::new(temp.path().to_path_buf());
+        let data_dir = Arc::new(data_dir);
         let handles = manifests
             .iter()
             .cloned()
@@ -8061,7 +8072,7 @@ mod tests {
                 .count(),
             1
         );
-        let loaded = load_current_semantic_generation(temp.path(), Some(&corpus)).unwrap();
+        let loaded = load_current_semantic_generation(&data_dir, Some(&corpus)).unwrap();
         assert!(
             manifests
                 .iter()
@@ -8079,6 +8090,7 @@ mod tests {
         ];
         for (fault, selects_new) in checkpoints {
             let temp = tempfile::tempdir().unwrap();
+            let data_dir = canonical_test_dir(&temp);
             let corpus = test_corpus_identity();
             let mut manifests = Vec::new();
             for (id, bytes) in [
@@ -8094,7 +8106,7 @@ mod tests {
                 let manifest =
                     generation_with_id(id, SemanticGenerationTopology::FastOnly, vec![artifact]);
                 seal_generation(
-                    temp.path(),
+                    &data_dir,
                     &manifest,
                     &BTreeMap::from([(SemanticArtifactRole::FastVector, bytes)]),
                 );
@@ -8104,14 +8116,14 @@ mod tests {
                 SemanticCurrentPointerV1::for_manifest(&manifests[0], 1_700_000_000_400, 1)
                     .unwrap();
             old_pointer
-                .publish_atomic(temp.path(), &SemanticExpectedCurrentV1::Absent)
+                .publish_atomic(&data_dir, &SemanticExpectedCurrentV1::Absent)
                 .unwrap();
             let new_pointer =
                 SemanticCurrentPointerV1::for_manifest(&manifests[1], 1_700_000_000_500, 2)
                     .unwrap();
             let error = new_pointer
                 .publish_atomic_with_hook(
-                    temp.path(),
+                    &data_dir,
                     &SemanticExpectedCurrentV1::exact(&old_pointer),
                     |observed| {
                         if observed == fault {
@@ -8124,7 +8136,7 @@ mod tests {
                 )
                 .expect_err("injected pointer checkpoint");
             assert!(matches!(error, SemanticGenerationError::PointerIo { .. }));
-            let loaded = load_current_semantic_generation(temp.path(), Some(&corpus)).unwrap();
+            let loaded = load_current_semantic_generation(&data_dir, Some(&corpus)).unwrap();
             assert_eq!(
                 loaded.manifest.generation_id,
                 manifests[usize::from(selects_new)].generation_id
@@ -8135,6 +8147,7 @@ mod tests {
     #[test]
     fn accepted_pointer_selection_timestamp_is_independent_and_supports_republication() {
         let temp = tempfile::tempdir().unwrap();
+        let data_dir = canonical_test_dir(&temp);
         let corpus = test_corpus_identity();
         let bytes = b"republish-vector".to_vec();
         let artifact = complete_generation_artifact(
@@ -8149,7 +8162,7 @@ mod tests {
             vec![artifact],
         );
         seal_generation(
-            temp.path(),
+            &data_dir,
             &manifest,
             &BTreeMap::from([(SemanticArtifactRole::FastVector, bytes)]),
         );
@@ -8167,15 +8180,15 @@ mod tests {
             SemanticCurrentPointerV1::for_manifest(&manifest, manifest.sealed_at_ms + 100, 1)
                 .unwrap();
         first
-            .publish_atomic(temp.path(), &SemanticExpectedCurrentV1::Absent)
+            .publish_atomic(&data_dir, &SemanticExpectedCurrentV1::Absent)
             .unwrap();
         let second =
             SemanticCurrentPointerV1::for_manifest(&manifest, manifest.sealed_at_ms + 200, 2)
                 .unwrap();
         second
-            .publish_atomic(temp.path(), &SemanticExpectedCurrentV1::exact(&first))
+            .publish_atomic(&data_dir, &SemanticExpectedCurrentV1::exact(&first))
             .unwrap();
-        let loaded = load_current_semantic_generation(temp.path(), None).unwrap();
+        let loaded = load_current_semantic_generation(&data_dir, None).unwrap();
         assert_eq!(
             loaded.manifest.sha256().unwrap(),
             manifest.sha256().unwrap()
@@ -8187,6 +8200,7 @@ mod tests {
     #[test]
     fn accepted_pointer_cas_rejects_aba_and_requires_a_strictly_newer_selection_epoch() {
         let temp = tempfile::tempdir().unwrap();
+        let data_dir = canonical_test_dir(&temp);
         let corpus = test_corpus_identity();
         let mut manifests = Vec::new();
         for (generation_id, bytes) in [
@@ -8205,7 +8219,7 @@ mod tests {
                 vec![artifact],
             );
             seal_generation(
-                temp.path(),
+                &data_dir,
                 &manifest,
                 &BTreeMap::from([(SemanticArtifactRole::FastVector, bytes)]),
             );
@@ -8215,7 +8229,7 @@ mod tests {
         let selected_a_first =
             SemanticCurrentPointerV1::for_manifest(&manifests[0], 1_700_000_000_400, 1).unwrap();
         selected_a_first
-            .publish_atomic(temp.path(), &SemanticExpectedCurrentV1::Absent)
+            .publish_atomic(&data_dir, &SemanticExpectedCurrentV1::Absent)
             .unwrap();
         let stale_a_expectation = SemanticExpectedCurrentV1::exact(&selected_a_first);
 
@@ -8223,23 +8237,23 @@ mod tests {
             SemanticCurrentPointerV1::for_manifest(&manifests[1], 1_700_000_000_500, 2).unwrap();
         selected_b
             .publish_atomic(
-                temp.path(),
+                &data_dir,
                 &SemanticExpectedCurrentV1::exact(&selected_a_first),
             )
             .unwrap();
         let selected_a_again =
             SemanticCurrentPointerV1::for_manifest(&manifests[0], 1_700_000_000_600, 3).unwrap();
         selected_a_again
-            .publish_atomic(temp.path(), &SemanticExpectedCurrentV1::exact(&selected_b))
+            .publish_atomic(&data_dir, &SemanticExpectedCurrentV1::exact(&selected_b))
             .unwrap();
 
         let stale_publisher_target =
             SemanticCurrentPointerV1::for_manifest(&manifests[1], 1_700_000_000_700, 4).unwrap();
         assert!(matches!(
-            stale_publisher_target.publish_atomic(temp.path(), &stale_a_expectation),
+            stale_publisher_target.publish_atomic(&data_dir, &stale_a_expectation),
             Err(SemanticGenerationError::ConcurrentPublishConflict { .. })
         ));
-        let after_stale_attempt = load_current_semantic_generation(temp.path(), None).unwrap();
+        let after_stale_attempt = load_current_semantic_generation(&data_dir, None).unwrap();
         assert_eq!(after_stale_attempt.pointer, selected_a_again);
 
         let equal_epoch = SemanticCurrentPointerV1::for_manifest(
@@ -8250,7 +8264,7 @@ mod tests {
         .unwrap();
         let error = equal_epoch
             .publish_atomic(
-                temp.path(),
+                &data_dir,
                 &SemanticExpectedCurrentV1::exact(&selected_a_again),
             )
             .expect_err("selection epochs must advance strictly");
@@ -8316,6 +8330,8 @@ mod tests {
 
         let temp = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
+        let temp_dir = canonical_test_dir(&temp);
+        let outside_dir = canonical_test_dir(&outside);
         let artifact = complete_generation_artifact(
             SemanticArtifactRole::FastVector,
             "fast/primary.fsvi",
@@ -8327,19 +8343,20 @@ mod tests {
             SemanticGenerationTopology::FastOnly,
             vec![artifact],
         );
-        let generation_dir = manifest.generation_dir(temp.path()).unwrap();
+        let generation_dir = manifest.generation_dir(&temp_dir).unwrap();
         fs::create_dir_all(generation_dir.join("fast")).unwrap();
-        let outside_file = outside.path().join("outside.fsvi");
+        let outside_file = outside_dir.join("outside.fsvi");
         fs::write(&outside_file, b"symlink-vector").unwrap();
         symlink(&outside_file, generation_dir.join("fast/primary.fsvi")).unwrap();
         assert!(matches!(
-            manifest.write_immutable(temp.path()),
+            manifest.write_immutable(&temp_dir),
             Err(SemanticGenerationError::ArtifactIo { .. })
                 | Err(SemanticGenerationError::ManifestIo { .. })
         ));
-        assert!(!manifest.manifest_path(temp.path()).unwrap().exists());
+        assert!(!manifest.manifest_path(&temp_dir).unwrap().exists());
 
         let alias_temp = tempfile::tempdir().unwrap();
+        let alias_dir = canonical_test_dir(&alias_temp);
         let base = complete_generation_artifact(
             SemanticArtifactRole::FastVector,
             "fast/primary.fsvi",
@@ -8360,13 +8377,13 @@ mod tests {
             SemanticGenerationTopology::FastOnly,
             vec![base, ann],
         );
-        let generation_dir = alias_manifest.generation_dir(alias_temp.path()).unwrap();
+        let generation_dir = alias_manifest.generation_dir(&alias_dir).unwrap();
         fs::create_dir_all(generation_dir.join("fast")).unwrap();
         let vector_path = generation_dir.join("fast/primary.fsvi");
         fs::write(&vector_path, b"same-physical-file").unwrap();
         fs::hard_link(&vector_path, generation_dir.join("fast/search.hnsw")).unwrap();
         assert!(matches!(
-            alias_manifest.write_immutable(alias_temp.path()),
+            alias_manifest.write_immutable(&alias_dir),
             Err(SemanticGenerationError::InvalidManifest {
                 class: SemanticManifestInvariantClass::Path,
                 ..
@@ -8375,6 +8392,8 @@ mod tests {
 
         let external_link_temp = tempfile::tempdir().unwrap();
         let external_link_target = tempfile::tempdir().unwrap();
+        let external_link_dir = canonical_test_dir(&external_link_temp);
+        let external_link_target_dir = canonical_test_dir(&external_link_target);
         let external_artifact = complete_generation_artifact(
             SemanticArtifactRole::FastVector,
             "fast/primary.fsvi",
@@ -8387,7 +8406,7 @@ mod tests {
             vec![external_artifact],
         );
         write_generation_artifacts(
-            external_link_temp.path(),
+            &external_link_dir,
             &external_manifest,
             &BTreeMap::from([(
                 SemanticArtifactRole::FastVector,
@@ -8395,16 +8414,16 @@ mod tests {
             )]),
         );
         let external_artifact_path = external_manifest
-            .generation_dir(external_link_temp.path())
+            .generation_dir(&external_link_dir)
             .unwrap()
             .join(&external_manifest.artifacts[0].relative_path);
         fs::hard_link(
             &external_artifact_path,
-            external_link_target.path().join("alias.fsvi"),
+            external_link_target_dir.join("alias.fsvi"),
         )
         .unwrap();
         assert!(matches!(
-            external_manifest.write_immutable(external_link_temp.path()),
+            external_manifest.write_immutable(&external_link_dir),
             Err(SemanticGenerationError::InvalidManifest {
                 class: SemanticManifestInvariantClass::Path,
                 ..
@@ -8412,13 +8431,14 @@ mod tests {
         ));
 
         let swap_temp = tempfile::tempdir().unwrap();
-        let selected_path = swap_temp.path().join("selected.fsvi");
+        let swap_dir = canonical_test_dir(&swap_temp);
+        let selected_path = swap_dir.join("selected.fsvi");
         fs::write(&selected_path, b"owner-a").unwrap();
         let selected_file = fs::File::open(&selected_path).unwrap();
         let selected_metadata = selected_file.metadata().unwrap();
         let selected_identity = portable_file_identity(&selected_file, &selected_metadata).unwrap();
         verify_path_still_names_open_file(&selected_path, selected_identity).unwrap();
-        fs::rename(&selected_path, swap_temp.path().join("displaced.fsvi")).unwrap();
+        fs::rename(&selected_path, swap_dir.join("displaced.fsvi")).unwrap();
         fs::write(&selected_path, b"owner-b").unwrap();
         assert!(
             verify_path_still_names_open_file(&selected_path, selected_identity).is_err(),
@@ -8952,6 +8972,7 @@ mod tests {
         }
 
         let temp = tempfile::tempdir().unwrap();
+        let data_dir = canonical_test_dir(&temp);
         let corpus = test_corpus_identity();
         let bytes = b"logged-vector".to_vec();
         let artifact = complete_generation_artifact(
@@ -8966,7 +8987,7 @@ mod tests {
             vec![artifact],
         );
         write_generation_artifacts(
-            temp.path(),
+            &data_dir,
             &manifest,
             &BTreeMap::from([(SemanticArtifactRole::FastVector, bytes)]),
         );
@@ -8981,20 +9002,20 @@ mod tests {
         let subscriber = tracing_subscriber::registry().with(layer);
         tracing::subscriber::with_default(subscriber, || {
             tracing::callsite::rebuild_interest_cache();
-            manifest.write_immutable(temp.path()).unwrap();
+            manifest.write_immutable(&data_dir).unwrap();
             let pointer =
                 SemanticCurrentPointerV1::for_manifest(&manifest, manifest.sealed_at_ms + 1, 1)
                     .unwrap();
             pointer
-                .publish_atomic(temp.path(), &SemanticExpectedCurrentV1::Absent)
+                .publish_atomic(&data_dir, &SemanticExpectedCurrentV1::Absent)
                 .unwrap();
-            load_current_semantic_generation(temp.path(), Some(&corpus)).unwrap();
+            load_current_semantic_generation(&data_dir, Some(&corpus)).unwrap();
             let artifact_path = manifest
-                .generation_dir(temp.path())
+                .generation_dir(&data_dir)
                 .unwrap()
                 .join("fast/primary.fsvi");
             fs::write(artifact_path, b"tamper-vector").unwrap();
-            assert!(load_current_semantic_generation(temp.path(), Some(&corpus)).is_err());
+            assert!(load_current_semantic_generation(&data_dir, Some(&corpus)).is_err());
         });
         let logs = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
         for field in [

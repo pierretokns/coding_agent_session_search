@@ -17,6 +17,30 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_session_search>
 
 ## [Unreleased]
 
+## [v0.6.31] -- 2026-08-05
+
+Recovery and storage durability release.
+
+### Fixed
+
+- Pin every FrankenSQLite dependency edge to the same immutable full revision,
+  preventing source drift between direct, development, and registry-patched
+  consumers.
+- Make semantic publication tests portable on macOS while retaining strict
+  rejection of symlinked directory chains, and make oversized lexical shards
+  visible in structured progress logs.
+- Preserve FTS rebuild and historical-seed results across connection close by
+  explicitly finalizing short-lived FrankenSQLite maintenance connections.
+- Keep readiness and doctor promotion tests aligned with real lock ownership
+  and transient shared-memory sidecar cleanup.
+- Prevent disabled TRACE callsites from reaching the dynamic trace filter.
+
+### Verified
+
+- Focused recovery, semantic-manifest, log-hygiene, FTS, and historical-seed
+  gates pass. The broad serial workspace run still contains unrelated
+  process-global test-isolation failures.
+
 ## [v0.6.30] -- 2026-08-04
 
 Lexical equivalence throughput release.
@@ -1856,7 +1880,8 @@ Initial development. Project scaffolding, architecture design, and first impleme
 
 ---
 
-[Unreleased]: https://github.com/pierretokns/coding_agent_session_search/compare/v0.6.24...HEAD
+[Unreleased]: https://github.com/pierretokns/coding_agent_session_search/compare/v0.6.31...HEAD
+[v0.6.31]: https://github.com/pierretokns/coding_agent_session_search/compare/v0.6.30...v0.6.31
 [v0.6.24]: https://github.com/pierretokns/coding_agent_session_search/compare/v0.6.23...v0.6.24
 [v0.2.2]: https://github.com/Dicklesworthstone/coding_agent_session_search/compare/v0.2.1...v0.2.2
 [v0.2.1]: https://github.com/Dicklesworthstone/coding_agent_session_search/compare/v0.2.0...v0.2.1

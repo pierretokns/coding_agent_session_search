@@ -9263,32 +9263,41 @@ fn lexical_rebuild_storage_fingerprint(db_path: &Path) -> Result<String> {
     // looked like a semantic wedge. Native SQLite answers the three scalar
     // queries without materializing the archive and matches the fingerprint
     // contract used by the lexical checkpoint.
-    let conn = rusqlite::Connection::open_with_flags(
-        db_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .with_context(|| {
+    let result: Result<String> = (|| {
+        let conn = rusqlite::Connection::open_with_flags(
+            db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .with_context(|| {
+            format!(
+                "opening native SQLite readonly connection to compute lexical fingerprint for {}",
+                db_path.display()
+            )
+        })?;
+        conn.busy_timeout(Duration::from_secs(30))?;
+        conn.execute_batch("PRAGMA query_only = 1;")?;
+        let total_conversations: i64 = conn
+            .query_row("SELECT COUNT(*) FROM conversations", [], |row| row.get(0))
+            .context("counting conversations for lexical fingerprint")?;
+        let max_conversation_id: i64 = conn
+            .query_row("SELECT COALESCE(MAX(id), 0) FROM conversations", [], |row| row.get(0))
+            .context("computing lexical rebuild conversation fingerprint")?;
+        let max_message_id: i64 = conn
+            .query_row("SELECT COALESCE(MAX(id), 0) FROM messages", [], |row| row.get(0))
+            .context("computing lexical rebuild message fingerprint")?;
+        Ok(lexical_rebuild_content_fingerprint_value(
+            usize::try_from(total_conversations.max(0)).unwrap_or(usize::MAX),
+            max_conversation_id,
+            max_message_id,
+        ))
+    })();
+    result.with_context(|| {
         format!(
-            "opening native SQLite readonly connection to compute lexical fingerprint for {}",
+            "opening readonly storage to compute lexical fingerprint for {}",
             db_path.display()
         )
-    })?;
-    conn.busy_timeout(Duration::from_secs(30))?;
-    conn.execute_batch("PRAGMA query_only = 1;")?;
-    let total_conversations: i64 = conn
-        .query_row("SELECT COUNT(*) FROM conversations", [], |row| row.get(0))
-        .context("counting conversations for lexical fingerprint")?;
-    let max_conversation_id: i64 = conn
-        .query_row("SELECT COALESCE(MAX(id), 0) FROM conversations", [], |row| row.get(0))
-        .context("computing lexical rebuild conversation fingerprint")?;
-    let max_message_id: i64 = conn
-        .query_row("SELECT COALESCE(MAX(id), 0) FROM messages", [], |row| row.get(0))
-        .context("computing lexical rebuild message fingerprint")?;
-    Ok(lexical_rebuild_content_fingerprint_value(
-        usize::try_from(total_conversations.max(0)).unwrap_or(usize::MAX),
-        max_conversation_id,
-        max_message_id,
-    ))
+    })
 }
 
 fn count_total_conversations_exact(storage: &FrankenStorage) -> Result<usize> {
@@ -18552,6 +18561,15 @@ fn spawn_lexical_rebuild_packet_producer(
                             .as_ref()
                             .and_then(LexicalRebuildPlannedShardCursor::current)
                         {
+                            if shard.oversized_single_conversation {
+                                tracing::info!(
+                                    shard_index = shard.shard_index,
+                                    conversation_count = shard.conversation_count,
+                                    message_count = shard.message_count,
+                                    message_bytes = shard.message_bytes,
+                                    "falling back to per-conversation fetches for oversized single conversation"
+                                );
+                            }
                             if logged_current_shard_index != Some(shard.shard_index) {
                                 tracing::info!(
                                     shard_index = shard.shard_index,

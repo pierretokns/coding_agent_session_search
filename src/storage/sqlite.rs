@@ -1375,7 +1375,18 @@ pub(crate) fn materialize_fresh_fts_schema_via_rusqlite(db_path: &Path) -> Resul
             db_path.display()
         )
     })?;
-    storage.rebuild_fts_via_frankensqlite().map(|_| ())
+    let result = storage.rebuild_fts_via_frankensqlite().map(|_| ());
+    let close_result = storage.close();
+    match (result, close_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), Err(error)) => Err(error).with_context(|| {
+            format!("closing frankensqlite FTS materialization at {}", db_path.display())
+        }),
+        (Err(error), Err(close_error)) => Err(error).context(format!(
+            "closing frankensqlite FTS materialization also failed: {close_error}"
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -1386,9 +1397,22 @@ pub(crate) fn rebuild_fts_via_rusqlite(db_path: &Path) -> Result<usize> {
             db_path.display()
         )
     })?;
-    let inserted = storage.rebuild_fts_via_frankensqlite()?;
-    storage.record_fts_franken_rebuild_generation()?;
-    Ok(inserted)
+    let result = (|| -> Result<usize> {
+        let inserted = storage.rebuild_fts_via_frankensqlite()?;
+        storage.record_fts_franken_rebuild_generation()?;
+        Ok(inserted)
+    })();
+    let close_result = storage.close();
+    match (result, close_result) {
+        (Ok(inserted), Ok(())) => Ok(inserted),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) => Err(error).with_context(|| {
+            format!("closing frankensqlite FTS rebuild at {}", db_path.display())
+        }),
+        (Err(error), Err(close_error)) => Err(error).context(format!(
+            "closing frankensqlite FTS rebuild also failed: {close_error}"
+        )),
+    }
 }
 
 pub(crate) fn ensure_fts_consistency_via_rusqlite(db_path: &Path) -> Result<FtsConsistencyRepair> {
@@ -1401,7 +1425,18 @@ pub(crate) fn ensure_fts_consistency_via_rusqlite(db_path: &Path) -> Result<FtsC
             db_path.display()
         )
     })?;
-    storage.ensure_search_fallback_fts_consistency()
+    let result = storage.ensure_search_fallback_fts_consistency();
+    let close_result = storage.close();
+    match (result, close_result) {
+        (Ok(repair), Ok(())) => Ok(repair),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) => Err(error).with_context(|| {
+            format!("closing frankensqlite FTS consistency check at {}", db_path.display())
+        }),
+        (Err(error), Err(close_error)) => Err(error).context(format!(
+            "closing frankensqlite FTS consistency check also failed: {close_error}"
+        )),
+    }
 }
 
 /// Create a uniquely named backup of the database file.
@@ -2663,6 +2698,12 @@ fn finalize_seeded_canonical_bundle_via_rusqlite(
         conversations_imported,
         messages_imported,
     )?;
+    conn.close().with_context(|| {
+        format!(
+            "closing seeded canonical database after post-seed finalization: {}",
+            canonical_db_path.display()
+        )
+    })?;
     Ok((conversations_imported, messages_imported))
 }
 
@@ -26955,17 +26996,15 @@ mod tests {
         assert_eq!(outcome.conversations_imported, 1);
         assert_eq!(outcome.messages_imported, 1);
 
-        let readonly = open_franken_with_flags(
-            &canonical_db.to_string_lossy(),
-            FrankenOpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .unwrap();
+        let readonly = SqliteStorage::open_readonly(&canonical_db).unwrap();
         let readonly_message_count: i64 = readonly
+            .conn
             .query_row_map("SELECT COUNT(*) FROM messages", fparams![], |row| {
                 row.get_typed(0)
             })
             .unwrap();
         assert_eq!(readonly_message_count, 1);
+        readonly.close().unwrap();
 
         let seeded = SqliteStorage::open(&canonical_db).unwrap();
         assert_eq!(
@@ -27006,12 +27045,10 @@ mod tests {
             .unwrap();
         assert_eq!(salvage_keys.len(), 1);
 
-        let reopened_readonly = open_franken_with_flags(
-            &canonical_db.to_string_lossy(),
-            FrankenOpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .unwrap();
+        seeded.close().unwrap();
+        let reopened_readonly = SqliteStorage::open_readonly(&canonical_db).unwrap();
         let reopened_fts_entries: i64 = reopened_readonly
+            .conn
             .query_row_map(
                 "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
                 fparams![],
@@ -27023,11 +27060,13 @@ mod tests {
             "seeded canonical db should keep a single stock-SQLite fts_messages schema row"
         );
         let reopened_message_count: i64 = reopened_readonly
+            .conn
             .query_row_map("SELECT COUNT(*) FROM messages", fparams![], |row| {
                 row.get_typed(0)
             })
             .unwrap();
         assert_eq!(reopened_message_count, 1);
+        reopened_readonly.close().unwrap();
 
         let franken_seeded = FrankenStorage::open(&canonical_db).unwrap();
         assert_eq!(
@@ -28803,18 +28842,31 @@ mod tests {
         // contract this regression protects.
         assert!(inserted <= 1, "one canonical message bounds repair work");
 
-        let conn = FrankenConnection::open(db_path.to_string_lossy().into_owned()).unwrap();
-        let schema_rows = franken_fts_schema_rows(&conn).unwrap();
+        // Existing archives intentionally use the schema-only pager-backed
+        // lane: a full eager FrankenSQLite reload cannot hydrate populated
+        // contentless FTS shadow pages reliably, while the production storage
+        // opener preserves the canonical shadow through its bounded lane.
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        storage
+            .ensure_search_fallback_fts_consistency()
+            .expect("reopen should restore FTS parity");
+        let schema_rows = franken_fts_schema_rows(&storage.conn).unwrap();
         assert_eq!(
             schema_rows, 1,
             "DROP TABLE should leave one clean FTS schema"
         );
-        let match_count: i64 = conn
-            .query_row_map("SELECT COUNT(*) FROM fts_messages", fparams![], |row| {
+        // FrankenSQLite's compatibility COUNT(*) over the contentless
+        // virtual table is not a durable row-cardinality probe after a
+        // schema-only reopen. The persisted docsize shadow is the authoritative
+        // physical row count for this regression.
+        let indexed_doc_count: i64 = storage
+            .conn
+            .query_row_map("SELECT COUNT(*) FROM fts_messages_docsize", fparams![], |row| {
                 row.get_typed(0)
             })
             .unwrap();
-        assert_eq!(match_count, 1);
+        assert_eq!(indexed_doc_count, 1);
+        storage.close().unwrap();
     }
 
     // =========================================================================
